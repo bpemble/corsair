@@ -216,6 +216,8 @@ async def main():
     logger.info("=" * 60)
     logger.info("Corsair v2 starting up")
     logger.info("=" * 60)
+    loop_name = type(asyncio.get_running_loop()).__module__
+    logger.info("Asyncio loop: %s", loop_name)
 
     # ── 2. Connect to IBKR ───────────────────────────────────────────
     conn = IBKRConnection(config)
@@ -385,9 +387,9 @@ async def main():
             elif key is not None:
                 dirty_keys.add(key)
 
-            # Drain any additional ticks within the batch window
-            deadline = _time.monotonic() + batch_window_sec
-            while _time.monotonic() < deadline:
+            # Drain whatever is already queued, instantly. Most of the time
+            # this empties immediately and we proceed without any sleep.
+            while True:
                 try:
                     tick_type, key = market_data.tick_queue.get_nowait()
                     if tick_type == "underlying":
@@ -396,6 +398,22 @@ async def main():
                         dirty_keys.add(key)
                 except asyncio.QueueEmpty:
                     break
+
+            # Only on an underlying tick (which fans out to ~28 options) is
+            # there a real benefit to waiting briefly for the burst — those
+            # 28 ticks may not have arrived yet. For pure option ticks, we
+            # already have everything we need; skip the wait.
+            if underlying_dirty:
+                await asyncio.sleep(batch_window_sec)
+                while True:
+                    try:
+                        tick_type, key = market_data.tick_queue.get_nowait()
+                        if tick_type == "underlying":
+                            pass
+                        elif key is not None:
+                            dirty_keys.add(key)
+                    except asyncio.QueueEmpty:
+                        break
         except asyncio.TimeoutError:
             pass  # No ticks — fall through to periodic refresh check
 
@@ -441,6 +459,14 @@ async def main():
 
 def run():
     """Entry point for running Corsair v2."""
+    # uvloop must be installed BEFORE the asyncio loop is created.
+    # Logging isn't set up yet, so report status via print().
+    try:
+        import uvloop
+        uvloop.install()
+        print(f"[corsair] uvloop {uvloop.__version__} installed as asyncio policy")
+    except ImportError:
+        print("[corsair] uvloop not available, using default asyncio loop")
     asyncio.run(main())
 
 

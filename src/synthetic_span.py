@@ -79,6 +79,7 @@ class SyntheticSpan:
         """Return 16-element risk array (loss $ per LONG contract per scenario).
 
         Positive = loss for a long position. For a short position, negate.
+        Uses vectorized Black-76 to price all 16 scenarios in one call.
         """
         if F <= 0 or T <= 0 or iv <= 0:
             return np.zeros(16)
@@ -88,26 +89,30 @@ class SyntheticSpan:
         down_scan = F * self.down_scan_pct
         vol_scan = iv * self.vol_scan_pct
         mult = self._multiplier
-        out = np.zeros(16)
 
-        # Scenarios 0..13: standard scan
+        # Build 16 (F, iv) scenario arrays
+        F_scen = np.empty(16)
+        iv_scen = np.empty(16)
+        cover = np.ones(16)
         for i in range(14):
             frac = _PRICE_FRACS[i]
             shift = (frac * up_scan) if frac >= 0 else (frac * down_scan)
-            F2 = max(F + shift, 1.0)
-            iv2 = max(iv + _VOL_SIGNS[i] * vol_scan, 0.01)
-            px = PricingEngine.black76_price(F2, K, T, iv2, right=right)
-            # SPAN convention: loss is positive
-            out[i] = -(px - base) * mult
+            F_scen[i] = max(F + shift, 1.0)
+            iv_scen[i] = max(iv + _VOL_SIGNS[i] * vol_scan, 0.01)
+        # Extreme up
+        F_scen[14] = max(F + self.extreme_mult * up_scan, 1.0)
+        iv_scen[14] = iv
+        cover[14] = self.extreme_cover
+        # Extreme down
+        F_scen[15] = max(F - self.extreme_mult * down_scan, 1.0)
+        iv_scen[15] = iv
+        cover[15] = self.extreme_cover
 
-        # Scenarios 14, 15: extreme up/down (vol flat, 33% cover)
-        for i, frac in ((14, +self.extreme_mult), (15, -self.extreme_mult)):
-            shift = (frac * up_scan) if frac >= 0 else (frac * down_scan)
-            F2 = max(F + shift, 1.0)
-            px = PricingEngine.black76_price(F2, K, T, iv, right=right)
-            out[i] = -(px - base) * mult * self.extreme_cover
-
-        return out
+        # One vectorized Black-76 call for all 16 scenarios
+        prices = PricingEngine.black76_price_vec(
+            F_scen, K, T, iv_scen, right=right,
+        )
+        return -(prices - base) * mult * cover
 
     def portfolio_margin(self, F: float, positions: Iterable[Tuple]) -> dict:
         """Compute portfolio SPAN margin.

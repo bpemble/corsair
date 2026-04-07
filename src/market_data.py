@@ -409,10 +409,12 @@ class MarketDataManager:
         if quote is None:
             return
 
+        prev_bid, prev_ask = quote.bid, quote.ask
         if ticker.bid is not None and ticker.bid > 0:
             quote.bid = ticker.bid
         if ticker.ask is not None and ticker.ask > 0:
             quote.ask = ticker.ask
+        bid_ask_changed = (quote.bid != prev_bid) or (quote.ask != prev_ask)
         if ticker.bidSize is not None and not np.isnan(ticker.bidSize):
             quote.bid_size = int(ticker.bidSize)
         if ticker.askSize is not None and not np.isnan(ticker.askSize):
@@ -445,10 +447,13 @@ class MarketDataManager:
             if mg.vega is not None:
                 quote.vega = mg.vega
 
-        # Always compute IV from market mid using our forward (self-consistent
-        # with theo computation). IBKR's modelGreeks.impliedVol uses a different
-        # reference and produces ~2% inflated values.
-        if quote.bid > 0 and quote.ask > 0 and self.state.underlying_price > 0:
+        # Compute IV from market mid using our forward. Skip when bid/ask
+        # haven't changed — brentq inversion is the most expensive part of
+        # the tick path (~200-500us per call) and pure waste on volume/last-only
+        # ticks. IBKR's modelGreeks.impliedVol uses a different reference and
+        # produces ~2% inflated values, so we always compute our own.
+        if (bid_ask_changed and quote.bid > 0 and quote.ask > 0
+                and self.state.underlying_price > 0):
             mid = (quote.bid + quote.ask) / 2
             tte = days_to_expiry(quote.expiry) / 365.0
             if tte > 0:

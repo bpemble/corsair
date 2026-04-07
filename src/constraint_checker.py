@@ -7,56 +7,44 @@ Pre-trade validation ensuring every potential fill passes:
 
 Improving-fill exception: if a constraint is currently breached, allow
 fills that move the state in the right direction.
+
+Caches portfolio scan-risk and per-strike risk arrays so each
+check_fill_margin call only reprices the candidate (not the whole book).
 """
 
 import logging
-from typing import Dict, Tuple
+import time
+from typing import Dict, Optional, Tuple
 
+import numpy as np
 from ib_insync import IB
 
+from .pricing import PricingEngine
 from .synthetic_span import SyntheticSpan
 from .utils import days_to_expiry
 
 logger = logging.getLogger(__name__)
 
 
-def _position_tuples(positions, market_data, override=None):
-    """Build (K, right, T_years, iv, qty) tuples from a position list.
-
-    `override` (optional): a dict {(strike, expiry, right): delta_qty} to
-    apply on top of the position list (used for hypothetical fills).
-    """
-    state = market_data.state
-    out = []
-    seen = set()
-    for p in positions:
-        key = (p.strike, p.expiry, p.put_call)
-        seen.add(key)
-        opt = state.get_option(p.strike, p.expiry, p.put_call)
-        iv = float(opt.iv) if opt and opt.iv > 0 else 0.0
-        T = max(days_to_expiry(p.expiry), 0) / 365.0
-        qty = p.quantity + (override.get(key, 0) if override else 0)
-        if qty != 0:
-            out.append((p.strike, p.put_call, T, iv, qty))
-    if override:
-        for key, dq in override.items():
-            if key in seen or dq == 0:
-                continue
-            strike, expiry, right = key
-            opt = state.get_option(strike, expiry, right)
-            iv = float(opt.iv) if opt and opt.iv > 0 else 0.0
-            T = max(days_to_expiry(expiry), 0) / 365.0
-            out.append((strike, right, T, iv, dq))
-    return out
+# Cache invalidation thresholds
+_F_TOLERANCE = 5.0          # invalidate if F moves more than this ($)
+_IV_TOLERANCE = 0.01        # invalidate per-strike if IV moves > 1 vol pt
+_CACHE_MAX_AGE_SEC = 30.0   # hard time-based invalidation
 
 
 class IBKRMarginChecker:
-    """Synthetic SPAN margin checker.
+    """Synthetic SPAN margin checker with caching.
 
-    Computes margin via SyntheticSpan over the live position book.
-    `update_cached_margin()` queries IBKR's actual MaintMarginReq for
-    reconciliation logging — synthetic vs real drift is logged so you
-    can recalibrate the scan percentages.
+    Caches:
+      - portfolio aggregate (scan-risk array, NOV, long_premium, short_count)
+      - per-strike risk arrays (so the candidate's scenario evaluation is
+        a numpy add against pre-computed state, not 16 fresh Black-76 calls)
+
+    Invalidation:
+      - on fill (call invalidate_portfolio() from FillHandler)
+      - when F moves more than $5 from the cached F
+      - when 30s have elapsed
+      - per-strike: when IV moves > 1 vol pt or F moves > $5
     """
 
     def __init__(self, ib: IB, config, market_data, portfolio):
@@ -67,14 +55,110 @@ class IBKRMarginChecker:
         self.span = SyntheticSpan(config)
         self.cached_ibkr_margin: float = 0.0
         self._account_id = config.account.account_id
+        self._mult = float(config.product.multiplier)
 
+        # Portfolio state cache
+        self._port_state: Optional[dict] = None
+        self._port_F: float = 0.0
+        self._port_time: float = 0.0
+
+        # Per-strike (strike, right) → {risk_array, base, F, iv, time}
+        self._strike_cache: Dict[Tuple[float, str], dict] = {}
+
+    # ── Cache invalidation ─────────────────────────────────────────
+    def invalidate_portfolio(self):
+        """Force a fresh portfolio recompute on the next check. Call from
+        FillHandler when a fill arrives."""
+        self._port_state = None
+
+    def _portfolio_cache_valid(self, F: float) -> bool:
+        if self._port_state is None:
+            return False
+        if abs(F - self._port_F) > _F_TOLERANCE:
+            return False
+        if (time.monotonic() - self._port_time) > _CACHE_MAX_AGE_SEC:
+            return False
+        return True
+
+    def _strike_cache_valid(self, entry: dict, F: float, iv: float) -> bool:
+        if abs(F - entry["F"]) > _F_TOLERANCE:
+            return False
+        if abs(iv - entry["iv"]) > _IV_TOLERANCE:
+            return False
+        if (time.monotonic() - entry["time"]) > _CACHE_MAX_AGE_SEC:
+            return False
+        return True
+
+    # ── Strike-level cache ─────────────────────────────────────────
+    def _get_strike_risk(self, strike: float, right: str, T: float,
+                         iv: float, F: float):
+        """Return (risk_array_16, base_price) for one long contract at this
+        strike, using the per-strike cache when possible."""
+        key = (strike, right)
+        entry = self._strike_cache.get(key)
+        if entry is not None and self._strike_cache_valid(entry, F, iv):
+            return entry["risk_array"], entry["base"]
+        ra = self.span.position_risk_array(F, strike, T, iv, right)
+        base = PricingEngine.black76_price(F, strike, T, iv, right=right)
+        self._strike_cache[key] = {
+            "risk_array": ra, "base": base,
+            "F": F, "iv": iv, "time": time.monotonic(),
+        }
+        return ra, base
+
+    # ── Portfolio aggregate cache ──────────────────────────────────
+    def _get_portfolio_state(self, F: float) -> dict:
+        """Aggregate the live position book into (portfolio_ra, nov,
+        long_premium, short_count). Cached across cycles."""
+        if self._portfolio_cache_valid(F):
+            return self._port_state
+
+        portfolio_ra = np.zeros(16)
+        nov = 0.0
+        long_premium = 0.0
+        short_count = 0
+        for p in self.portfolio.positions:
+            opt = self.market_data.state.get_option(p.strike, p.expiry, p.put_call)
+            iv = float(opt.iv) if opt and opt.iv > 0 else 0.0
+            T = max(days_to_expiry(p.expiry), 0) / 365.0
+            if iv <= 0 or T <= 0 or p.quantity == 0:
+                continue
+            ra, base = self._get_strike_risk(p.strike, p.put_call, T, iv, F)
+            portfolio_ra += ra * p.quantity
+            nov += base * p.quantity * self._mult
+            if p.quantity > 0:
+                long_premium += base * p.quantity * self._mult
+            else:
+                short_count += abs(p.quantity)
+
+        self._port_state = {
+            "portfolio_ra": portfolio_ra,
+            "nov": nov,
+            "long_premium": long_premium,
+            "short_count": short_count,
+        }
+        self._port_F = F
+        self._port_time = time.monotonic()
+        return self._port_state
+
+    def _margin_from_state(self, ra: np.ndarray, nov: float,
+                           long_premium: float, short_count: int) -> float:
+        scan_risk = float(max(ra.max(), 0.0)) if ra.size else 0.0
+        risk_margin = max(scan_risk - nov, 0.0)
+        short_min = short_count * self.span.short_option_minimum
+        return max(risk_margin, short_min, long_premium)
+
+    # ── Public API ─────────────────────────────────────────────────
     def get_current_margin(self) -> float:
         """Synthetic SPAN margin over current positions."""
         F = self.market_data.state.underlying_price
         if F <= 0:
             return 0.0
-        positions = _position_tuples(self.portfolio.positions, self.market_data)
-        return self.span.portfolio_margin(F, positions)["total_margin"]
+        st = self._get_portfolio_state(F)
+        return self._margin_from_state(
+            st["portfolio_ra"], st["nov"],
+            st["long_premium"], st["short_count"],
+        )
 
     def update_cached_margin(self):
         """Refresh IBKR's reported maintenance margin (for reconciliation)."""
@@ -93,21 +177,41 @@ class IBKRMarginChecker:
             logger.warning("Failed to refresh IBKR margin: %s", e)
 
     def check_fill_margin(self, option_quote, quantity: int) -> Dict:
-        """Compute current and post-fill synthetic SPAN margin."""
+        """Compute current and post-fill synthetic SPAN margin.
+
+        Hot path: ~0 Black-76 calls when both caches are warm. Just numpy
+        adds against the cached portfolio state.
+        """
         F = self.market_data.state.underlying_price
         if F <= 0:
             return {"current_margin": 0.0, "post_fill_margin": 0.0}
 
-        positions = self.portfolio.positions
-        cur = self.span.portfolio_margin(
-            F, _position_tuples(positions, self.market_data),
-        )["total_margin"]
+        st = self._get_portfolio_state(F)
+        cur = self._margin_from_state(
+            st["portfolio_ra"], st["nov"],
+            st["long_premium"], st["short_count"],
+        )
 
-        override = {(option_quote.strike, option_quote.expiry, option_quote.put_call): quantity}
-        post = self.span.portfolio_margin(
-            F, _position_tuples(positions, self.market_data, override=override),
-        )["total_margin"]
+        # Candidate contribution
+        K = option_quote.strike
+        right = option_quote.put_call
+        opt = self.market_data.state.get_option(K, option_quote.expiry, right)
+        iv = float(opt.iv) if opt and opt.iv > 0 else 0.0
+        T = max(days_to_expiry(option_quote.expiry), 0) / 365.0
+        if iv <= 0 or T <= 0:
+            return {"current_margin": cur, "post_fill_margin": cur}
 
+        cand_ra, cand_base = self._get_strike_risk(K, right, T, iv, F)
+        post_ra = st["portfolio_ra"] + cand_ra * quantity
+        post_nov = st["nov"] + cand_base * quantity * self._mult
+        if quantity > 0:
+            post_long = st["long_premium"] + cand_base * quantity * self._mult
+            post_short = st["short_count"]
+        else:
+            post_long = st["long_premium"]
+            post_short = st["short_count"] + abs(quantity)
+
+        post = self._margin_from_state(post_ra, post_nov, post_long, post_short)
         return {"current_margin": cur, "post_fill_margin": post}
 
 

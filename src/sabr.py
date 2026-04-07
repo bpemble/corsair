@@ -171,6 +171,10 @@ class SABRSurface:
         self.last_calibration: Optional[datetime] = None
         self.params: Optional[SABRParams] = None
         self._front_month_expiry: Optional[str] = None
+        # Theo cache: {(strike, put_call): (theo, monotonic_time)}
+        # 100ms TTL — quote loop ticks faster than this so we hit warm cache often
+        self._theo_cache: dict = {}
+        self._theo_cache_ttl_sec: float = 0.1
 
     def set_expiry(self, expiry: str):
         """Set the front month expiry for TTE calculations."""
@@ -221,6 +225,7 @@ class SABRSurface:
             self.nu = result.nu
             self.params = result
             self.last_calibration = datetime.now()
+            self._theo_cache.clear()  # parameters changed; flush stale theo
             logger.info(
                 "SABR calibrated: alpha=%.4f rho=%.3f nu=%.3f RMSE=%.4f (n=%d)",
                 result.alpha, result.rho, result.nu, result.rmse, result.n_points,
@@ -239,12 +244,20 @@ class SABRSurface:
         )
 
     def get_theo(self, strike: float, put_call: str = "C") -> float:
-        """Return theoretical option price from SABR surface."""
+        """Return theoretical option price from SABR surface (TTL-cached)."""
+        import time as _time
+        key = (strike, put_call)
+        now = _time.monotonic()
+        cached = self._theo_cache.get(key)
+        if cached is not None and (now - cached[1]) < self._theo_cache_ttl_sec:
+            return cached[0]
         tte = self._get_tte()
         if tte <= 0:
             return 0.0
         vol = self.get_vol(strike)
-        return PricingEngine.black76_price(self.forward, strike, tte, vol, right=put_call)
+        theo = PricingEngine.black76_price(self.forward, strike, tte, vol, right=put_call)
+        self._theo_cache[key] = (theo, now)
+        return theo
 
     def is_quote_stale(self, option, threshold_iv_diff: float = None) -> bool:
         """Check if incumbent quote is stale by comparing IV to SABR surface."""

@@ -6,3 +6,4 @@ pyyaml>=6.0
 streamlit>=1.30
 streamlit-autorefresh>=1.0
 plotly>=5.18
+uvloop>=0.19

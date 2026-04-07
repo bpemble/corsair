@@ -60,6 +60,10 @@ class FillHandler:
             strike=strike, expiry=expiry, put_call=put_call,
             quantity=quantity, fill_price=fill_price,
         )
+        # Invalidate the synthetic SPAN portfolio cache — the position book
+        # just changed, so the cached aggregate is stale.
+        if hasattr(self.margin, "invalidate_portfolio"):
+            self.margin.invalidate_portfolio()
 
         # Log
         logger.info(
