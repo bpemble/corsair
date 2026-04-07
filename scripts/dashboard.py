@@ -683,6 +683,8 @@ if snapshot is not None and snapshot.get("strikes"):
             <td style="background-color:rgba(99,102,241,0.08);color:{TEXT_PRIMARY};font-weight:500;">{theo_str}</td>
             <td>{our_ask_str}</td>
             <td>{mkt_ask:.1f}</td>
+            <td class="center">{volume:,}</td>
+            <td class="center">{oi:,}</td>
             <td>{edge_str}</td>
             <td>{delta:.3f}</td>
             <td class="center">{status_str}</td>
@@ -702,6 +704,8 @@ if snapshot is not None and snapshot.get("strikes"):
                 <th>Theo</th>
                 <th>Our Ask</th>
                 <th>Mkt Ask</th>
+                <th class="center">Vol</th>
+                <th class="center">OI</th>
                 <th>Edge</th>
                 <th>Delta</th>
                 <th class="center">Status</th>
