@@ -76,12 +76,12 @@ st.set_page_config(
 
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# Auto-refresh — page-level refresh stays at 5s for the slow-changing
-# sections (account, positions, risk buckets, header). The option chain
-# itself runs in an st.fragment with its own 2s cadence (defined further
-# down) so it updates faster without re-rendering the whole page.
+# Auto-refresh — page-level rerun every 500ms. Combined with the chain
+# fragment's faster cadence (defined further down) and corsair writing the
+# snapshot at 4Hz, this keeps visible state ≤500ms stale. Single-user
+# dashboard so the rerun rate is well within Streamlit's comfort zone.
 if _HAS_AUTOREFRESH:
-    st_autorefresh(interval=5000, limit=None, key="page_refresh")
+    st_autorefresh(interval=500, limit=None, key="page_refresh")
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -131,7 +131,7 @@ else:
     status_class = "offline"
     status_text = "NO DATA"
 
-# Latency pill (TTT / RTT) — pulled from the engine snapshot
+# Latency pill (TTT / RTT / AMEND) — pulled from the engine snapshot
 def _fmt_us(us):
     if us is None:
         return "—"
@@ -144,12 +144,15 @@ if snapshot is not None:
     lat = snapshot.get("latency") or {}
     ttt = (lat.get("ttt_us") or {})
     rtt = (lat.get("rtt_us") or {})
+    amend = (lat.get("amend_us") or {})
     ttt_p50 = _fmt_us(ttt.get("p50")); ttt_p99 = _fmt_us(ttt.get("p99"))
     rtt_p50 = _fmt_us(rtt.get("p50")); rtt_p99 = _fmt_us(rtt.get("p99"))
+    amend_p50 = _fmt_us(amend.get("p50")); amend_p99 = _fmt_us(amend.get("p99"))
     latency_pill = (
-        f'<span class="latency-pill" title="rolling p50/p99 — TTT samples: {ttt.get("n",0)}, RTT samples: {rtt.get("n",0)}">'
+        f'<span class="latency-pill" title="rolling p50/p99 — TTT samples: {ttt.get("n",0)}, RTT samples: {rtt.get("n",0)}, AMEND samples: {amend.get("n",0)}">'
         f'<span class="lat-row"><span class="lat-key">TTT</span>{ttt_p50} / {ttt_p99}</span>'
         f'<span class="lat-row"><span class="lat-key">RTT</span>{rtt_p50} / {rtt_p99}</span>'
+        f'<span class="lat-row"><span class="lat-key">AMD</span>{amend_p50} / {amend_p99}</span>'
         f'</span>'
     )
 
@@ -188,6 +191,7 @@ if snapshot is not None:
     net_theta = port.get("net_theta", 0)
     fills_today = port.get("fills_today", 0)
     spread_capture = port.get("spread_capture", 0)
+    spread_capture_mid = port.get("spread_capture_mid", 0)
 
     # Color bands track the snapshot's `limits` block so the dashboard
     # adapts automatically to whatever stage we're in. Within constraint
@@ -275,10 +279,11 @@ if snapshot is not None:
 
     with col6:
         sc_color = "green" if spread_capture >= 0 else "red"
+        mid_color = "green" if spread_capture_mid >= 0 else "red"
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">Spread Capture</div>
-            <div class="metric-value {sc_color}">${spread_capture:,.0f}</div>
+            <div class="metric-value {sc_color}">${spread_capture:,.0f}<span class="{mid_color}" style="font-size:0.55em;opacity:0.7;font-weight:normal;margin-left:0.3em;">(${spread_capture_mid:,.0f})</span></div>
         </div>
         """, unsafe_allow_html=True)
 else:
@@ -394,11 +399,11 @@ if snapshot is not None:
 
 st.markdown('<div class="section-header">Option Chain</div>', unsafe_allow_html=True)
 
-@st.fragment(run_every=2)
+@st.fragment(run_every=0.25)
 def render_chain():
     """Chain table render. Lives in a fragment so only this section
-    re-renders on its own 2s cadence — the rest of the page refreshes
-    at 5s and doesn't flicker the table on every refresh."""
+    re-renders on its own 4Hz cadence — matches the snapshot write rate
+    so we catch every fresh state without re-rendering the whole page."""
     snapshot = load_snapshot()
     chain_html = build_chain_html(snapshot)
     if chain_html is not None:

@@ -1,7 +1,7 @@
 account:
   gateway_host: "127.0.0.1"
   gateway_port: 4002
-  client_id: 1
+  client_id: 0  # MUST be 0 on FA accounts — see connection.py
   account_id: "UXXXXXXX"
 
 product:
@@ -64,7 +64,7 @@ quoting:
   penny_jump_ticks: 1         # Number of ticks inside incumbent's spread
   refresh_interval_ms: 1000   # Periodic full-refresh fallback (event-driven path is real-time)
   tick_batch_window_sec: 0.005       # Drain queue for 5ms after first tick (latency floor)
-  snapshot_write_interval_sec: 1.0   # Dashboard snapshot cadence
+  snapshot_write_interval_sec: 0.25  # Dashboard snapshot cadence (4Hz for near-real-time UI)
   greek_refresh_seconds: 300  # Refresh Greeks every 5 minutes
   # Depth-aware incumbent selection
   depth_levels: 5                  # Subscribe to top N levels per strike per side
@@ -85,10 +85,19 @@ operations:
 
 pricing:
   sabr_enabled: true
-  min_edge_points: 1.0        # Reject quote if our price is within $N of SABR theo.
-                              # SABR's structural fit residual is ~±$1 on liquid
-                              # ETH calls; combined with this $1 buffer the
-                              # effective edge from real fair value is ~$2.
+  min_edge_points: 0.5        # Reject quote if our price is within $N of SABR theo.
+                              # Loosened from 1.0 to 0.5 (one tick) on 2026-04-08
+                              # to test capture rate. SABR's structural fit residual
+                              # is ~±$1, so the effective real-world edge floor is
+                              # still ~$1.5; we're trading some model-confidence
+                              # cushion for ~3x the quotable surface area.
+  theo_edge_hysteresis_ticks: 1  # Consecutive theo_edge violations required before
+                                 # cancelling a resting order. 1 = no hysteresis
+                                 # (cancel on first violation, original behavior).
+                                 # 2 = require two cycles (smoother, but observed
+                                 # to trade `idle` for `behind` in the 2026-04-08
+                                 # measurement). Default 1 until we have data
+                                 # justifying the trade-off.
   sabr_recalibrate_seconds: 60
   sabr_fast_recal_dollars: 10.0  # Force a recal when underlying moves > $N since last fit
   sabr_beta: 1.0              # Fixed backbone (1.0 = lognormal, matches v1)
