@@ -26,6 +26,11 @@ class RiskMonitor:
         self.config = config
         self.killed = False
         self._kill_reason: str = ""
+        # Tracks who triggered the kill so the watchdog knows whether it can
+        # auto-clear it. "risk" kills are sticky (margin/delta/pnl breach
+        # demands human review). "disconnect" kills clear automatically when
+        # the watchdog successfully reconnects.
+        self._kill_source: str = ""
 
     def check(self, market_state):
         """Run all risk checks. Called every greek_refresh_seconds."""
@@ -80,6 +85,15 @@ class RiskMonitor:
             )
             return
 
+        # Vega kill switch (Stage 1+). Vega is the largest unmodeled risk
+        # at production scale; bound it explicitly.
+        vega_kill = float(getattr(self.config.kill_switch, "vega_kill", 0) or 0)
+        if vega_kill > 0 and abs(self.portfolio.net_vega) > vega_kill:
+            self.kill(
+                f"VEGA KILL: ${self.portfolio.net_vega:+,.0f} > ±${vega_kill:,.0f}"
+            )
+            return
+
         if self.portfolio.daily_pnl < self.config.kill_switch.max_daily_loss:
             self.kill(
                 f"P&L KILL: ${self.portfolio.daily_pnl:,.0f} < "
@@ -96,13 +110,35 @@ class RiskMonitor:
             )
             self.quotes.cancel_all_quotes()
 
-    def kill(self, reason: str):
-        """Emergency shutdown: cancel all quotes."""
-        logger.critical("KILL SWITCH ACTIVATED: %s", reason)
+    def kill(self, reason: str, source: str = "risk"):
+        """Emergency shutdown: cancel all quotes.
+
+        source="risk" (default) for margin/delta/pnl breaches — sticky.
+        source="disconnect" for gateway-loss kills — clearable by the
+        watchdog after a successful reconnect.
+        """
+        logger.critical("KILL SWITCH ACTIVATED [%s]: %s", source, reason)
         self.quotes.cancel_all_quotes()
         self.killed = True
         self._kill_reason = reason
+        self._kill_source = source
+
+    def clear_disconnect_kill(self) -> bool:
+        """Clear a kill IFF it was caused by a disconnect. Returns True if
+        cleared. Risk-induced kills (margin/delta/pnl) remain sticky and
+        will return False — those need human review."""
+        if self.killed and self._kill_source == "disconnect":
+            logger.info("Clearing disconnect-induced kill: %s", self._kill_reason)
+            self.killed = False
+            self._kill_reason = ""
+            self._kill_source = ""
+            return True
+        return False
 
     @property
     def kill_reason(self) -> str:
         return self._kill_reason
+
+    @property
+    def kill_source(self) -> str:
+        return self._kill_source

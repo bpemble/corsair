@@ -18,6 +18,7 @@ class CSVLogger:
         self._fill_path = os.path.join(self.log_dir, "fills.csv")
         self._risk_path = os.path.join(self.log_dir, "risk_snapshots.csv")
         self._quote_path = os.path.join(self.log_dir, "quotes.csv")
+        self._trade_path = os.path.join(self.log_dir, "trades.csv")
 
         self._init_files()
 
@@ -28,13 +29,25 @@ class CSVLogger:
                 "timestamp", "strike", "expiry", "put_call", "side", "quantity",
                 "fill_price", "spread_captured_est", "margin_after", "delta_after",
                 "theta_after", "vega_after", "fills_today", "cumulative_spread",
+                "fill_latency_ms",
             ])
 
         if not os.path.exists(self._quote_path):
             self._write_header(self._quote_path, [
                 "timestamp", "strike", "side", "our_price", "incumbent_price",
                 "incumbent_level", "incumbent_size", "incumbent_age_ms",
-                "bbo_width", "skip_reason",
+                "bbo_width", "skip_reason", "theo", "put_call",
+            ])
+
+        if not os.path.exists(self._trade_path):
+            self._write_header(self._trade_path, [
+                "timestamp", "strike", "put_call", "last_price", "last_size",
+                "trades_in_burst",  # how many prints rolled into this callback
+                "mkt_bid", "mkt_ask",
+                "our_bid", "our_ask",  # our resting prices at print time (or empty)
+                "our_bid_live", "our_ask_live",
+                "theo",
+                "side_inferred",  # "buy" / "sell" / "" via Lee-Ready price-vs-mid
             ])
 
         if not os.path.exists(self._risk_path):
@@ -59,17 +72,44 @@ class CSVLogger:
 
     def log_fill(self, strike, expiry, put_call, side, quantity, fill_price,
                  margin_after, delta_after, theta_after, vega_after,
-                 fills_today, cumulative_spread):
+                 fills_today, cumulative_spread, fill_latency_ms=None):
         self._append_row(self._fill_path, [
             datetime.now().isoformat(), strike, expiry, put_call, side,
             quantity, fill_price, 100 * quantity,  # Estimated spread capture
             f"{margin_after:.0f}", f"{delta_after:.3f}", f"{theta_after:.0f}",
             f"{vega_after:.0f}", fills_today, f"{cumulative_spread:.0f}",
+            f"{fill_latency_ms:.0f}" if fill_latency_ms is not None else "",
+        ])
+
+    def log_trade(self, strike, put_call, last_price, last_size,
+                  trades_in_burst, mkt_bid, mkt_ask,
+                  our_bid, our_ask, our_bid_live, our_ask_live,
+                  theo, side_inferred):
+        """Append one row per detected trade print on an option contract.
+
+        Captures market context AND our resting state at print time so we
+        can later analyze: did this print happen at our quote? At what
+        side? Did we miss a fillable opportunity? This is the raw data the
+        capture-rate analysis runs on.
+        """
+        self._append_row(self._trade_path, [
+            datetime.now().isoformat(), strike, put_call,
+            f"{last_price:.2f}" if last_price is not None else "",
+            last_size if last_size is not None else "",
+            trades_in_burst,
+            f"{mkt_bid:.2f}" if mkt_bid else "",
+            f"{mkt_ask:.2f}" if mkt_ask else "",
+            f"{our_bid:.2f}" if our_bid is not None else "",
+            f"{our_ask:.2f}" if our_ask is not None else "",
+            int(bool(our_bid_live)),
+            int(bool(our_ask_live)),
+            f"{theo:.2f}" if theo is not None else "",
+            side_inferred or "",
         ])
 
     def log_quote(self, strike, side, our_price, incumbent_price,
                   incumbent_level, incumbent_size, incumbent_age_ms,
-                  bbo_width, skip_reason=""):
+                  bbo_width, skip_reason="", theo=None, put_call="C"):
         self._append_row(self._quote_path, [
             datetime.now().isoformat(), strike, side,
             f"{our_price:.2f}" if our_price is not None else "",
@@ -79,6 +119,8 @@ class CSVLogger:
             incumbent_age_ms if incumbent_age_ms is not None else "",
             f"{bbo_width:.2f}" if bbo_width is not None else "",
             skip_reason,
+            f"{theo:.2f}" if theo is not None else "",
+            put_call,
         ])
 
     def log_risk_snapshot(self, underlying_price, margin_used, margin_pct,

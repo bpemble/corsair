@@ -149,10 +149,16 @@ class SyntheticSpan:
         worst = int(portfolio.argmax()) + 1 if scan_risk > 0 else 0
         short_min = short_count * self.short_option_minimum
         risk_margin = max(scan_risk - nov, 0.0)
-        # Capital-budget floor: long premium paid is unrecoverable cash and
-        # consumes the same capital as posted margin. IBKR reports this in
-        # its margin column even though pure CME SPAN does not. Floor the
-        # requirement at long_premium so net-long books are not under-counted.
+        # Conservative max-of-three. Empirically the floor matches IBKR with
+        # a +50% systematic over-estimate (ratio ~1.5). This is acceptable as
+        # a launch posture: we err in the safe direction (refuse fills IBKR
+        # would allow). Compensate by setting margin_ceiling at 2/3 of the
+        # nominal target. Two alternatives that I tested today and which
+        # perform worse:
+        #   - Removing long_premium entirely (ratio 0.05, dangerous)
+        #   - Additive (risk + long_premium): ratio 1.58, worse than max
+        # The right long-term fix is to model SPAN inter-month / inter-strike
+        # offsets properly, but that's a v2.1 effort.
         total = max(risk_margin, short_min, long_premium)
         return {
             "scan_risk": scan_risk,

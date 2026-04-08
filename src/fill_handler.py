@@ -55,6 +55,16 @@ class FillHandler:
 
         side = "BOUGHT" if quantity > 0 else "SOLD"
 
+        # Capture place→fill latency BEFORE recording the fill (the order id
+        # mapping in QuoteManager survives until we explicitly pop it).
+        fill_latency_ms = None
+        try:
+            order_id = trade.order.orderId
+            if hasattr(self.quotes, "fill_latency_ms"):
+                fill_latency_ms = self.quotes.fill_latency_ms(order_id)
+        except Exception:
+            pass
+
         # Record the fill
         self.portfolio.add_fill(
             strike=strike, expiry=expiry, put_call=put_call,
@@ -85,6 +95,7 @@ class FillHandler:
             vega_after=self.portfolio.net_vega,
             fills_today=self.portfolio.fills_today,
             cumulative_spread=self.portfolio.spread_capture_today,
+            fill_latency_ms=fill_latency_ms,
         )
 
         # Immediately re-evaluate all quotes (fill changes portfolio state)

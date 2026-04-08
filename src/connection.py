@@ -16,6 +16,8 @@ class IBKRConnection:
         self.ib = IB()
         self._on_disconnect_callback: Optional[Callable] = None
         self._connected = False
+        self._disconnect_fired = False
+        self._disconnect_handler_registered = False
 
     @property
     def connected(self) -> bool:
@@ -35,9 +37,12 @@ class IBKRConnection:
         try:
             await self.ib.connectAsync(host, port, clientId=client_id, timeout=30)
             self._connected = True
+            self._disconnect_fired = False  # arm for the next drop
 
-            # Register disconnect handler
-            self.ib.disconnectedEvent += self._on_disconnect
+            # Register disconnect handler (only once across reconnects)
+            if not getattr(self, "_disconnect_handler_registered", False):
+                self.ib.disconnectedEvent += self._on_disconnect
+                self._disconnect_handler_registered = True
 
             logger.info("Connected to IBKR Gateway. Server version: %s", self.ib.client.serverVersion())
             return True
@@ -48,13 +53,24 @@ class IBKRConnection:
 
     async def disconnect(self):
         """Gracefully disconnect from IBKR Gateway."""
+        # Mark as already-fired so the disconnectedEvent that ib_insync emits
+        # during ib.disconnect() doesn't re-trigger our user callback (the
+        # caller is initiating this teardown deliberately).
+        self._disconnect_fired = True
         if self.ib.isConnected():
             self.ib.disconnect()
         self._connected = False
         logger.info("Disconnected from IBKR Gateway")
 
     def _on_disconnect(self):
-        """Called when gateway connection drops."""
+        """Called when gateway connection drops. Idempotent within a session
+        — only the first invocation per connection actually fires the user
+        callback. ib_insync's disconnectedEvent can fire multiple times for a
+        single drop (and once more from a deliberate teardown), so we guard
+        with a per-connection flag that resets on each successful connect."""
+        if getattr(self, "_disconnect_fired", False):
+            return
+        self._disconnect_fired = True
         self._connected = False
         logger.critical("IBKR Gateway connection lost")
         if self._on_disconnect_callback:

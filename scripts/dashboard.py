@@ -20,6 +20,7 @@ PROJECT_ROOT = _SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
 # Auto-refresh (try streamlit-autorefresh, fall back to manual)
@@ -50,7 +51,14 @@ BG_CARD_BORDER = "#1e293b"
 GREEN = "#22c55e"
 RED = "#ef4444"
 AMBER = "#f59e0b"
-TEXT_PRIMARY = "#e2e8f0"
+# Desaturated steady-state variants — used for table cells & passive labels.
+# Reserve full-saturation GREEN/RED/AMBER for kill banners, alerts, and the
+# LIVE indicator where the eye should snap to them.
+GREEN_MUTED = "#4d9b6e"
+RED_MUTED = "#b86a6a"
+AMBER_MUTED = "#b88a3e"
+TEXT_PRIMARY = "#cbd5e1"
+TEXT_SECONDARY = "#94a3b8"
 TEXT_MUTED = "#64748b"
 ACCENT = "#6366f1"
 
@@ -140,14 +148,15 @@ CUSTOM_CSS = f"""
     .corsair-status {{
         display: flex;
         align-items: center;
+        gap: 10px;
     }}
     .status-pill {{
         display: inline-flex;
         align-items: center;
         gap: 8px;
-        padding: 6px 14px;
-        border-radius: 20px;
-        background: rgba(255,255,255,0.04);
+        padding: 6px 12px;
+        border-radius: 8px;
+        background: rgba(255,255,255,0.025);
         border: 1px solid {BG_CARD_BORDER};
     }}
     .status-dot {{
@@ -179,6 +188,28 @@ CUSTOM_CSS = f"""
     .status-label.offline {{
         color: {RED};
     }}
+    .latency-pill {{
+        display: inline-flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 2px;
+        padding: 5px 12px;
+        border-radius: 8px;
+        background: rgba(255,255,255,0.025);
+        border: 1px solid {BG_CARD_BORDER};
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 10.5px;
+        line-height: 1.2;
+        color: {TEXT_MUTED};
+        letter-spacing: 0.2px;
+    }}
+    .latency-pill .lat-row {{
+        display: inline-flex;
+        gap: 8px;
+    }}
+    .latency-pill .lat-key {{
+        opacity: 0.7;
+    }}
 
     @keyframes pulse {{
         0% {{ opacity: 1; }}
@@ -188,36 +219,43 @@ CUSTOM_CSS = f"""
 
     /* ── Metric Cards ──────────────────────────────────── */
     .metric-card {{
-        background-color: {BG_CARD};
-        border: 1px solid {BG_CARD_BORDER};
-        border-radius: 8px;
-        padding: 16px;
-        text-align: center;
+        background-color: transparent;
+        border: none;
+        border-bottom: 1px solid {BG_CARD_BORDER};
+        border-radius: 0;
+        padding: 8px 4px 10px 4px;
+        text-align: left;
     }}
     .metric-value {{
-        font-size: 26px;
-        font-weight: 700;
-        margin: 4px 0;
+        font-size: 20px;
+        font-weight: 600;
+        margin: 2px 0 0 0;
         font-family: 'Inter', sans-serif;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.01em;
     }}
     .metric-label {{
-        font-size: 11px;
+        font-size: 10px;
         color: {TEXT_MUTED};
         text-transform: uppercase;
-        letter-spacing: 0.05em;
+        letter-spacing: 0.08em;
+        font-weight: 500;
     }}
-    .green {{ color: {GREEN}; }}
-    .red {{ color: {RED}; }}
-    .amber {{ color: {AMBER}; }}
+    .green {{ color: {GREEN_MUTED}; }}
+    .red {{ color: {RED_MUTED}; }}
+    .amber {{ color: {AMBER_MUTED}; }}
     .blue {{ color: {BLUE}; }}
 
     /* ── Section Header ────────────────────────────────── */
     .section-header {{
-        font-family: 'DM Serif Display', serif;
-        font-size: 18px;
-        color: {TEXT_PRIMARY};
-        margin: 20px 0 12px 0;
-        padding-bottom: 8px;
+        font-family: 'Inter', sans-serif;
+        font-size: 10px;
+        font-weight: 600;
+        color: {TEXT_MUTED};
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        margin: 22px 0 8px 0;
+        padding-bottom: 6px;
         border-bottom: 1px solid {BG_CARD_BORDER};
     }}
 
@@ -275,6 +313,46 @@ CUSTOM_CSS = f"""
     .chain-table tr:hover {{
         background: rgba(99, 102, 241, 0.06);
     }}
+    .chain-table td.chain-theo {{
+        color: {TEXT_SECONDARY};
+        font-weight: 500;
+    }}
+    .chain-table th.chain-side-hdr {{
+        font-size: 10px;
+        letter-spacing: 0.15em;
+        color: {TEXT_MUTED};
+        background: rgba(255,255,255,0.015);
+        border-bottom: 1px solid {BG_CARD_BORDER};
+    }}
+    .chain-table td.chain-strike-cell {{
+        background: rgba(255,255,255,0.025);
+        border-left: 1px solid {BG_CARD_BORDER};
+        border-right: 1px solid {BG_CARD_BORDER};
+    }}
+    .bucket-table {{
+        width: 100%;
+    }}
+    .bucket-table td.bucket-label {{
+        text-align: left;
+        font-weight: 600;
+        color: {TEXT_PRIMARY};
+        letter-spacing: 0.05em;
+    }}
+    .side-subhdr {{
+        font-family: 'Inter', sans-serif;
+        font-size: 9px;
+        font-weight: 600;
+        color: {TEXT_MUTED};
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        margin: 0 0 6px 2px;
+    }}
+    .empty-positions {{
+        font-size: 12px;
+        color: {TEXT_MUTED};
+        padding: 8px 4px;
+        font-style: italic;
+    }}
     .chain-table tr.atm-row {{
         background: rgba(99, 102, 241, 0.08);
         border-left: 3px solid {ACCENT};
@@ -283,36 +361,40 @@ CUSTOM_CSS = f"""
         background: rgba(99, 102, 241, 0.14);
     }}
     .chain-strike {{
-        font-weight: 700;
+        font-weight: 400;
         color: {TEXT_PRIMARY};
-        font-size: 14px;
+        font-size: 13px;
     }}
     .chain-our-price {{
-        font-weight: 600;
+        font-weight: 500;
     }}
-    .chain-our-price.live {{
-        color: {BLUE};
+    .chain-our-price.quoting {{
+        color: {GREEN_MUTED};
+    }}
+    .chain-our-price.pending {{
+        color: {AMBER_MUTED};
     }}
     .chain-our-price.behind {{
-        color: {RED};
+        color: {RED_MUTED};
     }}
-    .chain-our-price.inactive {{
+    .chain-our-price.idle {{
         color: {TEXT_MUTED};
     }}
     .chain-edge.positive {{
-        color: {GREEN};
-        font-weight: 600;
+        color: {GREEN_MUTED};
+        font-weight: 500;
     }}
     .chain-edge.negative {{
-        color: {RED};
+        color: {RED_MUTED};
+        font-weight: 500;
     }}
     .chain-pos.long {{
-        color: {GREEN};
-        font-weight: 600;
+        color: {GREEN_MUTED};
+        font-weight: 500;
     }}
     .chain-pos.short {{
-        color: {RED};
-        font-weight: 600;
+        color: {RED_MUTED};
+        font-weight: 500;
     }}
     .chain-status {{
         font-size: 11px;
@@ -357,9 +439,12 @@ st.set_page_config(
 
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# Auto-refresh
+# Auto-refresh — page-level refresh stays at 5s for the slow-changing
+# sections (account, positions, risk buckets, header). The option chain
+# itself runs in an st.fragment with its own 2s cadence (defined further
+# down) so it updates faster without re-rendering the whole page.
 if _HAS_AUTOREFRESH:
-    st_autorefresh(interval=2000, limit=None, key="chain_refresh")
+    st_autorefresh(interval=5000, limit=None, key="page_refresh")
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -424,6 +509,28 @@ else:
     status_class = "offline"
     status_text = "NO DATA"
 
+# Latency pill (TTT / RTT) — pulled from the engine snapshot
+def _fmt_us(us):
+    if us is None:
+        return "—"
+    if us < 1000:
+        return f"{us}μs"
+    return f"{us/1000:.1f}ms"
+
+latency_pill = ""
+if snapshot is not None:
+    lat = snapshot.get("latency") or {}
+    ttt = (lat.get("ttt_us") or {})
+    rtt = (lat.get("rtt_us") or {})
+    ttt_p50 = _fmt_us(ttt.get("p50")); ttt_p99 = _fmt_us(ttt.get("p99"))
+    rtt_p50 = _fmt_us(rtt.get("p50")); rtt_p99 = _fmt_us(rtt.get("p99"))
+    latency_pill = (
+        f'<span class="latency-pill" title="rolling p50/p99 — TTT samples: {ttt.get("n",0)}, RTT samples: {rtt.get("n",0)}">'
+        f'<span class="lat-row"><span class="lat-key">TTT</span>{ttt_p50} / {ttt_p99}</span>'
+        f'<span class="lat-row"><span class="lat-key">RTT</span>{rtt_p50} / {rtt_p99}</span>'
+        f'</span>'
+    )
+
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
@@ -438,6 +545,7 @@ st.markdown(f"""
         </div>
     </div>
     <div class="corsair-status">
+        {latency_pill}
         <span class="status-pill">
             <span class="status-dot {status_class}"></span>
             <span class="status-label {status_class}">{status_text}</span>
@@ -459,17 +567,39 @@ if snapshot is not None:
     fills_today = port.get("fills_today", 0)
     spread_capture = port.get("spread_capture", 0)
 
+    # Color bands track the snapshot's `limits` block so the dashboard
+    # adapts automatically to whatever stage we're in. Within constraint
+    # → no extra color (default white text). Between constraint and kill
+    # → amber. Beyond kill threshold → red.
+    limits = snapshot.get("limits", {}) if snapshot else {}
+    delta_ceiling = float(limits.get("delta_ceiling", 0) or 0)
+    delta_kill = float(limits.get("delta_kill", 0) or 0)
+    theta_floor = float(limits.get("theta_floor", 0) or 0)
+    margin_ceiling = float(limits.get("margin_ceiling", 0) or 0)
+    margin_kill = float(limits.get("margin_kill", 0) or 0)
+
     def _delta_color(d):
-        if abs(d) < 0.5:
-            return "green"
-        if abs(d) < 1.0:
+        if delta_ceiling <= 0:
+            return ""
+        if abs(d) <= delta_ceiling:
+            return ""  # within constraint → default text color
+        if delta_kill > 0 and abs(d) <= delta_kill:
             return "amber"
         return "red"
 
     def _theta_color(t):
-        if t > -100:
-            return "green"
-        if t > -400:
+        if theta_floor >= 0:
+            return ""
+        if t >= theta_floor:
+            return ""  # within constraint → default text color
+        return "red"  # below floor — no separate kill threshold for theta in spec
+
+    def _margin_color(m):
+        if margin_ceiling <= 0:
+            return ""
+        if m <= margin_ceiling:
+            return ""  # within constraint → default text color
+        if margin_kill > 0 and m <= margin_kill:
             return "amber"
         return "red"
 
@@ -484,28 +614,32 @@ if snapshot is not None:
         """, unsafe_allow_html=True)
 
     with col2:
+        mc = _margin_color(margin_val)
+        cls = f" {mc}" if mc else ""
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">Margin</div>
-            <div class="metric-value">${margin_val:,.0f}</div>
+            <div class="metric-value{cls}">${margin_val:,.0f}</div>
         </div>
         """, unsafe_allow_html=True)
 
     with col3:
         dc = _delta_color(net_delta)
+        cls = f" {dc}" if dc else ""
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">Net Delta</div>
-            <div class="metric-value {dc}">{net_delta:+.2f}</div>
+            <div class="metric-value{cls}">{net_delta:+.2f}</div>
         </div>
         """, unsafe_allow_html=True)
 
     with col4:
         tc = _theta_color(net_theta)
+        cls = f" {tc}" if tc else ""
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">Net Theta</div>
-            <div class="metric-value {tc}">${net_theta:,.0f}/day</div>
+            <div class="metric-value{cls}">{net_theta:+,.0f}</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -557,36 +691,80 @@ if snapshot is not None:
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown('<div class="section-header">Open Positions</div>', unsafe_allow_html=True)
-    if positions:
-        pos_rows = ""
-        for p in sorted(positions, key=lambda x: (x["expiry"], x["right"], x["strike"])):
+    # ── Per-side risk buckets and open positions, side by side ──
+    calls_b = port.get("calls") or {}
+    puts_b = port.get("puts") or {}
+
+    def _bucket_table(b):
+        d = b.get("delta", 0); t = b.get("theta", 0)
+        m = b.get("margin", 0); g = b.get("gross", 0)
+        dc = "green" if abs(d) <= 1.5 else ("amber" if abs(d) <= 2.0 else "red")
+        tc = "green" if t >= -300 else ("amber" if t >= -400 else "red")
+        return f"""
+        <table class="chain-table bucket-table">
+          <thead><tr>
+            <th>Margin</th><th>Δ</th><th>Θ</th><th>Contracts</th>
+          </tr></thead>
+          <tbody>
+            <tr>
+              <td>${m:,.0f}</td>
+              <td class="{dc}">{d:+.2f}</td>
+              <td class="{tc}">{t:+,.0f}</td>
+              <td>{g}</td>
+            </tr>
+          </tbody>
+        </table>
+        """
+
+    def _positions_table(side_positions):
+        if not side_positions:
+            return '<div class="empty-positions">No open positions.</div>'
+        rows = ""
+        for p in sorted(side_positions, key=lambda x: (x["expiry"], x["strike"])):
             qty = p["qty"]
             qty_class = "pos-long" if qty > 0 else "pos-short"
             unr = p["unrealized_pnl"]
             unr_class = "positive" if unr >= 0 else "negative"
-            pos_rows += f"""<tr>
-                <td>{p['expiry']}</td>
+            rows += f"""<tr>
                 <td>{int(p['strike'])}{p['right']}</td>
                 <td class="{qty_class}">{qty:+d}</td>
                 <td>${p['avg_price']:.2f}</td>
                 <td>${p['mark']:.2f}</td>
                 <td class="chain-edge {unr_class}">${unr:+,.0f}</td>
                 <td>{p['delta']:+.3f}</td>
-                <td>${p['theta']:+,.0f}</td>
+                <td>{p['theta']:+,.0f}</td>
             </tr>"""
-        positions_html = f"""
+        return f"""
         <table class="chain-table">
             <thead><tr>
-                <th>Expiry</th><th>Contract</th><th>Qty</th><th>Avg Price</th>
-                <th>Mark</th><th>Unrealized P&amp;L</th><th>&Delta;</th><th>&Theta;/day</th>
+                <th>Contract</th><th>Qty</th><th>Avg</th><th>Mark</th>
+                <th>P&amp;L</th><th>&Delta;</th><th>&Theta;</th>
             </tr></thead>
-            <tbody>{pos_rows}</tbody>
+            <tbody>{rows}</tbody>
         </table>
         """
-        st.markdown(positions_html, unsafe_allow_html=True)
-    else:
-        st.caption("No open positions.")
+
+    calls_positions = [p for p in positions if p.get("right") == "C"]
+    puts_positions = [p for p in positions if p.get("right") == "P"]
+
+    if calls_b or puts_b or positions:
+        st.markdown('<div class="section-header">Risk by Side</div>', unsafe_allow_html=True)
+        rcol1, rcol2 = st.columns(2)
+        with rcol1:
+            st.markdown('<div class="side-subhdr">Calls</div>', unsafe_allow_html=True)
+            st.markdown(_bucket_table(calls_b), unsafe_allow_html=True)
+        with rcol2:
+            st.markdown('<div class="side-subhdr">Puts</div>', unsafe_allow_html=True)
+            st.markdown(_bucket_table(puts_b), unsafe_allow_html=True)
+
+        st.markdown('<div class="section-header">Open Positions</div>', unsafe_allow_html=True)
+        pcol1, pcol2 = st.columns(2)
+        with pcol1:
+            st.markdown('<div class="side-subhdr">Calls</div>', unsafe_allow_html=True)
+            st.markdown(_positions_table(calls_positions), unsafe_allow_html=True)
+        with pcol2:
+            st.markdown('<div class="side-subhdr">Puts</div>', unsafe_allow_html=True)
+            st.markdown(_positions_table(puts_positions), unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Option Chain Table
@@ -594,132 +772,193 @@ if snapshot is not None:
 
 st.markdown('<div class="section-header">Option Chain</div>', unsafe_allow_html=True)
 
-if snapshot is not None and snapshot.get("strikes"):
-    atm_strike = snapshot.get("atm_strike", 0)
-    strikes = snapshot["strikes"]
+@st.fragment(run_every=2)
+def render_chain():
+    """Chain table render. Lives in a fragment so only this section
+    re-renders on its own 2s cadence — the rest of the page refreshes
+    at 5s and doesn't flicker the table on every refresh."""
+    snapshot = load_snapshot()
+    if snapshot is not None and snapshot.get("strikes"):
+        atm_strike = snapshot.get("atm_strike", 0)
+        strikes = snapshot["strikes"]
 
-    # Build HTML table
-    rows_html = ""
-    for strike_str in sorted(strikes.keys(), key=lambda s: float(s)):
-        s = strikes[strike_str]
-        strike_val = float(strike_str)
-        is_atm = abs(strike_val - atm_strike) < 1.0
-        row_class = ' class="atm-row"' if is_atm else ""
-
-        mkt_bid = s.get("market_bid", 0) or 0
-        mkt_ask = s.get("market_ask", 0) or 0
-        our_bid = s.get("our_bid")
-        our_ask = s.get("our_ask")
-        bid_live = s.get("bid_live", False)
-        ask_live = s.get("ask_live", False)
-        theo = s.get("theo")
-        delta = s.get("delta", 0)
-        iv = s.get("iv", 0)
-        volume = s.get("volume", 0) or 0
-        oi = s.get("open_interest", 0) or 0
-        pos = s.get("position", 0)
-        status = s.get("status", "idle")
-
-        # Format our bid
-        if our_bid is not None:
-            if bid_live and our_bid > mkt_bid:
-                bid_class = "live"
-            elif bid_live:
-                bid_class = "behind"
+        def _our_price_cell(price, live, mkt_ref, side):
+            """Color-coded our_bid / our_ask cell.
+              - None  → idle (gray dash)
+              - live (Submitted) AND best-quote → quoting (green)
+              - live but behind → behind (red)
+              - has order but not yet Submitted → pending (amber)
+            """
+            if price is None:
+                return '<span class="chain-our-price idle">-</span>'
+            if live:
+                if side == "BUY":
+                    cls = "quoting" if (mkt_ref == 0 or price > mkt_ref) else "behind"
+                else:
+                    cls = "quoting" if (mkt_ref == 0 or price < mkt_ref) else "behind"
             else:
-                bid_class = "inactive"
-            our_bid_str = f'<span class="chain-our-price {bid_class}">{our_bid:.1f}</span>'
-        else:
-            our_bid_str = f'<span class="chain-our-price inactive">-</span>'
+                cls = "pending"
+            return f'<span class="chain-our-price {cls}">{price:.1f}</span>'
 
-        # Format our ask
-        if our_ask is not None:
-            if ask_live and our_ask < mkt_ask:
-                ask_class = "live"
-            elif ask_live:
-                ask_class = "behind"
+        def _fmt_side(s):
+            """Render the half-row cells for one option type at one strike.
+
+            Returns a tuple of HTML strings for:
+              oi, vol, pos, our_bid, our_ask, theo, mkt_bid, mkt_ask, edge
+            Cells are returned blank if the side block is None (no contract).
+            """
+            if s is None:
+                blank = '<span style="color:#475569">—</span>'
+                return (blank,) * 9
+            mkt_bid = s.get("market_bid", 0) or 0
+            mkt_ask = s.get("market_ask", 0) or 0
+            our_bid = s.get("our_bid")
+            our_ask = s.get("our_ask")
+            bid_live = s.get("bid_live", False)
+            ask_live = s.get("ask_live", False)
+            theo = s.get("theo")
+            pos = s.get("position", 0)
+            volume = s.get("volume", 0) or 0
+            oi = s.get("open_interest", 0) or 0
+
+            our_bid_html = _our_price_cell(our_bid, bid_live, mkt_bid, "BUY")
+            our_ask_html = _our_price_cell(our_ask, ask_live, mkt_ask, "SELL")
+
+            theo_html = f"{theo:.1f}" if theo is not None else "-"
+
+            # Edge per side vs theo. Bid edge = theo - our_bid (positive = we
+            # buy below fair). Ask edge = our_ask - theo (positive = we sell
+            # above fair). Average the two if both sides are quoting.
+            edge_html = "-"
+            if theo is not None:
+                edges = []
+                if our_bid is not None:
+                    edges.append(theo - our_bid)
+                if our_ask is not None:
+                    edges.append(our_ask - theo)
+                if edges:
+                    avg = sum(edges) / len(edges)
+                    cls = "positive" if avg > 0 else "negative"
+                    edge_html = f'<span class="chain-edge {cls}">{avg:+.1f}</span>'
+
+            if pos > 0:
+                pos_html = f'<span class="chain-pos long">+{pos}</span>'
+            elif pos < 0:
+                pos_html = f'<span class="chain-pos short">{pos}</span>'
             else:
-                ask_class = "inactive"
-            our_ask_str = f'<span class="chain-our-price {ask_class}">{our_ask:.1f}</span>'
-        else:
-            our_ask_str = f'<span class="chain-our-price inactive">-</span>'
+                pos_html = f'<span style="color:{TEXT_MUTED}">0</span>'
 
-        # Theo
-        theo_str = f"{theo:.1f}" if theo is not None else "-"
+            mkt_bid_html = f"{mkt_bid:.1f}" if mkt_bid > 0 else "-"
+            mkt_ask_html = f"{mkt_ask:.1f}" if mkt_ask > 0 else "-"
+            return (f"{oi:,}", f"{volume:,}", pos_html, our_bid_html, our_ask_html,
+                    theo_html, mkt_bid_html, mkt_ask_html, edge_html)
 
-        # Edge per side vs theo
-        # Bid edge = theo - our_bid (positive = we buy below theo = good)
-        # Ask edge = our_ask - theo (positive = we sell above theo = good)
-        edge_str = "-"
-        if theo is not None:
-            edges = []
-            if our_bid is not None:
-                edges.append(theo - our_bid)
-            if our_ask is not None:
-                edges.append(our_ask - theo)
-            if edges:
-                avg_edge = sum(edges) / len(edges)
-                edge_class = "positive" if avg_edge > 0 else "negative"
-                edge_str = f'<span class="chain-edge {edge_class}">{avg_edge:+.1f}</span>'
+        rows_html = ""
+        for strike_str in sorted(strikes.keys(), key=lambda s: float(s)):
+            block = strikes[strike_str]
+            # Backward compat: older snapshots stored a flat dict per strike.
+            if "call" not in block and "put" not in block:
+                call = block
+                put = None
+            else:
+                call = block.get("call")
+                put = block.get("put")
 
-        # Position
-        if pos > 0:
-            pos_str = f'<span class="chain-pos long">+{pos}</span>'
-        elif pos < 0:
-            pos_str = f'<span class="chain-pos short">{pos}</span>'
-        else:
-            pos_str = f'<span style="color:{TEXT_MUTED}">0</span>'
+            strike_val = float(strike_str)
+            is_atm = abs(strike_val - atm_strike) < 1.0
+            row_class = ' class="atm-row"' if is_atm else ""
 
-        # Status pill
-        status_str = f'<span class="chain-status {status}">{status}</span>'
+            (c_oi, c_vol, c_pos, c_our_bid, c_our_ask,
+             c_theo, c_mkt_bid, c_mkt_ask, c_edge) = _fmt_side(call)
+            (p_oi, p_vol, p_pos, p_our_bid, p_our_ask,
+             p_theo, p_mkt_bid, p_mkt_ask, p_edge) = _fmt_side(put)
 
-        rows_html += f"""<tr{row_class}>
-            <td class="center"><span class="chain-strike">{strike_str}</span></td>
-            <td class="center">{volume:,}</td>
-            <td class="center">{oi:,}</td>
-            <td class="center">{pos_str}</td>
-            <td>{mkt_bid:.1f}</td>
-            <td>{our_bid_str}</td>
-            <td style="background-color:rgba(99,102,241,0.08);color:{TEXT_PRIMARY};font-weight:500;">{theo_str}</td>
-            <td>{our_ask_str}</td>
-            <td>{mkt_ask:.1f}</td>
-            <td class="center">{volume:,}</td>
-            <td class="center">{oi:,}</td>
-            <td>{edge_str}</td>
-            <td>{delta:.3f}</td>
-            <td class="center">{status_str}</td>
-        </tr>"""
+            rows_html += f"""<tr{row_class}>
+                <td class="center">{c_oi}</td>
+                <td class="center">{c_vol}</td>
+                <td class="center">{c_pos}</td>
+                <td>{c_mkt_bid}</td>
+                <td>{c_our_bid}</td>
+                <td class="chain-theo">{c_theo}</td>
+                <td>{c_our_ask}</td>
+                <td>{c_mkt_ask}</td>
+                <td>{c_edge}</td>
+                <td class="center chain-strike-cell"><span class="chain-strike">{int(strike_val)}</span></td>
+                <td>{p_edge}</td>
+                <td>{p_mkt_bid}</td>
+                <td>{p_our_bid}</td>
+                <td class="chain-theo">{p_theo}</td>
+                <td>{p_our_ask}</td>
+                <td>{p_mkt_ask}</td>
+                <td class="center">{p_pos}</td>
+                <td class="center">{p_vol}</td>
+                <td class="center">{p_oi}</td>
+            </tr>"""
 
-    chain_html = f"""
-    <div style="max-height: 600px; overflow-y: auto; border: 1px solid {BG_CARD_BORDER}; border-radius: 8px;">
-    <table class="chain-table">
-        <thead>
-            <tr>
-                <th class="center">Strike</th>
-                <th class="center">Vol</th>
-                <th class="center">OI</th>
-                <th class="center">Pos</th>
-                <th>Mkt Bid</th>
-                <th>Our Bid</th>
-                <th>Theo</th>
-                <th>Our Ask</th>
-                <th>Mkt Ask</th>
-                <th class="center">Vol</th>
-                <th class="center">OI</th>
-                <th>Edge</th>
-                <th>Delta</th>
-                <th class="center">Status</th>
-            </tr>
-        </thead>
-        <tbody>
-            {rows_html}
-        </tbody>
-    </table>
-    </div>
-    """
-    st.markdown(chain_html, unsafe_allow_html=True)
-else:
-    st.info("No option chain data available.")
+        chain_html = f"""
+        <div id="chain-scroll" style="max-height: 820px; overflow-y: auto; border: 1px solid {BG_CARD_BORDER}; border-radius: 8px;">
+        <table class="chain-table">
+            <thead>
+                <tr>
+                    <th colspan="9" class="center chain-side-hdr">CALLS</th>
+                    <th class="center"></th>
+                    <th colspan="9" class="center chain-side-hdr">PUTS</th>
+                </tr>
+                <tr>
+                    <th class="center">OI</th>
+                    <th class="center">Vol</th>
+                    <th class="center">Pos</th>
+                    <th>Mkt Bid</th>
+                    <th>Our Bid</th>
+                    <th>Theo</th>
+                    <th>Our Ask</th>
+                    <th>Mkt Ask</th>
+                    <th>Edge</th>
+                    <th class="center">Strike</th>
+                    <th>Edge</th>
+                    <th>Mkt Bid</th>
+                    <th>Our Bid</th>
+                    <th>Theo</th>
+                    <th>Our Ask</th>
+                    <th>Mkt Ask</th>
+                    <th class="center">Pos</th>
+                    <th class="center">Vol</th>
+                    <th class="center">OI</th>
+                </tr>
+            </thead>
+            <tbody>
+                {rows_html}
+            </tbody>
+        </table>
+        </div>
+        """
+        st.markdown(chain_html, unsafe_allow_html=True)
+        # Streamlit strips <script> tags from st.markdown HTML for security, so
+        # we inject the auto-scroll JS through a tiny components.html iframe.
+        # The script reaches into window.parent.document to find the ATM row in
+        # the main page and centers it in its scrollable container. Re-runs on
+        # every Streamlit refresh because the components iframe is re-mounted.
+        components.html(
+            """
+            <script>
+            (function() {
+                const doc = window.parent.document;
+                const scroller = doc.getElementById('chain-scroll');
+                if (!scroller) return;
+                const atm = scroller.querySelector('tr.atm-row');
+                if (!atm) return;
+                const offset = atm.offsetTop - (scroller.clientHeight / 2) + (atm.offsetHeight / 2);
+                scroller.scrollTop = Math.max(0, offset);
+            })();
+            </script>
+            """,
+            height=0,
+        )
+    else:
+        st.info("No option chain data available.")
+
+
+render_chain()
 
 # ---------------------------------------------------------------------------
 # Tabs: Fills / Rejections

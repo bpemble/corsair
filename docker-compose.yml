@@ -41,12 +41,21 @@ services:
       - ./data:/app/data
       - ./span_data:/app/span_data
       - ./config:/app/config:ro
+      # Docker socket — lets the watchdog escalate to a gateway container
+      # restart when the in-engine recovery loop can't fix a JVM-level
+      # hang inside ib-gateway. See watchdog.escalate_gateway_restart().
+      - /var/run/docker.sock:/var/run/docker.sock:rw
     healthcheck:
-      test: ["CMD-SHELL", "test -f /app/logs/corsair_v2.log && test $$(( $$(date +%s) - $$(stat -c %Y /app/logs/corsair_v2.log) )) -lt 120"]
-      interval: 30s
+      # Snapshot file is written by the main loop every ~1s in steady state.
+      # If it's >30s old the loop is hung even if the process is still alive
+      # — that's the failure mode log-mtime healthchecks miss because the
+      # ib_insync stderr keeps the log file fresh during silent hangs.
+      # Triggers `restart: unless-stopped` after 3 consecutive failures.
+      test: ["CMD-SHELL", "test -f /app/data/chain_snapshot.json && test $$(( $$(date +%s) - $$(stat -c %Y /app/data/chain_snapshot.json) )) -lt 30"]
+      interval: 15s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 90s
 
   # ── Dashboard ───────────────────────────────────────────────────────
   dashboard:

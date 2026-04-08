@@ -19,6 +19,16 @@ def setup_logging(log_config) -> None:
         ],
     )
 
+    # Silence noisy ib_insync internals. At INFO they emit a Position dump
+    # for every account update, a full TradeLogEntry replay on every order
+    # status change, and per-tick info that filled corsair_v2.log to 523 GB
+    # in a couple of days. WARNING is loud enough to catch real problems
+    # (decode failures, disconnect events) without the steady-state firehose.
+    # Our own src.* loggers stay at INFO.
+    for noisy in ("ib_insync.wrapper", "ib_insync.ib", "ib_insync.client",
+                  "ib_insync.Decoder"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 def days_to_expiry(expiry: str) -> int:
     """Return calendar days from today to expiry (YYYYMMDD string)."""

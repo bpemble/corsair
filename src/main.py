@@ -6,7 +6,6 @@ manages risk through SPAN margin and portfolio theta constraints.
 """
 
 import asyncio
-import json
 import logging
 import os
 import signal
@@ -14,6 +13,9 @@ import time as _time
 from typing import Optional
 from datetime import datetime, date, timezone, timedelta
 from zoneinfo import ZoneInfo
+
+from . import ib_insync_patch as _ib_insync_patch
+_ib_insync_patch.apply()  # must run before any IB instance is created
 
 from .config import load_config
 from .utils import setup_logging, days_to_expiry
@@ -27,8 +29,19 @@ from .fill_handler import FillHandler
 from .risk_monitor import RiskMonitor
 from .logging_utils import CSVLogger
 from .weekend import friday_shutdown, monday_startup
+from .snapshot import write_chain_snapshot
+from .watchdog import (
+    safe_discover_and_subscribe,
+    watchdog_loop,
+    escalate_gateway_recreate,
+    STARTUP_RETRY_BACKOFF_SEC,
+    GATEWAY_RESTART_SETTLE_SEC,
+    RECOVERY_FAILS_BEFORE_GATEWAY_RESTART,
+)
 
 CT = ZoneInfo("America/Chicago")
+
+logger = logging.getLogger(__name__)
 
 
 def _session_day(now_utc: datetime, reset_hour_ct: int) -> date:
@@ -38,171 +51,13 @@ def _session_day(now_utc: datetime, reset_hour_ct: int) -> date:
         return (now_ct + timedelta(days=1)).date()
     return now_ct.date()
 
-logger = logging.getLogger(__name__)
-
-SNAPSHOT_PATH = "data/chain_snapshot.json"
-SNAPSHOT_TMP = "data/chain_snapshot.json.tmp"
-
-
-def _read_account_state(ib, account_id: str) -> dict:
-    """Pull cash, margin, and P&L summary from IBKR account values."""
-    out = {
-        "account_id": account_id,
-        "cash": 0.0,
-        "net_liq": 0.0,
-        "init_margin": 0.0,
-        "maint_margin": 0.0,
-        "buying_power": 0.0,
-        "unrealized_pnl": 0.0,
-        "realized_pnl": 0.0,
-    }
-    tag_map = {
-        "TotalCashValue": "cash",
-        "NetLiquidation": "net_liq",
-        "InitMarginReq": "init_margin",
-        "MaintMarginReq": "maint_margin",
-        "BuyingPower": "buying_power",
-        "UnrealizedPnL": "unrealized_pnl",
-        "RealizedPnL": "realized_pnl",
-    }
-    try:
-        for v in ib.accountValues(account_id):
-            if v.currency != "USD" and v.currency != "":
-                continue
-            key = tag_map.get(v.tag)
-            if key:
-                try:
-                    out[key] = float(v.value)
-                except (ValueError, TypeError):
-                    pass
-    except Exception:
-        pass
-    return out
-
-
-def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin, ib, account_id, config):
-    """Write a JSON snapshot of the full option chain for the dashboard."""
-    state = market_data.state
-    if state.underlying_price <= 0:
-        return
-
-    strikes_data = {}
-    active_quotes = quotes.get_active_quotes()
-
-    for strike in state.get_all_strikes():
-        opt = state.get_option(strike)
-        if opt is None:
-            continue
-
-        # Look up our bid/ask from active orders
-        bid_info = active_quotes.get((strike, "BUY"))
-        ask_info = active_quotes.get((strike, "SELL"))
-
-        our_bid = bid_info["price"] if bid_info else None
-        our_ask = ask_info["price"] if ask_info else None
-        bid_live = bid_info["status"] == "Submitted" if bid_info else False
-        ask_live = ask_info["status"] == "Submitted" if ask_info else False
-
-        # Theo from SABR if calibrated
-        theo = None
-        if sabr.last_calibration is not None:
-            try:
-                theo = round(sabr.get_theo(strike), 2)
-            except Exception:
-                pass
-
-        # Position at this strike
-        pos = 0
-        for p in portfolio.positions:
-            if p.strike == strike and p.expiry == state.front_month_expiry:
-                pos += p.quantity
-
-        # Status
-        if bid_live or ask_live:
-            status = "quoting"
-        elif bid_info or ask_info:
-            status = "pending"
-        else:
-            status = "idle"
-
-        # Get the real incumbent bid/ask from the quote engine's tracking
-        inc_bid, inc_ask = quotes.get_incumbent(strike)
-        if inc_bid <= 0:
-            inc_bid = opt.bid
-        if inc_ask <= 0:
-            inc_ask = opt.ask
-
-        strikes_data[str(int(strike))] = {
-            "market_bid": inc_bid,
-            "market_ask": inc_ask,
-            "raw_bid": opt.bid,
-            "raw_ask": opt.ask,
-            "our_bid": our_bid,
-            "our_ask": our_ask,
-            "bid_live": bid_live,
-            "ask_live": ask_live,
-            "theo": theo,
-            "delta": round(opt.delta, 4),
-            "iv": round(opt.iv, 4) if opt.iv else 0.0,
-            "volume": opt.volume,
-            "open_interest": opt.open_interest,
-            "position": pos,
-            "status": status,
-        }
-
-    # Per-position detail with MtM P&L
-    positions_detail = []
-    for p in portfolio.positions:
-        opt = state.get_option(p.strike, p.expiry, p.put_call)
-        mark = p.current_price
-        if opt and opt.bid > 0 and opt.ask > 0:
-            mark = (opt.bid + opt.ask) / 2
-        mult = config.product.multiplier
-        unrealized = (mark - p.avg_fill_price) * p.quantity * mult
-        positions_detail.append({
-            "strike": p.strike,
-            "expiry": p.expiry,
-            "right": p.put_call,
-            "qty": p.quantity,
-            "avg_price": round(p.avg_fill_price, 2),
-            "mark": round(mark, 2),
-            "unrealized_pnl": round(unrealized, 2),
-            "delta": round(p.delta, 4),
-            "theta": round(p.theta, 2),
-        })
-
-    snapshot = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "underlying_price": state.underlying_price,
-        "atm_strike": state.atm_strike,
-        "front_month_expiry": state.front_month_expiry,
-        "account": _read_account_state(ib, account_id),
-        "portfolio": {
-            "net_delta": round(portfolio.net_delta, 4),
-            "net_theta": round(portfolio.net_theta, 2),
-            "net_vega": round(portfolio.net_vega, 2),
-            "net_gamma": round(portfolio.net_gamma, 6),
-            "total_contracts": portfolio.gross_positions,
-            "margin": margin.get_current_margin(),
-            "fills_today": portfolio.fills_today,
-            "spread_capture": round(portfolio.spread_capture_today, 2),
-            "positions": positions_detail,
-        },
-        "strikes": strikes_data,
-    }
-
-    try:
-        with open(SNAPSHOT_TMP, "w") as f:
-            json.dump(snapshot, f, indent=2)
-        os.replace(SNAPSHOT_TMP, SNAPSHOT_PATH)
-    except Exception as e:
-        logger.warning("Failed to write chain snapshot: %s", e)
 
 
 def _get_todays_expiries(positions):
     """Return set of expiry strings that expire today."""
     today = datetime.now().strftime("%Y%m%d")
     return {p.expiry for p in positions if p.expiry == today}
+
 
 
 async def main():
@@ -219,17 +74,31 @@ async def main():
     loop_name = type(asyncio.get_running_loop()).__module__
     logger.info("Asyncio loop: %s", loop_name)
 
-    # ── 2. Connect to IBKR ───────────────────────────────────────────
+    # ── 2. Connect to IBKR with retry ────────────────────────────────
+    # Initial connect can fail when the gateway is in a bad post-restart
+    # state (accepts TCP but rejects API handshake). Retry with backoff
+    # so the engine self-heals instead of exiting and relying on docker
+    # to crash-loop us.
     conn = IBKRConnection(config)
-    if not await conn.connect():
-        logger.critical("Failed to connect to IBKR Gateway. Exiting.")
-        return
+    connect_attempt = 0
+    while not await conn.connect():
+        wait = STARTUP_RETRY_BACKOFF_SEC[
+            min(connect_attempt, len(STARTUP_RETRY_BACKOFF_SEC) - 1)
+        ]
+        connect_attempt += 1
+        logger.warning(
+            "Initial connect failed (attempt %d) — retrying in %ds",
+            connect_attempt, wait,
+        )
+        await asyncio.sleep(wait)
+    if connect_attempt > 0:
+        logger.info("Initial connect succeeded after %d retries", connect_attempt)
 
     ib = conn.ib
 
     # ── 3. Initialize components ──────────────────────────────────────
     csv_logger = CSVLogger(config)
-    market_data = MarketDataManager(ib, config)
+    market_data = MarketDataManager(ib, config, csv_logger=csv_logger)
     portfolio = PortfolioState(config)
 
     # Reconcile any existing ETHUSDRR option positions from IBKR
@@ -237,11 +106,17 @@ async def main():
     if seeded:
         logger.info("Reconciled %d existing ETHUSDRR option position(s) from IBKR", seeded)
 
-    margin = IBKRMarginChecker(ib, config, market_data, portfolio)
     sabr = SABRSurface(config)
+    # SABR is passed to the margin checker so it can fall back to fitted vol
+    # when a position's strike has no fresh bid/ask tick (otherwise positions
+    # at quiet wing strikes get silently dropped from the SPAN calc).
+    margin = IBKRMarginChecker(ib, config, market_data, portfolio, sabr=sabr)
     constraint_checker = ConstraintChecker(margin, portfolio, config)
     quotes = QuoteManager(ib, config, market_data, sabr, constraint_checker,
                           csv_logger=csv_logger)
+    # Back-reference so the trade-tape capture in market_data can look up
+    # our resting state at print time.
+    market_data.quotes = quotes
     risk = RiskMonitor(portfolio, margin, quotes, csv_logger, config)
     fills = FillHandler(ib, portfolio, margin, quotes, market_data, csv_logger, config)
 
@@ -249,7 +124,9 @@ async def main():
     def on_disconnect():
         logger.critical("GATEWAY DISCONNECT — cancelling all quotes")
         quotes.cancel_all_quotes()
-        risk.kill("Gateway disconnect")
+        # Tag the kill as disconnect-induced so the watchdog can clear it
+        # after a successful reconnect.
+        risk.kill("Gateway disconnect", source="disconnect")
 
     conn.set_disconnect_callback(on_disconnect)
 
@@ -267,9 +144,52 @@ async def main():
         logger.info("Cancelled %d stale orders from previous run", cancelled)
         await asyncio.sleep(2)  # Let cancels settle
 
-    # ── 6. Subscribe to market data ───────────────────────────────────
+    # ── 6. Subscribe to market data with hard timeout + retry ─────────
+    # IB Gateway can complete connect() but then hang inside the discovery
+    # path. Wrap in a timeout and retry with backoff. After N consecutive
+    # discovery failures, escalate to a gateway container recreate (volume
+    # wipe + fresh container) — the lighter container.restart() doesn't
+    # reliably clear the IBC session-state corruption we keep hitting.
     logger.info("Discovering option chain and subscribing to market data...")
-    await market_data.discover_and_subscribe()
+    startup_attempt = 0
+    discovery_fails = 0
+    while not await safe_discover_and_subscribe(market_data):
+        discovery_fails += 1
+        if discovery_fails >= RECOVERY_FAILS_BEFORE_GATEWAY_RESTART:
+            logger.critical(
+                "Startup: %d consecutive discovery failures — escalating "
+                "to gateway recreate", discovery_fails,
+            )
+            try:
+                await conn.disconnect()
+            except Exception:
+                pass
+            if escalate_gateway_recreate():
+                await asyncio.sleep(GATEWAY_RESTART_SETTLE_SEC)
+                discovery_fails = 0
+                startup_attempt = 0
+            if not await conn.connect():
+                logger.error("Post-escalation reconnect failed; will retry")
+            continue
+
+        wait = STARTUP_RETRY_BACKOFF_SEC[
+            min(startup_attempt, len(STARTUP_RETRY_BACKOFF_SEC) - 1)
+        ]
+        startup_attempt += 1
+        logger.warning(
+            "Startup discovery failed (attempt %d) — bouncing connection and "
+            "retrying in %ds", startup_attempt, wait,
+        )
+        try:
+            await conn.disconnect()
+        except Exception:
+            pass
+        await asyncio.sleep(wait)
+        if not await conn.connect():
+            logger.error("Reconnect attempt failed; will retry next cycle")
+            continue
+    if startup_attempt > 0:
+        logger.info("Startup discovery succeeded after %d retries", startup_attempt)
 
     # Wait for initial data to flow in (clean BBO without our orders)
     logger.info("Waiting for initial market data (5s)...")
@@ -288,12 +208,15 @@ async def main():
 
     # Seed incumbent tracker with clean market data (before we place any orders)
     for strike in market_data.state.get_all_strikes():
-        opt = market_data.state.get_option(strike)
-        if opt and opt.bid > 0:
-            quotes._incumbent_bid[strike] = opt.bid
-        if opt and opt.ask > 0:
-            quotes._incumbent_ask[strike] = opt.ask
-    logger.info("Incumbent tracker seeded with %d strikes", len(quotes._incumbent_bid))
+        for right in ("C", "P"):
+            opt = market_data.state.get_option(strike, right=right)
+            if opt is None:
+                continue
+            if opt.bid > 0:
+                quotes._incumbent_bid[(strike, right)] = opt.bid
+            if opt.ask > 0:
+                quotes._incumbent_ask[(strike, right)] = opt.ask
+    logger.info("Incumbent tracker seeded with %d (strike,right) pairs", len(quotes._incumbent_bid))
 
     # ── 6. Handle graceful shutdown ───────────────────────────────────
     shutdown_event = asyncio.Event()
@@ -326,6 +249,15 @@ async def main():
     logger.info(
         "Entering event-driven quote loop (batch=%.0fms, fallback=%.1fs, snapshot=%.1fs)",
         batch_window_sec * 1000, fallback_interval, snapshot_interval,
+    )
+
+    # Launch the watchdog in the background. Detects connection loss and
+    # silent gateway hangs; auto-reconnects with backoff. Survives the
+    # lifetime of the main loop and is cancelled on shutdown.
+    watchdog_task = asyncio.create_task(
+        watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
+                      sabr, config.account.account_id, shutdown_event),
+        name="watchdog",
     )
 
     while not shutdown_event.is_set():
@@ -422,21 +354,23 @@ async def main():
         do_full_refresh = (mono - last_full_refresh) >= fallback_interval
 
         if do_full_refresh:
-            dirty_strikes = None  # signal full refresh
+            dirty = None  # signal full refresh
             last_full_refresh = mono
         else:
-            # Convert OptionKeys to strike floats; expand on underlying tick
+            # Convert OptionKeys (strike, expiry, right) to (strike, right)
+            # pairs that the quoter iterates. Underlying ticks fan out to all
+            # strikes so we promote to a full refresh.
             if underlying_dirty:
-                dirty_strikes = None
+                dirty = None
                 last_full_refresh = mono
             elif dirty_keys:
-                dirty_strikes = {k[0] for k in dirty_keys}
+                dirty = {(k[0], k[2]) for k in dirty_keys}
             else:
-                dirty_strikes = set()  # nothing to do this cycle
+                dirty = set()  # nothing to do this cycle
 
-        if dirty_strikes is None or dirty_strikes:
+        if dirty is None or dirty:
             try:
-                quotes.update_quotes(portfolio, dirty_strikes=dirty_strikes)
+                quotes.update_quotes(portfolio, dirty=dirty)
             except Exception as e:
                 logger.error("Quote update error: %s", e, exc_info=True)
 
@@ -451,6 +385,11 @@ async def main():
 
     # ── 8. Shutdown ──────────────────────────────────────────────────
     logger.info("Shutting down...")
+    watchdog_task.cancel()
+    try:
+        await watchdog_task
+    except (asyncio.CancelledError, Exception):
+        pass
     quotes.cancel_all_quotes()
     market_data.cancel_all_subscriptions()
     await conn.disconnect()

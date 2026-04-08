@@ -76,13 +76,32 @@ class PortfolioState:
     def gross_positions(self) -> int:
         return sum(abs(p.quantity) for p in self.positions)
 
-    def seed_from_ibkr(self, ib, account_id: str) -> int:
-        """Sync existing ETHUSDRR option positions from IBKR on startup.
+    # ── Per-side accessors ─────────────────────────────────────────
+    # Calls and puts have independent risk budgets. These return the same
+    # quantity-weighted aggregates as the net_* properties above, but
+    # filtered to one option type.
+    def delta_for(self, right: str) -> float:
+        return sum(p.delta * p.quantity for p in self.positions if p.put_call == right)
 
-        Filters strictly to symbol='ETHUSDRR' and secType='FOP' — ignores
-        everything else (futures, other products, equities). Returns the
-        number of positions seeded.
+    def theta_for(self, right: str) -> float:
+        return sum(p.theta * p.quantity for p in self.positions if p.put_call == right)
+
+    def vega_for(self, right: str) -> float:
+        return sum(p.vega * p.quantity for p in self.positions if p.put_call == right)
+
+    def gross_for(self, right: str) -> int:
+        return sum(abs(p.quantity) for p in self.positions if p.put_call == right)
+
+    def seed_from_ibkr(self, ib, account_id: str) -> int:
+        """Sync existing ETHUSDRR option positions from IBKR.
+
+        Idempotent: clears the local position list first so multiple calls
+        (initial startup + each watchdog reseed after a reconnect) don't
+        accumulate duplicates. Filters strictly to symbol='ETHUSDRR' and
+        secType='FOP' — ignores everything else (futures, other products,
+        equities). Returns the number of positions seeded.
         """
+        self.positions.clear()
         seeded = 0
         for ib_pos in ib.positions(account_id):
             c = ib_pos.contract

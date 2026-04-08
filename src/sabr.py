@@ -10,7 +10,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -153,6 +153,72 @@ def calibrate_sabr(
     )
 
 
+def implied_forward_from_parity(
+    options: dict, ref_forward: float,
+    max_spread: float = 10.0, max_deviation: float = 50.0,
+) -> Optional[float]:
+    """Derive the futures forward implied by put-call parity.
+
+    For each strike where BOTH a call and a put have valid bid/ask with
+    spread ≤ max_spread, parity gives F = K + (C_mid - P_mid). The result
+    is the median across all such strikes — robust to outliers.
+
+    Why we need this: in fast markets the option BBOs lag the live futures
+    mid by a few hundred ms. SABR-fitted with the live mid produces theos
+    that are systematically biased relative to the option market. Using the
+    parity-implied forward eliminates the lag because we're using the same
+    forward the option market is implicitly using.
+
+    ref_forward filters outliers: implied F values that differ from the
+    reference by more than max_deviation are dropped (one side of the
+    pair is probably stale or has a bad print). If no pairs survive,
+    returns None and the caller should fall back to ref_forward.
+    """
+    pairs: dict = {}  # K -> {"C": mid, "P": mid}
+    for opt in options.values():
+        if opt.bid <= 0 or opt.ask <= 0:
+            continue
+        if (opt.ask - opt.bid) > max_spread:
+            continue
+        mid = (opt.bid + opt.ask) / 2.0
+        K = opt.strike
+        pairs.setdefault(K, {})[opt.put_call] = mid
+
+    forwards = []
+    for K, sides in pairs.items():
+        if "C" not in sides or "P" not in sides:
+            continue
+        F_K = K + (sides["C"] - sides["P"])
+        if abs(F_K - ref_forward) <= max_deviation:
+            forwards.append(F_K)
+
+    if not forwards:
+        return None
+    forwards.sort()
+    return forwards[len(forwards) // 2]
+
+
+def _sabr_quality_ok(result, min_strikes: int) -> Tuple[bool, str]:
+    """Structural sanity check on a SABR fit result. Returns (ok, reason).
+
+    Catches degenerate fits that the optimizer accepts numerically but
+    that produce nonsense theo at the wings:
+      - too few input strikes (calibration is overdetermined → unstable)
+      - alpha non-positive (vol level must be positive)
+      - rho near ±1 (correlation pinned at the boundary → instability)
+      - nu non-positive or absurdly large (vol-of-vol degenerate)
+    """
+    if result.n_points < min_strikes:
+        return False, f"only {result.n_points} strikes (need ≥{min_strikes})"
+    if result.alpha <= 0:
+        return False, f"alpha {result.alpha:.4f} ≤ 0"
+    if abs(result.rho) > 0.95:
+        return False, f"rho {result.rho:+.3f} pinned to boundary"
+    if result.nu <= 0 or result.nu > 10:
+        return False, f"nu {result.nu:.3f} out of [0, 10]"
+    return True, "ok"
+
+
 class SABRSurface:
     """SABR vol surface for Corsair v2.
 
@@ -184,17 +250,34 @@ class SABRSurface:
         """Calibrate SABR parameters to current option chain.
 
         Args:
-            forward: Current underlying futures price.
-            options: Dict of {(strike, expiry, right): OptionQuote} with .iv attribute.
+            forward: Current underlying futures price (used as the fallback
+                forward and as the outlier reference for parity derivation).
+            options: Dict of {(strike, expiry, right): OptionQuote} with
+                .iv, .bid, .ask, .strike, .put_call attributes.
         """
-        self.forward = forward
-
         # Drop strikes with wide BBOs from calibration — synthetic mids on
         # illiquid (typically deep ITM/OTM) strikes inject garbage IVs that
         # bias the entire fit. ETH options at this point have widths $5-8 on
         # liquid strikes vs $30+ on illiquid ones, so a $10 cutoff cleanly
         # separates them.
         max_cal_width = float(getattr(self.config.pricing, "max_calibration_bbo_width", 10.0))
+
+        # Replace the live futures mid with the parity-implied forward when
+        # we can derive one. The option market may be quoting against a
+        # slightly older futures price than our live tick reflects; using
+        # the implied forward keeps SABR consistent with the option BBOs
+        # rather than fighting them.
+        implied = implied_forward_from_parity(
+            options, ref_forward=forward, max_spread=max_cal_width,
+        )
+        if implied is not None:
+            if abs(implied - forward) > 1.0:
+                logger.info(
+                    "SABR forward: futures-mid=%.2f, parity-implied=%.2f (Δ=%+.2f)",
+                    forward, implied, implied - forward,
+                )
+            forward = implied
+        self.forward = forward
         market_ivs = []
         for key, option in options.items():
             bid = getattr(option, "bid", 0) or 0
@@ -220,6 +303,20 @@ class SABRSurface:
         )
 
         if result is not None:
+            # Quality gate: reject the fit if any of the structural sanity
+            # checks fail. Cheaper to keep the previous (known-good)
+            # parameters than to use a degenerate fit that prices wrong.
+            min_strikes = int(getattr(self.config.pricing, "sabr_min_strikes", 8))
+            quality_ok, quality_reason = _sabr_quality_ok(result, min_strikes)
+            if not quality_ok:
+                logger.warning(
+                    "SABR fit rejected (%s): alpha=%.4f rho=%.3f nu=%.3f "
+                    "RMSE=%.4f n=%d — keeping previous parameters",
+                    quality_reason, result.alpha, result.rho, result.nu,
+                    result.rmse, result.n_points,
+                )
+                return
+
             self.alpha = result.alpha
             self.rho = result.rho
             self.nu = result.nu

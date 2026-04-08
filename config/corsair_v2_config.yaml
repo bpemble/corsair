@@ -9,11 +9,16 @@ product:
   exchange: "CME"
   multiplier: 50
   currency: "USD"
-  option_type: "calls_only"   # "calls_only", "puts_only", "both"
-  # Subscription/display range — wider window we receive market data for
-  strike_range_low: -5        # Strikes below ATM to subscribe (negative = below)
+  option_type: "both"         # "calls_only", "puts_only", "both"
+  # Subscription/display range — wider window we receive market data for.
+  # Per spec: 5-strike buffer below the put quoting range (ATM-20) and 5
+  # strikes above the call quoting range (ATM+20). Subscribes both rights
+  # at every strike in this range, so total streaming lines = 2 × (high - low + 1) + 1.
+  # At -25/+25 that's 103 lines, just over IB's standard 100-line cap —
+  # tighten if any strikes fail to subscribe at startup.
+  strike_range_low: -25       # Strikes below ATM to subscribe (negative = below)
   strike_range_high: 25       # Strikes above ATM to subscribe
-  # Quoting range — narrower window we actually quote
+  # CALL quoting range — narrower window we actually quote calls in.
   quote_range_low: 0          # 0 = ATM
   quote_range_high: 20        # Number of strikes above ATM to quote
   min_dte: 3                  # Skip options with <= 3 DTE
@@ -26,15 +31,33 @@ product:
   strike_increment: 25        # ETH strike spacing
 
 constraints:
-  capital: 100000
-  margin_ceiling_pct: 0.50    # 50% of capital = $50K
-  delta_ceiling: 2.0          # |net_delta| must be <= this (contract-delta)
-  theta_floor: -400           # $/day, must be >= this value
+  # COMBINED portfolio bucket. Stage 1 of the deployment ramp: shared
+  # margin/delta/theta budgets across calls and puts (cross-margining
+  # benefit is the whole point of running both sides). $200K capital,
+  # 50% utilization → $100K SPAN cap. Note: synthetic SPAN runs ~+50%
+  # over IBKR's reported MaintMarginReq (documented in src/synthetic_span.py),
+  # so the effective real-IBKR ceiling is closer to $66K. Conservative bias
+  # is appropriate for first real-money deployment — leave the percentage
+  # at 50% and let the synthetic act as the binding constraint.
+  capital: 200000
+  margin_ceiling_pct: 0.50    # 50% of $200K = $100K synthetic
+  delta_ceiling: 3.0          # |portfolio net_delta| must be <= this
+  theta_floor: -200           # portfolio net_theta $/day, must be >= this
+
+puts:
+  # Puts now share the constraints/kill_switch budget with calls (combined
+  # portfolio architecture per Stage 1 spec). This block only carries the
+  # on/off toggle and the put-side quoting range — there are no longer
+  # independent margin/delta/theta budgets for puts.
+  enabled: true
+  quote_range_low: -20        # 20 strikes below ATM
+  quote_range_high: 0         # up to ATM (inclusive)
 
 kill_switch:
-  margin_kill_pct: 0.70       # 70% of capital = $70K
-  max_daily_loss: -2000       # Dollars
-  delta_kill: 3.0             # Contract-delta per side
+  margin_kill_pct: 0.70       # 70% of $200K = $140K (Stage 1)
+  max_daily_loss: -2500       # Dollars (Stage 1)
+  delta_kill: 5.0             # Combined |net_delta| kill threshold
+  vega_kill: 1000             # |net_vega| (per vol pt) kill threshold (NEW)
 
 quoting:
   tick_size: 0.50             # ETHUSDRR minimum tick ($0.50 per point = $25 per contract)
@@ -45,11 +68,15 @@ quoting:
   greek_refresh_seconds: 300  # Refresh Greeks every 5 minutes
   # Depth-aware incumbent selection
   depth_levels: 5                  # Subscribe to top N levels per strike per side
-  max_active_depth_subs: 5         # IBKR caps total concurrent depth subs (~5)
+  # IBKR caps concurrent depth subs (typically 3 for retail, up to 5 for
+  # higher-tier accounts). The ib_insync IndexError race in updateMktDepthL2
+  # is patched at startup via src/ib_insync_patch.py so depth cycling can
+  # run safely. If you see "reqMktDepth rotate failed" warnings, drop to 3.
+  max_active_depth_subs: 5
   depth_rotation_interval_sec: 2   # Cycle the depth window every N seconds
   min_incumbent_size: 2            # Min contracts at a level to be a "real" incumbent
   max_bbo_width_dollars: 10.00     # Don't penny-jump if BBO is wider than this (ETH options typically $5-8)
-  max_quote_staleness_sec: 5       # Discard depth older than N seconds
+  max_quote_staleness_sec: 10      # Discard depth older than N seconds
   filter_self_orders: true         # Exclude our own orders from incumbent search
 
 operations:
@@ -63,8 +90,10 @@ pricing:
                               # ETH calls; combined with this $1 buffer the
                               # effective edge from real fair value is ~$2.
   sabr_recalibrate_seconds: 60
+  sabr_fast_recal_dollars: 10.0  # Force a recal when underlying moves > $N since last fit
   sabr_beta: 1.0              # Fixed backbone (1.0 = lognormal, matches v1)
   sabr_max_rmse: 0.03         # Reject SABR fit if RMSE exceeds this
+  sabr_min_strikes: 8         # Reject fit if fewer than N strikes contributed (quality gate)
   stale_iv_threshold: 0.10    # IV discrepancy threshold for stale detection
   max_calibration_bbo_width: 10.0  # Drop strikes with wider BBOs from SABR calibration (synthetic mids on illiquid strikes)
 
@@ -83,5 +112,8 @@ synthetic_span:
 
 logging:
   log_dir: "./logs"
-  log_rejections: true
+  # REJECTs are noisy and the same info is captured in quotes.csv (skip_reason
+  # column) at much lower per-row cost. Leave off in steady state; flip to true
+  # when actively debugging gating logic.
+  log_rejections: false
   log_quotes: true
