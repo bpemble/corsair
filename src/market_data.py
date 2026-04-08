@@ -612,6 +612,18 @@ class MarketDataManager:
         filter_self = bool(getattr(q, "filter_self_orders", True))
         tick = float(q.tick_size)
 
+        # Build a tick-bucket set once so the per-level self-filter is O(1)
+        # set membership instead of O(|our_prices|) abs() comparisons. Two
+        # prices are "the same" iff they round to the same tick bucket.
+        if our_prices:
+            our_buckets = frozenset(int(round(op / tick)) for op in our_prices)
+            def is_self(px: float) -> bool:
+                return int(round(px / tick)) in our_buckets
+        else:
+            our_buckets = frozenset()
+            def is_self(px: float) -> bool:
+                return False
+
         # Use depth book if fresh; otherwise fall back to top-of-book.
         # (Depth subs rotate across many strikes, so most strikes have no
         # current L2 — top-of-book from the always-on price feed is still
@@ -629,11 +641,10 @@ class MarketDataManager:
             tob_bid = opt.bid
             tob_ask = opt.ask
             cache_key = (strike, right)
-            if our_prices:
-                if tob_bid > 0 and any(abs(tob_bid - op) < tick * 0.5 for op in our_prices):
-                    tob_bid = self._last_clean_bid.get(cache_key, 0.0)
-                if tob_ask > 0 and any(abs(tob_ask - op) < tick * 0.5 for op in our_prices):
-                    tob_ask = self._last_clean_ask.get(cache_key, 0.0)
+            if tob_bid > 0 and is_self(tob_bid):
+                tob_bid = self._last_clean_bid.get(cache_key, 0.0)
+            if tob_ask > 0 and is_self(tob_ask):
+                tob_ask = self._last_clean_ask.get(cache_key, 0.0)
             bids = [(tob_bid, opt.bid_size)] if tob_bid > 0 else []
             asks = [(tob_ask, opt.ask_size)] if tob_ask > 0 else []
             tick_age = (datetime.now() - opt.last_update).total_seconds() * 1000
@@ -645,9 +656,9 @@ class MarketDataManager:
         # Cache the most recent clean (non-self) top-of-book prices so we
         # can fall back to them next cycle if our order becomes the BBO.
         cache_key = (strike, right)
-        if opt.bid > 0 and not (our_prices and any(abs(opt.bid - op) < tick * 0.5 for op in our_prices)):
+        if opt.bid > 0 and not is_self(opt.bid):
             self._last_clean_bid[cache_key] = opt.bid
-        if opt.ask > 0 and not (our_prices and any(abs(opt.ask - op) < tick * 0.5 for op in our_prices)):
+        if opt.ask > 0 and not is_self(opt.ask):
             self._last_clean_ask[cache_key] = opt.ask
 
         best_bid = bids[0][0] if bids else 0.0
@@ -671,7 +682,7 @@ class MarketDataManager:
 
         # Scan for first meaningful level
         for idx, (px, sz) in enumerate(levels):
-            if filter_self and our_prices and any(abs(px - op) < tick * 0.5 for op in our_prices):
+            if filter_self and is_self(px):
                 continue
             if sz >= min_size:
                 return {"price": px, "level": idx + 1, "size": sz,
@@ -680,7 +691,7 @@ class MarketDataManager:
         # All-phantom fallback: penny-jump the deepest non-self level
         deepest = None
         for idx, (px, sz) in enumerate(levels):
-            if filter_self and our_prices and any(abs(px - op) < tick * 0.5 for op in our_prices):
+            if filter_self and is_self(px):
                 continue
             deepest = (px, idx + 1, sz)
         if deepest is not None:

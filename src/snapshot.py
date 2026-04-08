@@ -60,8 +60,13 @@ def _build_side(state, market_data, quotes, sabr, portfolio, active_quotes,
     ask_info = active_quotes.get((strike, right, "SELL"))
     our_bid = bid_info["price"] if bid_info else None
     our_ask = ask_info["price"] if ask_info else None
-    bid_live = bid_info["status"] == "Submitted" if bid_info else False
-    ask_live = ask_info["status"] == "Submitted" if ask_info else False
+    # PreSubmitted and Submitted both mean the order is resting on IBKR's
+    # book — paper Gateway frequently leaves orders at PreSubmitted and never
+    # advances them, so treating only "Submitted" as live makes the dashboard
+    # under-report. Match quote_engine._is_order_live for consistency.
+    _LIVE = ("PreSubmitted", "Submitted")
+    bid_live = bid_info["status"] in _LIVE if bid_info else False
+    ask_live = ask_info["status"] in _LIVE if ask_info else False
     theo = None
     if sabr.last_calibration is not None:
         try:
@@ -157,6 +162,13 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         "margin_kill": float(constraints.capital) * float(getattr(ks, "margin_kill_pct", 0) or 0) if ks else 0,
     }
 
+    # Compute margin once for total + per-side. Each get_current_margin call
+    # walks the (filtered) position list and runs the synthetic SPAN scenario
+    # array, so doing this three times per snapshot at 4Hz adds up fast.
+    _margin_total = margin.get_current_margin()
+    _margin_calls = margin.get_current_margin("C")
+    _margin_puts = margin.get_current_margin("P")
+
     snapshot = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "underlying_price": state.underlying_price,
@@ -171,22 +183,23 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
             "net_vega": round(portfolio.net_vega, 2),
             "net_gamma": round(portfolio.net_gamma, 6),
             "total_contracts": portfolio.gross_positions,
-            "margin": margin.get_current_margin(),
+            "margin": _margin_total,
             "fills_today": portfolio.fills_today,
             "spread_capture": round(portfolio.spread_capture_today, 2),
+            "spread_capture_mid": round(portfolio.spread_capture_mid_today, 2),
             "positions": positions_detail,
             "calls": {
                 "delta": round(portfolio.delta_for("C"), 4),
                 "theta": round(portfolio.theta_for("C"), 2),
                 "vega": round(portfolio.vega_for("C"), 2),
-                "margin": round(margin.get_current_margin("C"), 0),
+                "margin": round(_margin_calls, 0),
                 "gross": portfolio.gross_for("C"),
             },
             "puts": {
                 "delta": round(portfolio.delta_for("P"), 4),
                 "theta": round(portfolio.theta_for("P"), 2),
                 "vega": round(portfolio.vega_for("P"), 2),
-                "margin": round(margin.get_current_margin("P"), 0),
+                "margin": round(_margin_puts, 0),
                 "gross": portfolio.gross_for("P"),
             },
         },
