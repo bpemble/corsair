@@ -50,7 +50,7 @@ def _read_account_state(ib, account_id: str) -> dict:
     return out
 
 
-def _build_side(state, quotes, sabr, portfolio, active_quotes,
+def _build_side(state, market_data, quotes, sabr, portfolio, active_quotes,
                 strike: float, right: str) -> Optional[dict]:
     """Build the per-right block for one strike, or None if no contract."""
     opt = state.get_option(strike, right=right)
@@ -79,9 +79,10 @@ def _build_side(state, quotes, sabr, portfolio, active_quotes,
         status = "pending"
     else:
         status = "idle"
+    clean_bid, clean_ask = market_data.get_clean_bbo(strike, right)
     return {
-        "market_bid": opt.bid,
-        "market_ask": opt.ask,
+        "market_bid": clean_bid,
+        "market_ask": clean_ask,
         "raw_bid": opt.bid,
         "raw_ask": opt.ask,
         "our_bid": our_bid,
@@ -109,8 +110,8 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
     strikes_data = {}
     for strike in state.get_all_strikes():
         block = {
-            "call": _build_side(state, quotes, sabr, portfolio, active_quotes, strike, "C"),
-            "put": _build_side(state, quotes, sabr, portfolio, active_quotes, strike, "P"),
+            "call": _build_side(state, market_data, quotes, sabr, portfolio, active_quotes, strike, "C"),
+            "put": _build_side(state, market_data, quotes, sabr, portfolio, active_quotes, strike, "P"),
         }
         if block["call"] is None and block["put"] is None:
             continue

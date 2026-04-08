@@ -691,6 +691,21 @@ class MarketDataManager:
         return {"price": None, "level": None, "size": None,
                 "age_ms": age_ms, "bbo_width": bbo_width, "skip_reason": "self_only"}
 
+    def get_clean_bbo(self, strike: float, right: str) -> Tuple[float, float]:
+        """Return the L1 BBO with our own resting orders subtracted out.
+        Used by the snapshot writer so the dashboard's 'market' columns
+        show the book we're competing against, not our own quotes.
+
+        Falls back to raw L1 when the clean cache is empty (first cycle
+        before find_incumbent has populated it)."""
+        opt = self.state.get_option(strike, right=right)
+        if opt is None:
+            return (0.0, 0.0)
+        key = (strike, right)
+        bid = self._last_clean_bid.get(key, opt.bid) if opt.bid > 0 else 0.0
+        ask = self._last_clean_ask.get(key, opt.ask) if opt.ask > 0 else 0.0
+        return (bid, ask)
+
     def get_quotable_strikes(self) -> List[Tuple[float, str]]:
         """Return list of (strike, right) pairs eligible for quoting.
 
