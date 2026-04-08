@@ -59,6 +59,13 @@ class IBKRMarginChecker:
         self.sabr = sabr
         self.span = SyntheticSpan(config)
         self.cached_ibkr_margin: float = 0.0
+        # Calibration ratio synthetic ÷ ibkr_actual, refreshed at every recon.
+        # Used to scale synthetic numbers down to IBKR-equivalent so the
+        # constraint checker isn't gating on the structural overstatement
+        # documented in synthetic_span.py (verticals/strangles run ~25-30%
+        # high vs IBKR's actual margin). 1.0 means "no scaling, use synthetic
+        # as-is" — applies before we have a recon datapoint.
+        self.ibkr_scale: float = 1.0
         self._account_id = config.account.account_id
         self._mult = float(config.product.multiplier)
 
@@ -185,7 +192,12 @@ class IBKRMarginChecker:
 
     # ── Public API ─────────────────────────────────────────────────
     def get_current_margin(self, right: Optional[str] = None) -> float:
-        """Synthetic SPAN margin over current positions.
+        """SPAN margin over current positions, scaled to IBKR-equivalent.
+
+        Returns raw synthetic × ibkr_scale, where ibkr_scale is the live
+        calibration factor refreshed in update_cached_margin. This grounds
+        the gating decision (and dashboard display) in real IBKR margin
+        rather than synthetic's structural overstatement.
 
         Combined-budget mode: there is no per-side margin. The `right`
         argument is accepted for backward compatibility with callers that
@@ -197,13 +209,14 @@ class IBKRMarginChecker:
             return 0.0
         if right is None:
             st = self._get_portfolio_state(F)
-            return self._margin_from_state(
+            raw = self._margin_from_state(
                 st["portfolio_ra"], st["nov"],
                 st["long_premium"], st["short_count"],
             )
+            return raw * self.ibkr_scale
         # Per-side display only — recompute over the filtered subset.
         # Not used by constraint check; just for the dashboard breakdown.
-        return self._margin_for_side(F, right)
+        return self._margin_for_side(F, right) * self.ibkr_scale
 
     def _margin_for_side(self, F: float, right: str) -> float:
         """Display-only per-side SPAN. Uncached; called by the snapshot
@@ -215,20 +228,48 @@ class IBKRMarginChecker:
         )
 
     def update_cached_margin(self):
-        """Refresh IBKR's reported maintenance margin (for reconciliation)."""
+        """Refresh IBKR's reported maintenance margin (for reconciliation)
+        and recompute the synthetic-to-IBKR scaling ratio.
+
+        We need to read RAW synthetic here (not the scaled get_current_margin
+        output, which would be 1.0× tautologically) — so we call the span
+        engine directly with the same portfolio state get_current_margin uses.
+        """
         try:
             for item in self.ib.accountValues(self._account_id):
                 if item.tag == "MaintMarginReq" and item.currency == "USD":
                     self.cached_ibkr_margin = float(item.value)
-                    synth = self.get_current_margin()
-                    if synth > 0 and self.cached_ibkr_margin > 0:
+                    raw_synth = self._raw_current_margin()
+                    if raw_synth > 0 and self.cached_ibkr_margin > 0:
+                        ratio = raw_synth / self.cached_ibkr_margin
+                        # Bound the scale to a sensible range. If ratio drifts
+                        # outside [0.8, 2.0] something is wrong with either
+                        # the live recon or the synthetic — fall back to
+                        # raw synthetic in that case (safe direction: we'd
+                        # rather be conservative than blow the cap).
+                        if 0.8 <= ratio <= 2.0:
+                            self.ibkr_scale = 1.0 / ratio
+                        else:
+                            self.ibkr_scale = 1.0
                         logger.info(
-                            "MARGIN RECON: synthetic=$%.0f ibkr=$%.0f ratio=%.2f",
-                            synth, self.cached_ibkr_margin, synth / self.cached_ibkr_margin,
+                            "MARGIN RECON: synthetic=$%.0f ibkr=$%.0f ratio=%.2f scale=%.2f",
+                            raw_synth, self.cached_ibkr_margin, ratio, self.ibkr_scale,
                         )
                     return
         except Exception as e:
             logger.warning("Failed to refresh IBKR margin: %s", e)
+
+    def _raw_current_margin(self) -> float:
+        """Internal: synthetic SPAN over current positions, NO scaling.
+        Used by update_cached_margin to compute the calibration ratio."""
+        F = self._get_forward()
+        if F <= 0:
+            return 0.0
+        st = self._get_portfolio_state(F)
+        return self._margin_from_state(
+            st["portfolio_ra"], st["nov"],
+            st["long_premium"], st["short_count"],
+        )
 
     def check_fill_margin(self, option_quote, quantity: int) -> Dict:
         """Compute current and post-fill synthetic SPAN margin against the
@@ -270,9 +311,13 @@ class IBKRMarginChecker:
             post_short = st["short_count"] + abs(quantity)
 
         post = self._margin_from_state(post_ra, post_nov, post_long, post_short)
+        # Scale both current and post into IBKR-equivalent units so the
+        # gating decision compares against the real margin we have to spend,
+        # not synthetic's structural overstatement. ibkr_scale is bounded
+        # in update_cached_margin to a sensible range with a 1.0 fallback.
         return {
-            "current_margin": cur,
-            "post_fill_margin": post,
+            "current_margin": cur * self.ibkr_scale,
+            "post_fill_margin": post * self.ibkr_scale,
             "current_long_premium": st["long_premium"],
             "post_long_premium": post_long,
         }
