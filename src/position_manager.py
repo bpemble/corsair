@@ -39,7 +39,8 @@ class PortfolioState:
         self.config = config
         self.positions: List[Position] = []
         self.fills_today: int = 0
-        self.spread_capture_today: float = 0.0
+        self.spread_capture_today: float = 0.0       # theo-based, headline
+        self.spread_capture_mid_today: float = 0.0   # mid-based, reality check
         self.daily_pnl: float = 0.0
         self._greeks_calc = GreeksCalculator()
         self._multiplier = config.product.multiplier
@@ -128,8 +129,15 @@ class PortfolioState:
         return seeded
 
     def add_fill(self, strike: float, expiry: str, put_call: str,
-                 quantity: int, fill_price: float):
-        """Record a new fill. Merges with existing position at same strike/expiry."""
+                 quantity: int, fill_price: float,
+                 spread_captured: float = 0.0,
+                 spread_captured_mid: float = 0.0):
+        """Record a new fill. Merges with existing position at same strike/expiry.
+
+        spread_captured is the theo-based dollar edge (headline metric).
+        spread_captured_mid is the mid-based dollar edge (reality check).
+        Both are signed; the caller has already applied the multiplier.
+        """
         for pos in self.positions:
             if pos.strike == strike and pos.expiry == expiry and pos.put_call == put_call:
                 new_qty = pos.quantity + quantity
@@ -138,7 +146,7 @@ class PortfolioState:
                 else:
                     pos.quantity = new_qty
                     pos.avg_fill_price = fill_price
-                self._record_fill(strike, quantity, fill_price)
+                self._record_fill(quantity, spread_captured, spread_captured_mid)
                 return
 
         # New position
@@ -147,13 +155,14 @@ class PortfolioState:
             quantity=quantity, avg_fill_price=fill_price,
             fill_time=datetime.now(),
         ))
-        self._record_fill(strike, quantity, fill_price)
+        self._record_fill(quantity, spread_captured, spread_captured_mid)
 
-    def _record_fill(self, strike: float, quantity: int, fill_price: float):
+    def _record_fill(self, quantity: int, spread_captured: float,
+                     spread_captured_mid: float):
         """Track fill for daily accounting."""
         self.fills_today += abs(quantity)
-        # Estimated spread capture per fill
-        self.spread_capture_today += 100 * abs(quantity)
+        self.spread_capture_today += spread_captured
+        self.spread_capture_mid_today += spread_captured_mid
 
     def refresh_greeks(self, market_state):
         """Recompute all position Greeks using current market data.

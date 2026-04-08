@@ -65,15 +65,54 @@ class FillHandler:
         except Exception:
             pass
 
+        # Compute realized edge two ways:
+        #   theo-based: signed distance from our SABR theo (model PnL view)
+        #   mid-based:  signed distance from clean-BBO mid (microstructure view)
+        # Theo is the headline metric; mid is logged as a reality check.
+        # Both are in dollars (multiplier applied) and signed — negatives mean
+        # we paid above theo / above mid (bought) or sold below.
+        mult = self.portfolio._multiplier
+        sign = 1 if quantity > 0 else -1  # buy: want fill < ref; sell: want fill > ref
+
+        spread_captured_theo = 0.0
+        try:
+            theo = self.quotes.sabr.get_theo(strike, put_call)
+            if theo and theo > 0:
+                edge_theo = (theo - fill_price) * sign
+                spread_captured_theo = edge_theo * mult * abs(quantity)
+        except Exception:
+            pass
+
+        spread_captured_mid = 0.0
+        try:
+            bid, ask = self.market_data.get_clean_bbo(strike, put_call)
+            if bid > 0 and ask > 0 and ask > bid:
+                mid = (bid + ask) / 2.0
+                edge_mid = (mid - fill_price) * sign
+                spread_captured_mid = edge_mid * mult * abs(quantity)
+        except Exception:
+            pass
+
         # Record the fill
         self.portfolio.add_fill(
             strike=strike, expiry=expiry, put_call=put_call,
             quantity=quantity, fill_price=fill_price,
+            spread_captured=spread_captured_theo,
+            spread_captured_mid=spread_captured_mid,
         )
         # Invalidate the synthetic SPAN portfolio cache — the position book
         # just changed, so the cached aggregate is stale.
         if hasattr(self.margin, "invalidate_portfolio"):
             self.margin.invalidate_portfolio()
+
+        # Refresh Greeks immediately so the just-added position contributes
+        # real delta/theta/vega to the fill log line and CSV row. Without this
+        # the new Position carries zeros until the next 5-minute refresh tick,
+        # which makes per-fill decomposition (spread vs theta vs MtM) useless.
+        try:
+            self.portfolio.refresh_greeks(self.market_data.state)
+        except Exception:
+            logger.exception("refresh_greeks after fill failed")
 
         # Log
         logger.info(
@@ -89,12 +128,15 @@ class FillHandler:
         self.csv_logger.log_fill(
             strike=strike, expiry=expiry, put_call=put_call,
             side=side, quantity=abs(quantity), fill_price=fill_price,
+            spread_captured_theo=spread_captured_theo,
+            spread_captured_mid=spread_captured_mid,
             margin_after=self.margin.get_current_margin(),
             delta_after=self.portfolio.net_delta,
             theta_after=self.portfolio.net_theta,
             vega_after=self.portfolio.net_vega,
             fills_today=self.portfolio.fills_today,
-            cumulative_spread=self.portfolio.spread_capture_today,
+            cumulative_spread_theo=self.portfolio.spread_capture_today,
+            cumulative_spread_mid=self.portfolio.spread_capture_mid_today,
             fill_latency_ms=fill_latency_ms,
         )
 

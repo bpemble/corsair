@@ -27,8 +27,10 @@ class CSVLogger:
         if not os.path.exists(self._fill_path):
             self._write_header(self._fill_path, [
                 "timestamp", "strike", "expiry", "put_call", "side", "quantity",
-                "fill_price", "spread_captured_est", "margin_after", "delta_after",
-                "theta_after", "vega_after", "fills_today", "cumulative_spread",
+                "fill_price", "spread_captured_theo", "spread_captured_mid",
+                "margin_after", "delta_after",
+                "theta_after", "vega_after", "fills_today",
+                "cumulative_spread_theo", "cumulative_spread_mid",
                 "fill_latency_ms",
             ])
 
@@ -71,13 +73,17 @@ class CSVLogger:
             logger.warning("Failed to write to %s: %s", path, e)
 
     def log_fill(self, strike, expiry, put_call, side, quantity, fill_price,
+                 spread_captured_theo, spread_captured_mid,
                  margin_after, delta_after, theta_after, vega_after,
-                 fills_today, cumulative_spread, fill_latency_ms=None):
+                 fills_today, cumulative_spread_theo, cumulative_spread_mid,
+                 fill_latency_ms=None):
         self._append_row(self._fill_path, [
             datetime.now().isoformat(), strike, expiry, put_call, side,
-            quantity, fill_price, 100 * quantity,  # Estimated spread capture
+            quantity, fill_price,
+            f"{spread_captured_theo:.2f}", f"{spread_captured_mid:.2f}",
             f"{margin_after:.0f}", f"{delta_after:.3f}", f"{theta_after:.0f}",
-            f"{vega_after:.0f}", fills_today, f"{cumulative_spread:.0f}",
+            f"{vega_after:.0f}", fills_today,
+            f"{cumulative_spread_theo:.0f}", f"{cumulative_spread_mid:.0f}",
             f"{fill_latency_ms:.0f}" if fill_latency_ms is not None else "",
         ])
 
