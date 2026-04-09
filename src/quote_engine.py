@@ -389,25 +389,45 @@ class QuoteManager:
             if not self._is_order_live(trade):
                 self.active_orders.pop(key, None)
             elif trade.order.lmtPrice != price:
-                # Mutate trade.order in place. The "clean rebuild" approach
-                # we briefly tried (build a new LimitOrder with the same
-                # orderId) drops the canonical Trade's clientId association
-                # in ib_insync's wrapper, so IBKR sees the modify as coming
-                # from a foreign client and rejects with Error 103
-                # (Duplicate order id). The orders then sit at PendingSubmit
-                # forever, every subsequent modify errors, and cancels start
-                # failing too. v1 always mutated in place; restoring that.
+                # Build a CLEAN LimitOrder for the modify and preserve the
+                # orderId / permId / clientId from the canonical Trade.
+                #
+                # Why not mutate trade.order in place: ib_insync's wrapper
+                # mutates trade.order from openOrder callbacks and at some
+                # point picks up volatility-related fields that turn the
+                # next placeOrder into a malformed VOL order — IBKR returns
+                # Error 321 ("VOL order requires non-negative floating
+                # point value for volatility"), and our placeOrder hits an
+                # AssertionError on the way out.
+                #
+                # Why preserve permId: IBKR identifies an order across
+                # modifies by permId (its server-side permanent id), not
+                # just orderId. A clean LimitOrder with permId=0 looks
+                # like a NEW order with a duplicate orderId → Error 103.
+                # Copying permId from the canonical Trade tells IBKR "this
+                # is the same order, just with new fields" — modify path,
+                # no duplicate.
                 now_ns = time.monotonic_ns()
-                trade.order.lmtPrice = price
-                trade.order.totalQuantity = qty
-                trade.order.goodTillDate = _gtd_string()
+                action = "BUY" if side == "BUY" else "SELL"
+                clean_order = LimitOrder(
+                    action=action,
+                    totalQuantity=qty,
+                    lmtPrice=price,
+                    tif="GTD",
+                    goodTillDate=_gtd_string(),
+                    account=self._account,
+                    orderRef=trade.order.orderRef,
+                )
+                clean_order.orderId = order_id
+                clean_order.permId = trade.order.permId
+                clean_order.clientId = trade.order.clientId
                 self._record_send_latency(strike, right, order_id)
                 # Stash for amend-RTT capture: keyed by (oid, price) so
                 # back-to-back modifies on the same orderId don't collide.
                 self._pending_amend[(order_id, price)] = now_ns
                 if len(self._pending_amend) > TRACKING_DICT_MAX:
                     self._evict_oldest_half(self._pending_amend)
-                self.ib.placeOrder(trade.contract, trade.order)
+                self.ib.placeOrder(trade.contract, clean_order)
                 return
             else:
                 gtd_str = trade.order.goodTillDate or ""
@@ -419,8 +439,22 @@ class QuoteManager:
                 except Exception:
                     remaining = 0
                 if remaining < GTD_REFRESH_THRESHOLD_SECONDS:
-                    trade.order.goodTillDate = _gtd_string()
-                    self.ib.placeOrder(trade.contract, trade.order)
+                    # Same clean-rebuild + permId rationale as the modify
+                    # path above.
+                    action = "BUY" if side == "BUY" else "SELL"
+                    refresh_order = LimitOrder(
+                        action=action,
+                        totalQuantity=qty,
+                        lmtPrice=price,
+                        tif="GTD",
+                        goodTillDate=_gtd_string(),
+                        account=self._account,
+                        orderRef=trade.order.orderRef,
+                    )
+                    refresh_order.orderId = order_id
+                    refresh_order.permId = trade.order.permId
+                    refresh_order.clientId = trade.order.clientId
+                    self.ib.placeOrder(trade.contract, refresh_order)
                 return
 
         # Place a new order
