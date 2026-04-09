@@ -36,7 +36,14 @@ WATCHDOG_INTERVAL_SEC = 2.0
 # fast move is a lot of risk — we want detect-to-cancel in single-digit
 # seconds.
 WATCHDOG_FAST_CANCEL_STALE_SEC = 5.0
-WATCHDOG_STALE_THRESHOLD_SEC = 30.0
+# Lowered from 30s to 12s (defense vector D, 2026-04-09). With the new
+# Error 1100 handler in connection.py treating soft disconnects immediately,
+# the tick-staleness path is now a backstop only — we want it to fire
+# faster than the 30s GTD floor so the cancel-on-disconnect timing isn't
+# bounded by GTD expiry. 12s gives ~6 watchdog ticks of grace which is
+# enough to ride out a quiet ETH options market without false-positive
+# cancels (verified against the freshest_signal_age min() semantics).
+WATCHDOG_STALE_THRESHOLD_SEC = 12.0
 WATCHDOG_FAILURES_BEFORE_ACTION = 2
 WATCHDOG_BACKOFF_SEC = (5, 10, 30, 60, 60)  # last value repeats
 # Quote-loop exception storm: if QuoteManager.consecutive_quote_errors
@@ -404,6 +411,49 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                     await asyncio.sleep(GATEWAY_RESTART_SETTLE_SEC)
                     consecutive_recovery_failures = 0
                     backoff_idx = 0
+                    # Defense vector E (2026-04-09): immediately force a
+                    # clean reconnect against the fresh gateway. Without
+                    # this, we'd fall through to the next loop iteration
+                    # which still holds stale ib_insync state and may take
+                    # several more health-check cycles + backoff to start
+                    # connecting — empirically this caused corsair to sit
+                    # idle even after a successful gateway escalation,
+                    # requiring a manual `docker compose restart corsair`.
+                    logger.info(
+                        "WATCHDOG: post-escalation, forcing clean reconnect"
+                    )
+                    try:
+                        await conn.disconnect()
+                    except Exception as e:
+                        logger.warning("WATCHDOG: post-escalation disconnect: %s", e)
+                    try:
+                        if await conn.connect() and await safe_discover_and_subscribe(market_data):
+                            await asyncio.sleep(3)
+                            seeded = portfolio.seed_from_ibkr(ib, account_id)
+                            logger.info(
+                                "WATCHDOG: post-escalation reseed: %d position(s)",
+                                seeded,
+                            )
+                            margin.invalidate_portfolio()
+                            sabr.set_expiry(market_data.state.front_month_expiry)
+                            quotes.consecutive_quote_errors = 0
+                            if risk.clear_disconnect_kill():
+                                logger.info(
+                                    "WATCHDOG: post-escalation cleared disconnect kill, "
+                                    "quoting resumes"
+                                )
+                            consecutive_failures = 0
+                            logger.info("WATCHDOG: post-escalation recovery complete")
+                        else:
+                            logger.error(
+                                "WATCHDOG: post-escalation reconnect failed; "
+                                "next normal cycle will retry"
+                            )
+                    except Exception as e:
+                        logger.error(
+                            "WATCHDOG: post-escalation reconnect exception: %s",
+                            e, exc_info=True,
+                        )
 
         except asyncio.CancelledError:
             logger.info("WATCHDOG: cancelled, exiting")

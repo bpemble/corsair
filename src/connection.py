@@ -100,11 +100,32 @@ class IBKRConnection:
             }
             tasks = [asyncio.wait_for(coro, TIMEOUT) for coro in reqs.values()]
             results = await asyncio.gather(*tasks, return_exceptions=True)
+            timeouts = 0
             for name, result in zip(reqs, results):
                 if isinstance(result, asyncio.TimeoutError):
-                    logger.warning("Bootstrap '%s' timed out — continuing anyway", name)
+                    logger.warning("Bootstrap '%s' timed out", name)
+                    timeouts += 1
                 elif isinstance(result, BaseException):
-                    logger.warning("Bootstrap '%s' failed: %s — continuing", name, result)
+                    logger.warning("Bootstrap '%s' failed: %s", name, result)
+                    timeouts += 1
+            # If any of the lean bootstrap calls timed out, the gateway is
+            # in the half-dead "IBC session corrupted" state — accepts TCP,
+            # rejects/hangs API calls. Continuing to declare "Connected"
+            # downstream guarantees a wasted chain-discovery attempt later
+            # and another 30s before the watchdog can re-escalate. Fail
+            # fast so the watchdog escalation counter can advance.
+            if timeouts >= 1:
+                logger.error(
+                    "Bootstrap failed: %d/%d requests timed out — gateway is "
+                    "half-dead, reporting connect failure",
+                    timeouts, len(reqs),
+                )
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+                self._connected = False
+                return False
 
             # Force a fresh nextValidId sync. IBKR sends one automatically
             # during the API handshake, but if a prior session on this clientId
@@ -127,6 +148,7 @@ class IBKRConnection:
             # Register disconnect handler (only once across reconnects)
             if not getattr(self, "_disconnect_handler_registered", False):
                 ib.disconnectedEvent += self._on_disconnect
+                ib.errorEvent += self._on_error
                 self._disconnect_handler_registered = True
 
             # ib_insync normally emits this from connectAsync; emit it ourselves
@@ -157,6 +179,36 @@ class IBKRConnection:
             self.ib.disconnect()
         self._connected = False
         logger.info("Disconnected from IBKR Gateway")
+
+    def _on_error(self, reqId, errorCode, errorString, contract):
+        """Treat IBKR connectivity errors as soft disconnects.
+
+        Defense vector A: ib_insync's `disconnectedEvent` only fires on hard
+        socket close. When IBKR's upstream link dies (Error 1100), the TCP
+        socket stays alive but no data flows — we'd otherwise wait for the
+        watchdog tick-staleness threshold (30s) before reacting. By the
+        time we did, our orders had been sitting on the book for 30+s of
+        bad-fill exposure.
+
+        Codes:
+          1100 — Connectivity between IBKR and TWS has been lost
+          1300 — TWS socket port has been reset
+        Both mean: stop trading, cancel everything, wait for restoration.
+
+          1101 — Connectivity restored, data lost (need to resubscribe)
+          1102 — Connectivity restored, data maintained
+        These will be picked up by the watchdog reconnect path; we don't
+        need to do anything special here beyond noting them.
+        """
+        if errorCode in (1100, 1300):
+            if not getattr(self, "_disconnect_fired", False):
+                logger.critical(
+                    "IBKR Error %d: %s — treating as soft disconnect",
+                    errorCode, errorString,
+                )
+                self._on_disconnect()
+        elif errorCode in (1101, 1102):
+            logger.warning("IBKR Error %d: %s", errorCode, errorString)
 
     def _on_disconnect(self):
         """Called when gateway connection drops. Idempotent within a session
