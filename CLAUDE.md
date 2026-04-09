@@ -4,6 +4,26 @@ Hard-earned lessons. Read before debugging anything weird around connectivity,
 order lifecycle, or margin display. Each entry took hours to find live; the
 goal of this doc is to never re-discover them.
 
+## 0. Source is BAKED INTO the corsair image — `restart` ≠ `up --build`
+
+The `corsair` service in `docker-compose.yml` builds from the local
+Dockerfile and **does not volume-mount `src/`**. Code edits do NOT take
+effect on `docker compose restart corsair` — that just bounces the
+existing container running the cached image.
+
+To deploy code changes:
+
+```bash
+docker compose up -d --build corsair
+```
+
+Burned ~20 minutes on 2026-04-09 testing "fixes" against an old image
+because `restart` reported success and the new log lines never appeared.
+Verify your edits are live by grepping the new log line in the first
+boot output before drawing any conclusions about whether a fix worked.
+
+Gateway and dashboard images are similarly built locally; same rule.
+
 ## 1. clientId=0 is REQUIRED on FA paper accounts
 
 Our paper login (`DUP553656` under master `DFP553653`) is a Financial

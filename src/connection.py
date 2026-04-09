@@ -180,7 +180,26 @@ class IBKRConnection:
         self._connected = False
         logger.info("Disconnected from IBKR Gateway")
 
-    def _on_error(self, reqId, errorCode, errorString, contract):
+    def _on_error(self, *args, **kwargs):
+        """Treat IBKR connectivity errors as soft disconnects.
+
+        ib_insync's errorEvent signature has varied across versions
+        ((reqId, errorCode, errorString) → +contract → +errorTime), and
+        a signature mismatch in eventkit dispatch silently swallows the
+        callback. Accept *args/**kwargs to be version-agnostic and
+        unpack defensively.
+        """
+        if len(args) < 2:
+            return
+        # args: (reqId, errorCode, errorString, [contract], [errorTime])
+        try:
+            errorCode = int(args[1])
+        except (TypeError, ValueError):
+            return
+        errorString = args[2] if len(args) >= 3 else ""
+        return self._handle_error_code(errorCode, errorString)
+
+    def _handle_error_code(self, errorCode: int, errorString: str):
         """Treat IBKR connectivity errors as soft disconnects.
 
         Defense vector A: ib_insync's `disconnectedEvent` only fires on hard
