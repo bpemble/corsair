@@ -998,15 +998,16 @@ class MarketDataManager:
             p_high = state.atm_strike + (puts_cfg.quote_range_high * inc)
             windows.append(("P", p_low, p_high))
 
+        dte = days_to_expiry(expiry)
+        if dte <= config.product.min_dte:
+            return quotable
+
         for right, low, high in windows:
             for strike in all_strikes:
                 if strike < low or strike > high:
                     continue
                 option = state.get_option(strike, expiry=expiry, right=right)
                 if option is None:
-                    continue
-                dte = days_to_expiry(option.expiry)
-                if dte <= config.product.min_dte:
                     continue
                 if option.bid <= 0 or option.ask <= 0:
                     continue

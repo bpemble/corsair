@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+from .utils import time_to_expiry_years
+
 from .greeks import GreeksCalculator, Greeks
 
 logger = logging.getLogger(__name__)
@@ -190,7 +192,7 @@ class PortfolioState:
         Args:
             market_state: MarketState with current option quotes and underlying price.
         """
-        from .utils import time_to_expiry_years
+
 
         underlying = market_state.underlying_price
         if underlying <= 0:

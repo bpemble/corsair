@@ -8,6 +8,7 @@ Reused from Corsair v1. Provides:
 
 import logging
 import math
+import time as _time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -618,7 +619,6 @@ class SABRSurface:
 
     def get_theo(self, strike: float, put_call: str = "C") -> float:
         """Return theoretical option price from SABR surface (TTL-cached)."""
-        import time as _time
         key = (strike, put_call)
         now = _time.monotonic()
         cached = self._theo_cache.get(key)

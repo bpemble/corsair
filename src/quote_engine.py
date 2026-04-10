@@ -28,13 +28,10 @@ TRACKING_DICT_MAX = 4_000
 # Minimum lifetime before a freshly-placed order is eligible for cancellation.
 # IBKR takes ~50-300ms to ack a new order; if we cancel inside that window the
 # order goes PendingSubmit → PendingCancel without ever visiting Submitted, so
-# the order is invisible on the book and we burn a place/cancel pair. Lowered
-# from 750ms to 300ms 2026-04-08 — the canonical_trade fix means we now reliably
-# observe the ack, so we don't need the 750ms safety margin we needed when
-# orders looked perpetually stuck. 300ms covers the observed amend p50 (~106ms)
-# with headroom for the long tail without artificially delaying legitimate
-# cancels on real skip conditions.
+# the order is invisible on the book and we burn a place/cancel pair. 750ms
+# covers the long-tail ack latency with headroom.
 MIN_ORDER_LIFETIME_MS = 750
+MIN_ORDER_LIFETIME_NS = MIN_ORDER_LIFETIME_MS * 1_000_000
 
 logger = logging.getLogger(__name__)
 
@@ -470,6 +467,12 @@ class QuoteManager:
             else:
                 iter_pairs = pairs
 
+            # Per-expiry constants (avoid re-fetching per-strike)
+            _exp_cal_ready = (config.pricing.sabr_enabled
+                              and self.sabr.get_last_calibration(exp) is not None)
+            _exp_cal_forward = self.sabr.get_forward(exp) if _exp_cal_ready else 0.0
+            _exp_underlying = state.underlying_price
+
             for strike, right in iter_pairs:
                 option = state.get_option(strike, expiry=exp, right=right)
                 if option is None:
@@ -477,14 +480,13 @@ class QuoteManager:
 
                 self._decision_tick_ns[(strike, exp, right)] = option.tick_received_ns
 
-                # Theo from SABR (per expiry × right)
+                # Theo from SVI/SABR (per expiry × right)
                 theo = None
-                if config.pricing.sabr_enabled:
-                    if self.sabr.get_last_calibration(exp) is not None:
-                        try:
-                            theo = self.sabr.get_theo(strike, right, expiry=exp)
-                        except Exception:
-                            theo = None
+                if _exp_cal_ready:
+                    try:
+                        theo = self.sabr.get_theo(strike, right, expiry=exp)
+                    except Exception:
+                        theo = None
 
                 our_bid_prices = our_prices_idx.get((strike, exp, right, "BUY"), _empty_set)
                 our_ask_prices = our_prices_idx.get((strike, exp, right, "SELL"), _empty_set)
@@ -494,9 +496,11 @@ class QuoteManager:
                     strike, "SELL", our_ask_prices, right=right, expiry=exp)
 
                 self._process_side(portfolio, option, strike, exp, right, "BUY",
-                                   inc_bid_info, theo)
+                                   inc_bid_info, theo,
+                                   _exp_cal_forward, _exp_underlying)
                 self._process_side(portfolio, option, strike, exp, right, "SELL",
-                                   inc_ask_info, theo)
+                                   inc_ask_info, theo,
+                                   _exp_cal_forward, _exp_underlying)
 
         # On full refresh, sweep stale orders for any (strike, expiry, right, side)
         # whose (strike, expiry, right) is no longer in the full quotable set.
@@ -508,27 +512,21 @@ class QuoteManager:
 
     def _process_side(self, portfolio, option, strike: float, expiry: str,
                       right: str, side: str, inc_info: dict,
-                      theo: Optional[float]) -> None:
+                      theo: Optional[float],
+                      cal_forward: float = 0.0,
+                      current_underlying: float = 0.0) -> None:
         """Apply skip-reason gate, theo-edge gate, constraint check, and
         order placement for a single (strike, expiry, right, side)."""
         config = self.config
         tick = config.quoting.tick_size
 
         # Delta-based instant reprice: adjust theo for underlying movement
-        # since the last SVI/SABR calibration. First-order Taylor expansion:
-        #   theo_adj ≈ theo + delta × (current_underlying - cal_forward)
-        # This collapses repricing latency from ~300ms (full recal) to <1ms.
-        # The full recal still runs on its normal schedule to correct for
-        # higher-order terms (gamma, vega); this just keeps the aggression
-        # cap and theo-edge gate fresh between recals.
+        # since the last SVI/SABR calibration. First-order Taylor expansion
+        # collapses repricing latency from ~300ms (full recal) to <1ms.
         if theo is not None and option is not None:
-            delta = getattr(option, "delta", 0) or 0
-            if delta != 0:
-                cal_forward = self.sabr.get_forward(expiry)
-                current_underlying = self.market_data.state.underlying_price
-                if cal_forward > 0 and current_underlying > 0:
-                    underlying_move = current_underlying - cal_forward
-                    theo = max(theo + delta * underlying_move, 0.01)
+            delta = option.delta
+            if delta != 0 and cal_forward > 0 and current_underlying > 0:
+                theo = max(theo + delta * (current_underlying - cal_forward), 0.01)
 
         # Skip-reason gate from market_data
         #
@@ -861,7 +859,7 @@ class QuoteManager:
                 if (placed_ns is not None
                         and status in ("PendingSubmit", "ApiPending")
                         and (time.monotonic_ns() - placed_ns)
-                                < MIN_ORDER_LIFETIME_MS * 1_000_000):
+                                < MIN_ORDER_LIFETIME_NS):
                     return  # let IBKR ack first; next cycle will retry
                 # In-place mutation of the canonical trade.order. The
                 # clean-LimitOrder rebuild approach (commits 3a391d2 /
@@ -946,7 +944,6 @@ class QuoteManager:
             return
 
         # Place a new order
-        action = "BUY" if side == "BUY" else "SELL"
         # account= is REQUIRED on multi-account logins (DFP/DUP paper sub-
         # accounts) — IBKR returns Error 436 "You must specify an allocation"
         # if it's missing. Verified 2026-04-08.
@@ -956,7 +953,7 @@ class QuoteManager:
         # canonical-trade filter in _build_our_prices_index still matches.
         exp_tag = (expiry or "")[-4:] or "xxxx"
         order = LimitOrder(
-            action=action,
+            action=side,
             totalQuantity=qty,
             lmtPrice=price,
             tif="GTD",
@@ -1077,9 +1074,7 @@ class QuoteManager:
                         self._place_rtt_us.append(rtt_us)
                     self._rtt_captured_oids.add(oid)
                     if len(self._rtt_captured_oids) > TRACKING_DICT_MAX:
-                        self._rtt_captured_oids = set(
-                            list(self._rtt_captured_oids)[-(TRACKING_DICT_MAX // 2):]
-                        )
+                        self._rtt_captured_oids.clear()
 
             # ── amend-RTT (one sample per modify) ─────────────────
             # Match on (oid, price) so rapid modifies are independent.
@@ -1181,7 +1176,7 @@ class QuoteManager:
             status = trade.orderStatus.status
             if (placed_ns is not None
                     and status in ("PendingSubmit", "ApiPending")
-                    and (time.monotonic_ns() - placed_ns) < MIN_ORDER_LIFETIME_MS * 1_000_000):
+                    and (time.monotonic_ns() - placed_ns) < MIN_ORDER_LIFETIME_NS):
                 # Too young to cancel — let IBKR ack first.
                 return
             # Bucket-gated. If the cancel is dropped here we still pop
