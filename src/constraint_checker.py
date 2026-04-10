@@ -242,12 +242,14 @@ class IBKRMarginChecker:
                     raw_synth = self._raw_current_margin()
                     if raw_synth > 0 and self.cached_ibkr_margin > 0:
                         ratio = raw_synth / self.cached_ibkr_margin
-                        # Bound the scale to a sensible range. If ratio drifts
-                        # outside [0.8, 2.0] something is wrong with either
-                        # the live recon or the synthetic — fall back to
-                        # raw synthetic in that case (safe direction: we'd
-                        # rather be conservative than blow the cap).
-                        if 0.8 <= ratio <= 2.0:
+                        # Bound the scale to a sensible range.
+                        # ratio > 1.0 = IBKR margin is LOWER than synthetic
+                        #   (expected: SPAN offsets, or unmodeled hedges like
+                        #   manual futures positions). Trust the IBKR number.
+                        # ratio < 0.8 = IBKR margin is HIGHER than synthetic
+                        #   (unexpected: synthetic is underestimating risk).
+                        #   Fall back to raw synthetic (conservative).
+                        if ratio >= 0.8:
                             self.ibkr_scale = 1.0 / ratio
                         else:
                             self.ibkr_scale = 1.0

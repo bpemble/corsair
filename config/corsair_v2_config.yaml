@@ -114,7 +114,7 @@ quoting:
   # Hard cap on total resting orders per side across all strikes
   # (defense vector #11). With ~21 quotable strikes per side this is
   # ~3x the expected steady-state and gives runaway-bug headroom.
-  max_resting_per_side: 60
+  max_resting_per_side: 90
   refresh_interval_ms: 1000   # Periodic full-refresh fallback (event-driven path is real-time)
   tick_batch_window_sec: 0.005       # Drain queue for 5ms after first tick (latency floor)
   snapshot_write_interval_sec: 0.25  # Dashboard snapshot cadence (4Hz for near-real-time UI)

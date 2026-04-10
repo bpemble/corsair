@@ -355,8 +355,11 @@ if snapshot is not None:
             qty_class = "pos-long" if qty > 0 else "pos-short"
             unr = p["unrealized_pnl"]
             unr_class = "positive" if unr >= 0 else "negative"
+            exp = p.get('expiry', '')
+            exp_label = f"{exp[4:6]}/{exp[6:8]}" if len(exp) == 8 else exp
             rows += f"""<tr>
                 <td>{int(p['strike'])}{p['right']}</td>
+                <td>{exp_label}</td>
                 <td class="{qty_class}">{qty:+d}</td>
                 <td>${p['avg_price']:.2f}</td>
                 <td>${p['mark']:.2f}</td>
@@ -367,7 +370,7 @@ if snapshot is not None:
         return f"""
         <table class="chain-table">
             <thead><tr>
-                <th>Contract</th><th>Qty</th><th>Avg</th><th>Mark</th>
+                <th>Contract</th><th>Exp</th><th>Qty</th><th>Avg</th><th>Mark</th>
                 <th>P&amp;L</th><th>&Delta;</th><th>&Theta;</th>
             </tr></thead>
             <tbody>{rows}</tbody>

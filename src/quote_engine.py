@@ -521,46 +521,59 @@ class QuoteManager:
         config = self.config
         tick = config.quoting.tick_size
 
+        # Delta-based instant reprice: adjust theo for underlying movement
+        # since the last SVI/SABR calibration. First-order Taylor expansion:
+        #   theo_adj ≈ theo + delta × (current_underlying - cal_forward)
+        # This collapses repricing latency from ~300ms (full recal) to <1ms.
+        # The full recal still runs on its normal schedule to correct for
+        # higher-order terms (gamma, vega); this just keeps the aggression
+        # cap and theo-edge gate fresh between recals.
+        if theo is not None and option is not None:
+            delta = getattr(option, "delta", 0) or 0
+            if delta != 0:
+                cal_forward = self.sabr.get_forward(expiry)
+                current_underlying = self.market_data.state.underlying_price
+                if cal_forward > 0 and current_underlying > 0:
+                    underlying_move = current_underlying - cal_forward
+                    theo = max(theo + delta * underlying_move, 0.01)
+
         # Skip-reason gate from market_data
         #
-        # Position-closing bypass (defense vector #16, 2026-04-09):
+        # Margin-escape bypass (defense vector #16, 2026-04-09):
         # when the incumbent gate returns `wide_market` for a strike
-        # where we hold a non-zero position AND the requested side
-        # would reduce the position's magnitude (BUY to close a short,
-        # SELL to close a long), bypass the skip and fall through to
-        # a theo-anchored price path. Rationale: in fast-moving or
-        # illiquid markets option spreads can widen past the normal
-        # penny-jump threshold exactly when we most need to unwind
-        # existing exposure (e.g. to satisfy margin escape). Without
-        # this bypass the system wedges — constraint checker says
-        # "close the short to free margin," market_data says "spread
-        # too wide to compute a target," and nothing happens.
+        # where we hold a position AND closing it would reduce margin
+        # AND margin is currently breached, bypass the skip and post a
+        # mid-anchored passive order. Without this the system wedges —
+        # constraint checker says "close to free margin," market_data
+        # says "spread too wide," and nothing happens.
         #
-        # Safety: the theo cap + theo-edge gate downstream still
-        # apply, so the synthesized price is bounded by model-fair
-        # regardless of how wide the market is. We post passively
-        # (theo - edge for BUY close, theo + edge for SELL close),
-        # which rests safely inside our tolerance and waits for a
-        # natural counterparty — it does NOT aggressively cross.
+        # Gated on margin breach: if margin is fine, let positions sit.
+        # Posting closing orders into wide markets when there's no
+        # urgency to unwind just generates adverse fills for no benefit.
         _bypass_wide_market = False
         if (inc_info["skip_reason"] == "wide_market"
                 and theo is not None and theo > 0):
-            pos_qty = 0
-            for _p in portfolio.positions:
-                if (_p.strike == strike and _p.expiry == expiry
-                        and _p.put_call == right):
-                    pos_qty = _p.quantity
-                    break
-            is_closing = ((pos_qty > 0 and side == "SELL")
-                          or (pos_qty < 0 and side == "BUY"))
-            if is_closing:
-                _bypass_wide_market = True
-                logger.info(
-                    "wide_market bypass: closing %+d %s %s%.0f via theo anchor "
-                    "(spread=%.2f, theo=%.2f)",
-                    pos_qty, expiry[-4:], right, strike,
-                    inc_info.get("bbo_width") or 0.0, theo,
-                )
+            margin_ceiling = (float(config.constraints.capital)
+                              * float(config.constraints.margin_ceiling_pct))
+            cur_margin = self.constraint_checker.margin_checker.get_current_margin()
+            if cur_margin > margin_ceiling:
+                pos_qty = 0
+                for _p in portfolio.positions:
+                    if (_p.strike == strike and _p.expiry == expiry
+                            and _p.put_call == right):
+                        pos_qty = _p.quantity
+                        break
+                is_closing = ((pos_qty > 0 and side == "SELL")
+                              or (pos_qty < 0 and side == "BUY"))
+                if is_closing:
+                    _bypass_wide_market = True
+                    logger.info(
+                        "wide_market bypass: closing %+d %s %s%.0f via mid anchor "
+                        "(margin=$%.0f > $%.0f ceiling, spread=%.2f, theo=%.2f)",
+                        pos_qty, expiry[-4:], right, strike,
+                        cur_margin, margin_ceiling,
+                        inc_info.get("bbo_width") or 0.0, theo,
+                    )
 
         if inc_info["skip_reason"] and not _bypass_wide_market:
             # self_only = our order is the only level on this side; leave it
@@ -571,19 +584,25 @@ class QuoteManager:
             return
 
         # Penny-jump the incumbent — or, in the wide_market bypass
-        # case, synthesize a theo-anchored price directly. The bypass
-        # path posts at theo ± min_edge (safe passive price), which
-        # rests inside our model tolerance but doesn't cross the wide
-        # market. If a natural counterparty hits it, great; if not,
-        # the resting order waits for the spread to tighten.
+        # case, synthesize a mid-anchored price to close the position.
+        # Uses market mid (not theo) as the anchor because theo can be
+        # $5+ off mid on wide-spread near-ATM strikes, leading to
+        # adverse fills where we think we have edge but are actually
+        # on the wrong side of fair.
         if _bypass_wide_market:
             import math as _math
             edge_floor = float(config.pricing.min_edge_points or 0.0)
+            mkt_bid, mkt_ask = self.market_data.get_clean_bbo(
+                strike, right, expiry=expiry)
+            if mkt_bid > 0 and mkt_ask > 0:
+                mid = (mkt_bid + mkt_ask) / 2.0
+            else:
+                mid = theo  # fall back to theo if no BBO
             if side == "BUY":
-                anchor = theo - edge_floor
+                anchor = mid - edge_floor
                 adj = _math.floor(anchor / tick) * tick
             else:  # SELL
-                anchor = theo + edge_floor
+                anchor = mid + edge_floor
                 adj = _math.ceil(anchor / tick) * tick
         else:
             if side == "BUY":

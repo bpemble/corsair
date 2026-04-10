@@ -526,7 +526,7 @@ class SABRSurface:
                     continue
                 prior = sp["svi_params"]
                 if (prior is not None
-                        and result.rmse > max(prior.rmse * 1.5, 0.005)):
+                        and result.rmse > max(prior.rmse * 1.5, 0.01)):
                     logger.warning(
                         "SVI %s fit rejected (rmse_regression %.4f > 1.5x prior %.4f)",
                         side, result.rmse, prior.rmse,
@@ -564,7 +564,7 @@ class SABRSurface:
                     continue
                 prior = sp["params"]
                 if (prior is not None
-                        and result.rmse > max(prior.rmse * 1.5, 0.005)):
+                        and result.rmse > max(prior.rmse * 1.5, 0.01)):
                     logger.warning(
                         "SABR %s fit rejected (rmse_regression %.4f > 1.5x prior %.4f)",
                         side, result.rmse, prior.rmse,
@@ -771,4 +771,12 @@ class MultiExpirySABR:
     @property
     def forward(self) -> float:
         surf = self._front_surface()
+        return surf.forward if surf else 0.0
+
+    def get_forward(self, expiry: str = None) -> float:
+        """Return the calibration forward for a given expiry."""
+        exp = expiry if expiry is not None else self.front_month
+        if exp is None:
+            return 0.0
+        surf = self._surfaces.get(exp)
         return surf.forward if surf else 0.0
