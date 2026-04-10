@@ -7,18 +7,22 @@ names, never inline styles.
 """
 
 
-def _our_price_cell(price, live, mkt_ref, side):
+def _our_price_cell(price, live, mkt_ref, raw_ref, side):
     """Color-coded our_bid / our_ask cell.
       - None  → idle (gray dash)
-      - live (Submitted) AND best-quote → quoting (green)
+      - live (Submitted) AND at/better than BBO → quoting (green)
       - live but behind → behind (red)
       - has order but not yet Submitted → pending (amber)
     """
     if price is None:
         return '<span class="chain-our-price idle">-</span>'
     if live:
-        better = (price > mkt_ref) if side == "BUY" else (price < mkt_ref)
-        cls = "quoting" if (mkt_ref == 0 or better) else "behind"
+        # Compare against raw L1 BBO: if our price IS the best bid/ask,
+        # we're leading. The clean "market" ref can equal our price when
+        # the self-filter cache is stale, which would incorrectly show
+        # red for a quote that's actually at the top of the book.
+        at_bbo = (price >= raw_ref) if side == "BUY" else (price <= raw_ref)
+        cls = "quoting" if (raw_ref == 0 or at_bbo) else "behind"
     else:
         cls = "pending"
     return f'<span class="chain-our-price {cls}">{price:.1f}</span>'
@@ -35,13 +39,15 @@ def _fmt_side(s):
 
     mkt_bid = s.get("market_bid", 0) or 0
     mkt_ask = s.get("market_ask", 0) or 0
+    raw_bid = s.get("raw_bid", 0) or 0
+    raw_ask = s.get("raw_ask", 0) or 0
     our_bid = s.get("our_bid")
     our_ask = s.get("our_ask")
     theo = s.get("theo")
     pos = s.get("position", 0)
 
-    our_bid_html = _our_price_cell(our_bid, s.get("bid_live", False), mkt_bid, "BUY")
-    our_ask_html = _our_price_cell(our_ask, s.get("ask_live", False), mkt_ask, "SELL")
+    our_bid_html = _our_price_cell(our_bid, s.get("bid_live", False), mkt_bid, raw_bid, "BUY")
+    our_ask_html = _our_price_cell(our_ask, s.get("ask_live", False), mkt_ask, raw_ask, "SELL")
     theo_html = f"{theo:.1f}" if theo is not None else "-"
 
     # Edge per side vs theo. Bid edge = theo - our_bid (positive = we buy
@@ -148,13 +154,24 @@ def _build_row(strike_str, block, atm_strike):
     </tr>"""
 
 
-def build_chain_html(snapshot):
+def build_chain_html(snapshot, selected_expiry: str = None):
     """Return the full chain table HTML, or None if the snapshot has
-    no strike data. Wrapper div uses .chain-scroll for styling."""
-    if not snapshot or not snapshot.get("strikes"):
+    no strike data. Wrapper div uses .chain-scroll for styling.
+
+    If ``selected_expiry`` is provided and present in snapshot["chains"],
+    that expiry's chain is rendered. Otherwise falls back to the legacy
+    top-level ``snapshot["strikes"]`` block (front month)."""
+    if not snapshot:
+        return None
+    chains = snapshot.get("chains") or {}
+    strikes = None
+    if selected_expiry and selected_expiry in chains:
+        strikes = chains[selected_expiry].get("strikes")
+    if not strikes:
+        strikes = snapshot.get("strikes")
+    if not strikes:
         return None
     atm_strike = snapshot.get("atm_strike", 0)
-    strikes = snapshot["strikes"]
     rows = "".join(
         _build_row(k, strikes[k], atm_strike)
         for k in sorted(strikes.keys(), key=float)

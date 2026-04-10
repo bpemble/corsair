@@ -116,6 +116,11 @@ def calibrate_sabr(
     best_result = None
     best_cost = float("inf")
 
+    # Alpha bounds scale with F^(1-beta): for beta=1.0 alpha is ~ATM_IV
+    # (~0.6), but for beta=0.5 it's ~ATM_IV * sqrt(F) (~28). The upper
+    # bound must accommodate both regimes.
+    alpha_ub = max(10.0, alpha_0 * 5.0)
+
     initial_guesses = [
         (alpha_0, -0.3, 0.3),
         (alpha_0, -0.5, 0.5),
@@ -127,7 +132,7 @@ def calibrate_sabr(
         try:
             result = least_squares(
                 residuals, x0=guess,
-                bounds=([0.0001, -0.999, 0.0001], [10.0, 0.999, 5.0]),
+                bounds=([0.0001, -0.999, 0.0001], [alpha_ub, 0.999, 5.0]),
                 method="trf", max_nfev=200,
             )
             if result.cost < best_cost:
@@ -248,8 +253,156 @@ def _sabr_quality_ok(result, min_strikes: int) -> Tuple[bool, str]:
     return True, "ok"
 
 
+# ── SVI (Stochastic Volatility Inspired) model ─────────────────────────
+#
+# Gatheral's raw SVI parametrization for total implied variance:
+#   w(k) = a + b * (rho * (k - m) + sqrt((k - m)^2 + sigma^2))
+# where k = log(K/F) and w = sigma_BS^2 * T (total variance).
+#
+# 5 free parameters (a, b, rho, m, sigma) give enough flexibility to
+# capture the ETH put skew + curvature that SABR's 3 params cannot.
+
+
+@dataclass
+class SVIParams:
+    """Fitted SVI parameters for a single expiry/side."""
+    a: float
+    b: float
+    rho: float
+    m: float
+    sigma: float
+    rmse: float
+    n_points: int
+
+
+def svi_total_variance(k: float, a: float, b: float, rho: float,
+                       m: float, sigma: float) -> float:
+    """Raw SVI total variance w(k) for log-moneyness k."""
+    return a + b * (rho * (k - m) + math.sqrt((k - m) ** 2 + sigma ** 2))
+
+
+def svi_implied_vol(F: float, K: float, T: float,
+                    a: float, b: float, rho: float,
+                    m: float, sigma: float) -> float:
+    """Return Black implied vol from SVI parameters."""
+    if T <= 0 or K <= 0 or F <= 0:
+        return 0.0
+    k = math.log(K / F)
+    w = svi_total_variance(k, a, b, rho, m, sigma)
+    if w <= 0:
+        return 0.001
+    return math.sqrt(w / T)
+
+
+def calibrate_svi(
+    F: float, T: float,
+    strikes: List[float], market_ivs: List[float],
+    max_rmse: float = 0.03,
+    weights: Optional[List[float]] = None,
+) -> Optional[SVIParams]:
+    """Calibrate SVI parameters to market implied vols."""
+    n = len(strikes)
+    if n < 5 or len(market_ivs) != n:
+        return None
+    if T <= 0 or F <= 0:
+        return None
+
+    K = np.array(strikes, dtype=np.float64)
+    mkt = np.array(market_ivs, dtype=np.float64)
+    ks = np.log(K / F)  # log-moneyness
+    mkt_w = mkt ** 2 * T  # total variance targets
+
+    W = np.ones(n, dtype=np.float64)
+    if weights is not None and len(weights) == n:
+        W = np.array(weights, dtype=np.float64)
+        w_sum = W.sum()
+        if w_sum > 0:
+            W = W * (n / w_sum)
+
+    atm_var = float(np.interp(0.0, ks, mkt_w))
+
+    def residuals(params):
+        a, b, rho, m, sig = params
+        model_w = np.array([
+            svi_total_variance(k, a, b, rho, m, sig) for k in ks
+        ])
+        # Fit in IV space for comparability with SABR RMSE
+        model_iv = np.sqrt(np.maximum(model_w, 1e-10) / T)
+        return (model_iv - mkt) * W
+
+    # Initial guesses spanning mild to steep skew regimes.
+    # ETH puts have steep skew that needs larger b, more negative rho,
+    # and wider sigma to avoid pinning rho to -1.0.
+    initial_guesses = [
+        (atm_var, 0.1, -0.3, 0.0, 0.1),
+        (atm_var, 0.2, -0.5, 0.0, 0.05),
+        (atm_var * 0.8, 0.15, -0.2, -0.05, 0.15),
+        (atm_var, 0.05, -0.4, 0.02, 0.08),
+        # Steep-skew guesses (puts)
+        (atm_var, 0.1, -0.7, -0.1, 0.3),
+        (atm_var * 0.5, 0.15, -0.6, -0.05, 0.5),
+        (atm_var, 0.08, -0.8, -0.15, 0.4),
+        (atm_var * 0.3, 0.2, -0.5, 0.0, 0.6),
+    ]
+
+    best_result = None
+    best_cost = float("inf")
+
+    for guess in initial_guesses:
+        try:
+            result = least_squares(
+                residuals, x0=guess,
+                bounds=(
+                    [0.0, 0.0001, -0.999, -1.0, 0.0001],   # lower
+                    [5.0, 5.0,     0.999,  1.0, 2.0],       # upper
+                ),
+                method="trf", max_nfev=500,
+            )
+            if result.cost < best_cost:
+                best_cost = result.cost
+                best_result = result
+        except Exception:
+            continue
+
+    if best_result is None:
+        return None
+
+    a, b, rho, m, sig = best_result.x
+    rmse = float(np.sqrt(np.mean(best_result.fun ** 2)))
+
+    if rmse > max_rmse:
+        return None
+
+    # Butterfly arbitrage check: b * (1 + |rho|) * sigma > 0 is always
+    # true given our bounds, but verify total variance is non-negative
+    # at the extreme calibration strikes.
+    for k in ks:
+        if svi_total_variance(k, a, b, rho, m, sig) < 0:
+            return None
+
+    return SVIParams(
+        a=float(a), b=float(b), rho=float(rho),
+        m=float(m), sigma=float(sig),
+        rmse=rmse, n_points=n,
+    )
+
+
+def _svi_quality_ok(result: SVIParams, min_strikes: int) -> Tuple[bool, str]:
+    """Sanity-check a fitted SVI result."""
+    if result.n_points < min_strikes:
+        return False, f"only {result.n_points} strikes (need ≥{min_strikes})"
+    if result.b <= 0:
+        return False, f"b {result.b:.4f} ≤ 0"
+    # SVI rho near ±1 is valid for steep skews (unlike SABR) — only
+    # reject if it's literally at the optimizer bound AND sigma is tiny,
+    # which indicates the fit is degenerate (a kink, not a curve).
+    if abs(result.rho) > 0.998 and result.sigma < 0.01:
+        return False, f"rho {result.rho:+.3f} at boundary with sigma={result.sigma:.4f} (degenerate)"
+    return True, "ok"
+
+
 class SABRSurface:
-    """SABR vol surface for Corsair v2.
+    """Vol surface for Corsair v2 — supports SABR or SVI backend.
 
     Serves two roles:
     1. Edge filter -- reject quotes where penny-jump price < min_edge over theo
@@ -258,24 +411,22 @@ class SABRSurface:
 
     def __init__(self, config):
         self.config = config
-        self.alpha = config.pricing.sabr_beta  # Will be overwritten by calibration
         self.beta = config.pricing.sabr_beta
-        self.rho = -0.2
-        self.nu = 0.4
         self.forward = 0.0
         self.last_calibration: Optional[datetime] = None
+        # vol_model: "sabr" (default, 3-param per side) or "svi" (5-param per side)
+        self._vol_model = str(getattr(config.pricing, "vol_model", "sabr")).lower()
+        # Per-side parameters. Separate fits let each side match its own skew.
+        self._side_params: dict = {
+            "C": {"alpha": 0.6, "rho": -0.2, "nu": 0.4, "params": None,
+                   "svi_params": None, "rmse_history": deque(maxlen=20)},
+            "P": {"alpha": 0.6, "rho": -0.2, "nu": 0.4, "params": None,
+                   "svi_params": None, "rmse_history": deque(maxlen=20)},
+        }
         self.params: Optional[SABRParams] = None
         self._front_month_expiry: Optional[str] = None
-        # Theo cache: {(strike, put_call): (theo, monotonic_time)}
-        # 100ms TTL — quote loop ticks faster than this so we hit warm cache often
         self._theo_cache: dict = {}
         self._theo_cache_ttl_sec: float = 0.1
-        # Rolling RMSE history for drift detection. We log a single RMSE
-        # number per calibration today, but a slow walk from 0.007 → 0.020
-        # → 0.028 sits comfortably under the 0.03 hard gate the whole time
-        # and we'd never get a warning. The deque + median check below
-        # turns the existing single-number log into a real drift detector.
-        self._rmse_history: Deque[float] = deque(maxlen=20)
 
     def set_expiry(self, expiry: str):
         """Set the front month expiry for TTE calculations."""
@@ -297,11 +448,12 @@ class SABRSurface:
         # separates them.
         max_cal_width = float(getattr(self.config.pricing, "max_calibration_bbo_width", 10.0))
 
-        # Replace the live futures mid with the parity-implied forward when
-        # we can derive one. The option market may be quoting against a
-        # slightly older futures price than our live tick reflects; using
-        # the implied forward keeps SABR consistent with the option BBOs
-        # rather than fighting them.
+        # Blend futures mid with parity-implied forward. Pure futures mid
+        # underprices near-ATM puts (~-$2.50); pure parity overprices OTM
+        # puts (~+$3). The 50/50 blend centers the residuals across both
+        # zones. The parity premium in crypto reflects call demand skew,
+        # not a real forward offset — splitting the difference acknowledges
+        # both signals without committing fully to either.
         implied = implied_forward_from_parity(
             options, ref_forward=forward, max_spread=max_cal_width,
         )
@@ -311,111 +463,155 @@ class SABRSurface:
                     "SABR forward: futures-mid=%.2f, parity-implied=%.2f (Δ=%+.2f)",
                     forward, implied, implied - forward,
                 )
-            forward = implied
+            forward = (forward + implied) / 2.0
         self.forward = forward
-        market_ivs = []
-        for key, option in options.items():
-            bid = getattr(option, "bid", 0) or 0
-            ask = getattr(option, "ask", 0) or 0
-            iv = getattr(option, "iv", 0) or 0
-            if bid > 0 and ask > 0 and iv > 0 and (ask - bid) <= max_cal_width:
-                market_ivs.append((option.strike, iv))
-
-        if len(market_ivs) < 3:
-            logger.warning("SABR calibration skipped: only %d valid quotes", len(market_ivs))
-            return
-
-        strikes = [s for s, _ in market_ivs]
-        ivs = [v for _, v in market_ivs]
 
         tte = self._get_tte()
         if tte <= 0:
             return
 
-        result = calibrate_sabr(
-            F=forward, T=tte, strikes=strikes, market_ivs=ivs,
-            beta=self.beta, max_rmse=self.config.pricing.sabr_max_rmse,
-        )
+        # Per-side calibration: fit calls and puts independently so each
+        # side gets its own alpha/rho/nu. A single 3-parameter fit across
+        # both sides forces SABR to compromise between two different skew
+        # shapes, producing systematic bias on OTM puts.
+        min_strikes = int(getattr(self.config.pricing, "sabr_min_strikes", 8))
+        max_rmse = self.config.pricing.sabr_max_rmse
+        use_svi = self._vol_model == "svi"
+        any_updated = False
 
-        if result is not None:
-            # Quality gate: reject the fit if any of the structural sanity
-            # checks fail. Cheaper to keep the previous (known-good)
-            # parameters than to use a degenerate fit that prices wrong.
-            min_strikes = int(getattr(self.config.pricing, "sabr_min_strikes", 8))
-            quality_ok, quality_reason = _sabr_quality_ok(result, min_strikes)
-            if not quality_ok:
-                # On rejection, surface the worst per-strike residual so
-                # the operator can see WHICH strike is poisoning the fit
-                # — a single deep-wing strike with a 5-vol residual is
-                # invisible from the aggregate RMSE alone.
-                worst_strike, worst_resid = _worst_strike_residual(
-                    result, forward, strikes, ivs, tte,
-                )
-                worst_str = (
-                    f" worst_strike={worst_strike:.0f} resid={worst_resid:.4f}"
-                    if worst_strike is not None else ""
-                )
-                logger.warning(
-                    "SABR fit rejected (%s): alpha=%.4f rho=%.3f nu=%.3f "
-                    "RMSE=%.4f n=%d%s — keeping previous parameters",
-                    quality_reason, result.alpha, result.rho, result.nu,
-                    result.rmse, result.n_points, worst_str,
-                )
-                return
+        for side in ("C", "P"):
+            cal_data = []  # (strike, iv, spread)
+            for key, option in options.items():
+                if option.put_call != side:
+                    continue
+                bid = getattr(option, "bid", 0) or 0
+                ask = getattr(option, "ask", 0) or 0
+                if bid > 0 and ask > 0 and (ask - bid) <= max_cal_width:
+                    mid = (bid + ask) / 2.0
+                    iv = PricingEngine.implied_vol(
+                        mid, forward, option.strike, tte, right=side,
+                    )
+                    if iv is not None and iv > 0:
+                        cal_data.append((option.strike, iv, ask - bid))
 
-            # Relative quality gate: only accept a new fit if its RMSE is
-            # not much worse than the prior fit. Without this, a fit with
-            # RMSE=0.029 (just under the 0.03 hard ceiling) would replace
-            # a fit with RMSE=0.007, and we'd silently start pricing on a
-            # 4× worse surface. The 1.5× headroom permits legitimate vol
-            # regime shifts but blocks slow degradation.
-            if (self.params is not None
-                    and result.rmse > max(self.params.rmse * 1.5, 0.005)):
-                logger.warning(
-                    "SABR fit rejected (rmse_regression %.4f > 1.5x prior %.4f): "
-                    "alpha=%.4f rho=%.3f nu=%.3f n=%d — keeping previous parameters",
-                    result.rmse, self.params.rmse,
-                    result.alpha, result.rho, result.nu, result.n_points,
+            min_pts = 5 if use_svi else 3
+            if len(cal_data) < min_pts:
+                continue
+
+            strikes = [s for s, _, _ in cal_data]
+            ivs = [v for _, v, _ in cal_data]
+            spreads = [w for _, _, w in cal_data]
+
+            # Spread-inverse weighting
+            min_spread = min(spreads)
+            weights = [min_spread / s for s in spreads]
+
+            sp = self._side_params[side]
+
+            if use_svi:
+                result = calibrate_svi(
+                    F=forward, T=tte, strikes=strikes, market_ivs=ivs,
+                    max_rmse=max_rmse, weights=weights,
                 )
-                return
-
-            self.alpha = result.alpha
-            self.rho = result.rho
-            self.nu = result.nu
-            self.params = result
-            self.last_calibration = datetime.now()
-            self._theo_cache.clear()  # parameters changed; flush stale theo
-
-            # Drift detection: track the last 20 accepted RMSEs and warn
-            # if the current sample is materially worse than the rolling
-            # median. Catches slow degradation (0.007 → 0.020 → 0.028)
-            # before it hits the absolute 0.03 ceiling.
-            self._rmse_history.append(result.rmse)
-            if len(self._rmse_history) >= 5:
-                median_rmse = float(np.median(self._rmse_history))
-                if (median_rmse > 0
-                        and result.rmse > max(median_rmse * 1.5, 0.005)):
+                if result is None:
+                    continue
+                quality_ok, quality_reason = _svi_quality_ok(result, min_strikes // 2)
+                if not quality_ok:
                     logger.warning(
-                        "SABR RMSE drift: current=%.4f vs rolling median=%.4f "
-                        "(%.1fx) — surface may be destabilizing",
-                        result.rmse, median_rmse, result.rmse / median_rmse,
+                        "SVI %s fit rejected (%s): a=%.4f b=%.3f rho=%.3f "
+                        "m=%.3f sig=%.3f RMSE=%.4f n=%d",
+                        side, quality_reason, result.a, result.b, result.rho,
+                        result.m, result.sigma, result.rmse, result.n_points,
+                    )
+                    continue
+                prior = sp["svi_params"]
+                if (prior is not None
+                        and result.rmse > max(prior.rmse * 1.5, 0.005)):
+                    logger.warning(
+                        "SVI %s fit rejected (rmse_regression %.4f > 1.5x prior %.4f)",
+                        side, result.rmse, prior.rmse,
+                    )
+                    continue
+                sp["svi_params"] = result
+                any_updated = True
+                logger.info(
+                    "SVI %s calibrated: a=%.4f b=%.4f rho=%.3f m=%.4f sig=%.4f RMSE=%.4f (n=%d)",
+                    side, result.a, result.b, result.rho, result.m, result.sigma,
+                    result.rmse, result.n_points,
+                )
+            else:
+                result = calibrate_sabr(
+                    F=forward, T=tte, strikes=strikes, market_ivs=ivs,
+                    beta=self.beta, max_rmse=max_rmse, weights=weights,
+                )
+                if result is None:
+                    continue
+                quality_ok, quality_reason = _sabr_quality_ok(result, min_strikes // 2)
+                if not quality_ok:
+                    worst_strike, worst_resid = _worst_strike_residual(
+                        result, forward, strikes, ivs, tte,
+                    )
+                    worst_str = (
+                        f" worst_strike={worst_strike:.0f} resid={worst_resid:.4f}"
+                        if worst_strike is not None else ""
+                    )
+                    logger.warning(
+                        "SABR %s fit rejected (%s): alpha=%.4f rho=%.3f nu=%.3f "
+                        "RMSE=%.4f n=%d%s",
+                        side, quality_reason, result.alpha, result.rho, result.nu,
+                        result.rmse, result.n_points, worst_str,
+                    )
+                    continue
+                prior = sp["params"]
+                if (prior is not None
+                        and result.rmse > max(prior.rmse * 1.5, 0.005)):
+                    logger.warning(
+                        "SABR %s fit rejected (rmse_regression %.4f > 1.5x prior %.4f)",
+                        side, result.rmse, prior.rmse,
+                    )
+                    continue
+                sp["alpha"] = result.alpha
+                sp["rho"] = result.rho
+                sp["nu"] = result.nu
+                sp["params"] = result
+                any_updated = True
+                logger.info(
+                    "SABR %s calibrated: alpha=%.4f rho=%.3f nu=%.3f RMSE=%.4f (n=%d)",
+                    side, result.alpha, result.rho, result.nu, result.rmse, result.n_points,
+                )
+
+            # Drift detection (shared across both models)
+            rmse_val = result.rmse
+            sp["rmse_history"].append(rmse_val)
+            if len(sp["rmse_history"]) >= 5:
+                median_rmse = float(np.median(sp["rmse_history"]))
+                if (median_rmse > 0
+                        and rmse_val > max(median_rmse * 1.5, 0.005)):
+                    logger.warning(
+                        "%s %s RMSE drift: current=%.4f vs median=%.4f",
+                        "SVI" if use_svi else "SABR",
+                        side, rmse_val, median_rmse,
                     )
 
-            logger.info(
-                "SABR calibrated: alpha=%.4f rho=%.3f nu=%.3f RMSE=%.4f (n=%d)",
-                result.alpha, result.rho, result.nu, result.rmse, result.n_points,
-            )
-        else:
-            logger.warning("SABR calibration failed, keeping previous parameters")
+        if any_updated:
+            self.last_calibration = datetime.now()
+            self._theo_cache.clear()
+            self.params = sp.get("svi_params") or sp.get("params")
 
-    def get_vol(self, strike: float) -> float:
-        """Return SABR-implied vol for a given strike."""
+    def get_vol(self, strike: float, put_call: str = "C") -> float:
+        """Return implied vol for a given strike using per-side params."""
         tte = self._get_tte()
         if tte <= 0:
             return 0.0
+        side = put_call.upper()
+        sp = self._side_params.get(side, self._side_params["C"])
+        if self._vol_model == "svi" and sp.get("svi_params") is not None:
+            p = sp["svi_params"]
+            return svi_implied_vol(self.forward, strike, tte,
+                                   p.a, p.b, p.rho, p.m, p.sigma)
         return sabr_implied_vol(
             self.forward, strike, tte,
-            self.alpha, self.beta, self.rho, self.nu,
+            sp["alpha"], self.beta, sp["rho"], sp["nu"],
         )
 
     def get_theo(self, strike: float, put_call: str = "C") -> float:
@@ -429,7 +625,7 @@ class SABRSurface:
         tte = self._get_tte()
         if tte <= 0:
             return 0.0
-        vol = self.get_vol(strike)
+        vol = self.get_vol(strike, put_call)
         theo = PricingEngine.black76_price(self.forward, strike, tte, vol, right=put_call)
         self._theo_cache[key] = (theo, now)
         return theo
@@ -443,7 +639,7 @@ class SABRSurface:
         if tte <= 0:
             return False
 
-        sabr_vol_val = self.get_vol(option.strike)
+        sabr_vol_val = self.get_vol(option.strike, getattr(option, "put_call", "C"))
 
         bid = getattr(option, "bid", 0) or 0
         ask = getattr(option, "ask", 0) or 0
@@ -465,3 +661,114 @@ class SABRSurface:
         if self._front_month_expiry is None:
             return 0.0
         return time_to_expiry_years(self._front_month_expiry)
+
+
+class MultiExpirySABR:
+    """Multi-expiry SABR wrapper.
+
+    Holds one ``SABRSurface`` per subscribed expiry and dispatches calls
+    to the right surface. Keeps the legacy single-expiry API (``params``,
+    ``forward``, ``last_calibration``, ``set_expiry``, ``get_theo``,
+    ``is_quote_stale``) working by delegating to the front-month surface
+    (first element of the expiry list).
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self._surfaces: dict = {}
+        self._expiries: List[str] = []
+
+    # ------------- expiry management -------------
+
+    def set_expiries(self, expiries: List[str]):
+        expiries = list(expiries or [])
+        self._expiries = expiries
+        # Add new
+        for exp in expiries:
+            if exp not in self._surfaces:
+                surf = SABRSurface(self.config)
+                surf.set_expiry(exp)
+                self._surfaces[exp] = surf
+            else:
+                self._surfaces[exp].set_expiry(exp)
+        # Drop retired
+        for exp in list(self._surfaces.keys()):
+            if exp not in expiries:
+                self._surfaces.pop(exp, None)
+
+    def set_expiry(self, expiry: str):
+        """Legacy single-expiry shim."""
+        self.set_expiries([expiry])
+
+    @property
+    def front_month(self) -> Optional[str]:
+        return self._expiries[0] if self._expiries else None
+
+    def _front_surface(self) -> Optional[SABRSurface]:
+        fm = self.front_month
+        if fm is None:
+            return None
+        return self._surfaces.get(fm)
+
+    # ------------- calibration -------------
+
+    def calibrate(self, forward: float, options: dict, expiry: str = None):
+        """Calibrate SABR. If expiry is None, calibrates all subscribed expiries."""
+        targets = [expiry] if expiry is not None else list(self._expiries)
+        for exp in targets:
+            surf = self._surfaces.get(exp)
+            if surf is None:
+                continue
+            # Filter options dict by this expiry
+            filtered = {k: v for k, v in options.items() if k[1] == exp}
+            if not filtered:
+                continue
+            surf.calibrate(forward, filtered)
+
+    # ------------- theo / vol lookups -------------
+
+    def get_theo(self, strike: float, put_call: str = "C", expiry: str = None) -> float:
+        exp = expiry if expiry is not None else self.front_month
+        if exp is None:
+            return 0.0
+        surf = self._surfaces.get(exp)
+        if surf is None or surf.last_calibration is None:
+            return 0.0
+        return surf.get_theo(strike, put_call)
+
+    def get_vol(self, strike: float, expiry: str = None, put_call: str = "C") -> float:
+        exp = expiry if expiry is not None else self.front_month
+        if exp is None:
+            return 0.0
+        surf = self._surfaces.get(exp)
+        if surf is None:
+            return 0.0
+        return surf.get_vol(strike, put_call)
+
+    def is_quote_stale(self, option, threshold_iv_diff: float = None, expiry: str = None) -> bool:
+        exp = expiry if expiry is not None else getattr(option, "expiry", None) or self.front_month
+        surf = self._surfaces.get(exp) if exp else None
+        if surf is None:
+            return False
+        return surf.is_quote_stale(option, threshold_iv_diff=threshold_iv_diff)
+
+    # ------------- back-compat accessors -------------
+
+    @property
+    def last_calibration(self):
+        surf = self._front_surface()
+        return surf.last_calibration if surf else None
+
+    def get_last_calibration(self, expiry: str):
+        surf = self._surfaces.get(expiry)
+        return surf.last_calibration if surf else None
+
+    @property
+    def params(self):
+        surf = self._front_surface()
+        return surf.params if surf else None
+
+    @property
+    def forward(self) -> float:
+        surf = self._front_surface()
+        return surf.forward if surf else 0.0

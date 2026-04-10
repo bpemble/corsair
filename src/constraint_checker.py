@@ -348,17 +348,87 @@ class ConstraintChecker:
                           quantity: int = 1) -> Tuple[bool, str]:
         """Check if a hypothetical fill passes all constraints.
 
-        Improving-fill exception: if currently breached, allow fills that
-        move state in the right direction.
+        Two operating modes:
+
+        1. Strict (default): each constraint (margin, delta, theta) is
+           checked independently. An improving-fill exception exists
+           per-constraint: if currently breached, allow fills that move
+           that specific constraint in the right direction.
+
+        2. Margin-escape (constraints.margin_escape_enabled + margin
+           currently breached): tier-1 margin takes priority over
+           tier-2 delta/theta. Any fill that strictly reduces post-fill
+           margin is allowed, even if it drags tier-2 constraints into
+           soft-breach territory, as long as no HARD kill limit is
+           crossed (delta_kill, theta_kill, margin_kill_pct,
+           long_premium). This exists to unwedge states where the
+           strict per-constraint rule locks us past the margin ceiling
+           with no permitted unwind path (observed 2026-04-09 after
+           an adverse-fill burst — closing a short reduced margin but
+           simultaneously tripped the theta floor, and the strict
+           check rejected the recovery trade).
         """
         fill_qty = quantity if side == "BUY" else -quantity
         multiplier = self.config.product.multiplier
         margin_ceiling, delta_ceiling, theta_floor = self._ceilings()
 
-        # ── Constraint 1: SPAN margin (combined) ────────────────────
+        # Compute post-fill state once up front (needed by both paths).
         margin_result = self.margin.check_fill_margin(option_quote, fill_qty)
         cur_margin = margin_result["current_margin"]
         post_margin = margin_result["post_fill_margin"]
+
+        cur_delta = self.portfolio.net_delta
+        post_delta = cur_delta + (option_quote.delta * fill_qty)
+
+        option_theta = option_quote.theta * multiplier
+        cur_theta = self.portfolio.net_theta
+        post_theta = cur_theta + (option_theta * fill_qty)
+
+        cur_long_premium = margin_result["current_long_premium"]
+        post_long_premium = margin_result["post_long_premium"]
+        capital = float(self.config.constraints.capital)
+
+        # ── Tier-1 margin priority escape ──────────────────────────
+        escape_enabled = bool(getattr(
+            self.config.constraints, "margin_escape_enabled", False))
+        if (escape_enabled
+                and cur_margin > margin_ceiling
+                and post_margin < cur_margin):
+            ks = getattr(self.config, "kill_switch", None)
+            delta_kill = float(getattr(ks, "delta_kill", 5.0) or 5.0) if ks else 5.0
+            theta_kill = float(getattr(ks, "theta_kill", -500) or -500) if ks else -500.0
+            margin_kill_pct = float(
+                getattr(ks, "margin_kill_pct", 0.70) or 0.70) if ks else 0.70
+            margin_kill = capital * margin_kill_pct
+
+            # Hard kills remain binding even in escape mode.
+            if post_margin > margin_kill:
+                return False, (
+                    f"margin_kill (${post_margin:,.0f} > ${margin_kill:,.0f}) "
+                    f"[escape]"
+                )
+            if abs(post_delta) > delta_kill:
+                return False, (
+                    f"delta_kill ({post_delta:+.2f} > ±{delta_kill}) [escape]"
+                )
+            if post_theta < theta_kill:
+                return False, (
+                    f"theta_kill (${post_theta:,.0f} < ${theta_kill:,.0f}) "
+                    f"[escape]"
+                )
+            # Long-premium capital check is a solvency constraint
+            # (cash outlay), not a risk metric — enforce it even in
+            # escape mode, with the same improving-fill exception.
+            if post_long_premium > capital:
+                if not (cur_long_premium > capital
+                        and post_long_premium <= cur_long_premium):
+                    return False, (
+                        f"long_premium (${post_long_premium:,.0f} > "
+                        f"${capital:,.0f}) [escape]"
+                    )
+            return True, "margin_escape"
+
+        # ── Constraint 1: SPAN margin (combined) ────────────────────
         if post_margin > margin_ceiling:
             if not (cur_margin > margin_ceiling and post_margin <= cur_margin):
                 return False, f"margin (${post_margin:,.0f} > ${margin_ceiling:,.0f})"
@@ -367,9 +437,6 @@ class ConstraintChecker:
         # SPAN risk margin doesn't fully capture the cash outlay for long
         # premium. Cap total long-premium outlay at the configured capital
         # so a runaway long path can't silently bleed cash.
-        cur_long_premium = margin_result["current_long_premium"]
-        post_long_premium = margin_result["post_long_premium"]
-        capital = float(self.config.constraints.capital)
         if post_long_premium > capital:
             if not (cur_long_premium > capital
                     and post_long_premium <= cur_long_premium):
@@ -378,16 +445,11 @@ class ConstraintChecker:
                 )
 
         # ── Constraint 2: Combined net delta ────────────────────────
-        cur_delta = self.portfolio.net_delta
-        post_delta = cur_delta + (option_quote.delta * fill_qty)
         if abs(post_delta) > delta_ceiling:
             if not (abs(cur_delta) > delta_ceiling and abs(post_delta) < abs(cur_delta)):
                 return False, f"delta ({post_delta:+.2f} > ±{delta_ceiling})"
 
         # ── Constraint 3: Combined net theta ────────────────────────
-        option_theta = option_quote.theta * multiplier
-        cur_theta = self.portfolio.net_theta
-        post_theta = cur_theta + (option_theta * fill_qty)
         if post_theta < theta_floor:
             if not (cur_theta < theta_floor and post_theta >= cur_theta):
                 return False, f"theta (${post_theta:,.0f} < ${theta_floor:,.0f})"

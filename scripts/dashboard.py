@@ -402,13 +402,34 @@ if snapshot is not None:
 
 st.markdown('<div class="section-header">Option Chain</div>', unsafe_allow_html=True)
 
+# Expiry selector (rendered outside the fragment so the selectbox survives
+# chain refreshes). Reads one snapshot to get the list; the fragment then
+# reads its own snapshot each tick and dispatches to the selected expiry.
+_sel_snap = load_snapshot() or {}
+_expiries = _sel_snap.get("expiries") or []
+_front = _sel_snap.get("front_month_expiry")
+if _expiries:
+    _default_idx = _expiries.index(_front) if _front in _expiries else 0
+    # Constrain the selectbox to ~1/6 page width so it sits as a compact
+    # control instead of stretching across the chain-table header.
+    _sel_col, _ = st.columns([1, 5])
+    with _sel_col:
+        _selected = st.selectbox(
+            "Expiry", options=_expiries, index=_default_idx,
+            key="selected_expiry",
+        )
+else:
+    _selected = _front
+    st.session_state["selected_expiry"] = _front
+
 @st.fragment(run_every=0.25)
 def render_chain():
     """Chain table render. Lives in a fragment so only this section
     re-renders on its own 4Hz cadence — matches the snapshot write rate
     so we catch every fresh state without re-rendering the whole page."""
     snapshot = load_snapshot()
-    chain_html = build_chain_html(snapshot)
+    sel = st.session_state.get("selected_expiry")
+    chain_html = build_chain_html(snapshot, selected_expiry=sel)
     if chain_html is not None:
         st.markdown(chain_html, unsafe_allow_html=True)
         # Streamlit strips <script> tags from st.markdown HTML for security, so

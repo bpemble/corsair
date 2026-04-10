@@ -112,14 +112,25 @@ class RiskMonitor:
             )
             return
 
-        # Margin warning (above ceiling but below kill)
+        # Margin warning (above ceiling but below kill).
+        #
+        # Previously this called cancel_all_quotes(), but that fights the
+        # constraint checker's improving-fill exception: the checker allows
+        # BUY orders that reduce margin, but the risk monitor immediately
+        # cancelled them. Result: zero active quotes when margin > ceiling,
+        # no path to unwind, system wedged.
+        #
+        # Now we just log. The constraint checker already blocks any order
+        # that would increase margin (SELL-to-open) and only permits orders
+        # that strictly reduce it (BUY-to-close). The kill switch at
+        # margin_kill_pct remains the hard stop.
         margin_ceiling = capital * self.config.constraints.margin_ceiling_pct
         if current_margin > margin_ceiling:
             logger.warning(
-                "MARGIN WARNING: $%.0f above ceiling $%.0f. Pulling all quotes.",
+                "MARGIN WARNING: $%.0f above ceiling $%.0f. "
+                "Constraint checker blocking margin-increasing orders.",
                 current_margin, margin_ceiling,
             )
-            self.quotes.cancel_all_quotes()
 
     def kill(self, reason: str, source: str = "risk"):
         """Emergency shutdown: cancel all quotes.

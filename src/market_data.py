@@ -67,7 +67,29 @@ class MarketState:
 
     atm_strike: float = 0.0
     front_month_expiry: str = ""
+    # Full list of subscribed expiries (YYYYMMDD, sorted front-first).
+    # front_month_expiry == expiries[0] whenever the list is populated.
+    # Kept as a separate scalar for backward compat with callers that
+    # haven't been updated for multi-expiry awareness.
+    expiries: List[str] = field(default_factory=list)
     strike_increment: float = 25.0  # Will be set from discovered chain
+    # Timestamp of the most recent successful discover_and_subscribe().
+    # The watchdog uses this to apply a short grace period on the
+    # tick-staleness check immediately after a reconnect — during the
+    # ETH options close window (CLAUDE.md §4) or after a full gateway
+    # volume wipe, the data feed can take 20-30s to start delivering
+    # ticks even though the subscriptions succeeded. None until the
+    # first discovery completes.
+    discovery_completed_at: Optional[datetime] = None
+    # Flips to True on the first tick (underlying or option) since the
+    # most recent discover_and_subscribe(). Reset to False whenever a
+    # new discovery starts. The watchdog uses this as a hard gate on
+    # the tick-staleness check: if we've NEVER seen a tick on this
+    # session, staleness is undefined — the initial last_update
+    # timestamp was just the construction time, not a real data event.
+    # Prevents false-positive reconnect storms on cold boots during
+    # quiet market windows.
+    first_tick_seen: bool = False
 
     def get_option(self, strike: float, expiry: str = None, right: str = "C") -> Optional[OptionQuote]:
         """Get option quote by strike. Uses front_month_expiry if expiry not specified."""
@@ -75,10 +97,18 @@ class MarketState:
             expiry = self.front_month_expiry
         return self.options.get((strike, expiry, right))
 
-    def get_all_strikes(self) -> List[float]:
-        """Return sorted list of all available strikes."""
+    def get_all_strikes(self, expiry: str = None) -> List[float]:
+        """Return sorted list of all available strikes.
+
+        If expiry is given, restrict to that expiry; otherwise return the
+        union across all subscribed expiries (multi-expiry plumbing: lets
+        the snapshot walker iterate per-expiry without leaking strikes
+        from unrelated chains).
+        """
         strikes = set()
-        for (strike, _, _) in self.options:
+        for (strike, exp, _) in self.options:
+            if expiry is not None and exp != expiry:
+                continue
             strikes.add(strike)
         return sorted(strikes)
 
@@ -108,8 +138,10 @@ class MarketDataManager:
         # find_incumbent as a fallback when the live top-of-book is just our
         # own resting order — prevents self-quote feedback loops. Keyed per
         # right because calls and puts at the same strike are different books.
-        self._last_clean_bid: Dict[Tuple[float, str], float] = {}
-        self._last_clean_ask: Dict[Tuple[float, str], float] = {}
+        # Keyed by (strike, expiry, right) so multi-expiry subscriptions
+        # don't cross-contaminate clean-BBO caches.
+        self._last_clean_bid: Dict[Tuple[float, str, str], float] = {}
+        self._last_clean_ask: Dict[Tuple[float, str, str], float] = {}
         # Event-driven tick queue. Created lazily in discover_and_subscribe()
         # so it binds to the running asyncio loop. Items are tuples of
         #   ("option", OptionKey)  or  ("underlying", None)
@@ -122,6 +154,13 @@ class MarketDataManager:
         # Create the tick queue on the running event loop
         if self.tick_queue is None:
             self.tick_queue = asyncio.Queue(maxsize=5000)
+
+        # Re-arm the first-tick gate so the watchdog's stale-tick check
+        # stays dormant until a real tick lands on the new session. The
+        # previous session's gate state doesn't apply after a reconnect
+        # because ib.reqMktData is reissued from scratch below.
+        self.state.first_tick_seen = False
+        self.state.discovery_completed_at = None
 
         # Step 1: Find and subscribe to the underlying futures contract
         await self._subscribe_underlying()
@@ -140,6 +179,7 @@ class MarketDataManager:
         # Step 4: Subscribe to option quotes
         await self._subscribe_options()
 
+        self.state.discovery_completed_at = datetime.now()
         logger.info(
             "Market data ready: underlying=%s, %d options subscribed, front_month=%s",
             self.state.underlying_price, len(self._option_tickers),
@@ -194,6 +234,7 @@ class MarketDataManager:
 
     def _on_underlying_tick(self, ticker: Ticker):
         """Process underlying futures price update."""
+        self.state.first_tick_seen = True
         if ticker.bid and ticker.bid > 0:
             self.state.underlying_bid = ticker.bid
         if ticker.ask and ticker.ask > 0:
@@ -244,43 +285,103 @@ class MarketDataManager:
             logger.error("Cannot discover chain: no underlying contract")
             return
 
-        params_list = await self.ib.reqSecDefOptParamsAsync(
-            underlyingSymbol=self._underlying_contract.symbol,
-            futFopExchange=p.exchange,
-            underlyingSecType="FUT",
-            underlyingConId=self._underlying_contract.conId,
-        )
+        # For futures options, reqSecDefOptParams keyed by a single futures
+        # conId only returns option expiries tied to THAT future. To span
+        # multiple option expiries, we must query the option chain directly
+        # via reqContractDetailsAsync on a symbol-only FuturesOption stub,
+        # then group by expiry. This gives us the full multi-month chain
+        # in one shot.
+        n_subscribe_probe = int(getattr(self.config.product, "subscribed_expiries", 1))
+        n_subscribe_probe = max(1, n_subscribe_probe)
 
-        if not params_list:
-            logger.error("No option chain parameters returned for %s", p.symbol)
-            return
+        if n_subscribe_probe > 1:
+            probe = FuturesOption(
+                symbol=p.option_symbol,
+                exchange=p.exchange,
+                currency=p.currency,
+                tradingClass=p.trading_class,
+            )
+            all_details = await self.ib.reqContractDetailsAsync(probe)
+            if not all_details:
+                logger.error("No FuturesOption contract details for %s", p.option_symbol)
+                return
+            # Aggregate strikes + expiries across all returned contracts.
+            # Also build a per-expiry strike set so we only build contracts
+            # for (expiry, strike) tuples that actually exist — strike grids
+            # are narrower for back-month expiries, so a naive cross-product
+            # gets Error 200 "no security definition" for phantom strikes.
+            expirations = set()
+            strikes_set = set()
+            per_expiry_strikes: Dict[str, set] = {}
+            for d in all_details:
+                c = d.contract
+                exp_val = c.lastTradeDateOrContractMonth
+                k_val = float(c.strike) if (c.strike and c.strike > 0) else None
+                if exp_val:
+                    expirations.add(exp_val)
+                if k_val is not None:
+                    strikes_set.add(k_val)
+                if exp_val and k_val is not None:
+                    per_expiry_strikes.setdefault(exp_val, set()).add(k_val)
+            self._per_expiry_strikes = per_expiry_strikes
 
-        # Find the right param set (matching exchange)
-        params = None
-        for param in params_list:
-            if param.exchange == p.exchange:
-                params = param
-                break
+            class _Params:
+                pass
+            params = _Params()
+            params.expirations = expirations
+            params.strikes = strikes_set
+            params.exchange = p.exchange
+        else:
+            params_list = await self.ib.reqSecDefOptParamsAsync(
+                underlyingSymbol=self._underlying_contract.symbol,
+                futFopExchange=p.exchange,
+                underlyingSecType="FUT",
+                underlyingConId=self._underlying_contract.conId,
+            )
 
-        if params is None:
-            params = params_list[0]
-            logger.warning("No exact exchange match, using %s", params.exchange)
+            if not params_list:
+                logger.error("No option chain parameters returned for %s", p.symbol)
+                return
 
-        # Determine front month expiry
+            # Find the right param set (matching exchange)
+            params = None
+            for param in params_list:
+                if param.exchange == p.exchange:
+                    params = param
+                    break
+
+            if params is None:
+                params = params_list[0]
+                logger.warning("No exact exchange match, using %s", params.exchange)
+
+        # Determine the list of expiries we'll subscribe to: the first
+        # `subscribed_expiries` consecutive future expiries with DTE past
+        # the min_dte cutoff. One = legacy front-month-only behavior; N>1
+        # fans out the chain + SABR + snapshot across multiple months.
+        # Quoting is gated separately via quoting.enabled_expiries.
         sorted_expiries = sorted(params.expirations)
-        now_str = datetime.now().strftime("%Y%m%d")
-        front_month = None
+        n_subscribe = int(getattr(self.config.product, "subscribed_expiries", 1))
+        n_subscribe = max(1, n_subscribe)
+        chosen: List[str] = []
         for exp in sorted_expiries:
-            dte = days_to_expiry(exp)
-            if dte > self.config.product.min_dte:
-                front_month = exp
+            if days_to_expiry(exp) <= self.config.product.min_dte:
+                continue
+            chosen.append(exp)
+            if len(chosen) >= n_subscribe:
                 break
 
-        if front_month is None:
+        if not chosen:
             logger.error("No valid expiry found with DTE > %d", self.config.product.min_dte)
             return
 
+        self.state.expiries = chosen
+        front_month = chosen[0]
         self.state.front_month_expiry = front_month
+        if len(chosen) > 1:
+            logger.info(
+                "Multi-expiry subscription: %d expiries %s",
+                len(chosen), ", ".join(chosen),
+            )
 
         # Determine strike increment from available strikes
         sorted_strikes = sorted(params.strikes)
@@ -306,12 +407,17 @@ class MarketDataManager:
             high_bound = relevant_strikes[-1] if relevant_strikes else 0
 
         logger.info(
-            "Option chain: expiry=%s, %d strikes in range [%.0f, %.0f], increment=%.0f, ATM=%.0f",
-            front_month, len(relevant_strikes), low_bound, high_bound, inc,
-            self.state.atm_strike,
+            "Option chain: %d expiries %s, %d strikes in range [%.0f, %.0f], "
+            "increment=%.0f, ATM=%.0f",
+            len(chosen), chosen, len(relevant_strikes), low_bound, high_bound,
+            inc, self.state.atm_strike,
         )
 
-        # Build option contracts
+        # Build option contracts — fan out across every subscribed expiry
+        # at the same strike/right grid. Contract count scales linearly
+        # with len(chosen); at 3 expiries × ~50 strikes × 2 rights that's
+        # ~300 market data lines vs ~100 single-expiry. Log line count at
+        # subscription time so we can see how close we are to the IBKR cap.
         option_types = []
         opt_type = self.config.product.option_type
         if opt_type in ("calls_only", "both"):
@@ -319,26 +425,41 @@ class MarketDataManager:
         if opt_type in ("puts_only", "both"):
             option_types.append("P")
 
-        for strike in relevant_strikes:
-            for right in option_types:
-                contract = FuturesOption(
-                    symbol=p.option_symbol,
-                    lastTradeDateOrContractMonth=front_month,
-                    strike=strike,
-                    right=right,
-                    exchange=p.exchange,
-                    currency=p.currency,
-                    tradingClass=p.trading_class,
-                )
-                key = (strike, front_month, right)
-                self._option_contracts[key] = contract
+        per_exp = getattr(self, "_per_expiry_strikes", None)
+        for exp in chosen:
+            # If we have a per-expiry strike map from the probe (multi-expiry
+            # path), intersect so we don't request strikes that don't exist
+            # for this expiry.
+            if per_exp is not None:
+                exp_strikes_set = per_exp.get(exp, set())
+                exp_strikes = [s for s in relevant_strikes if s in exp_strikes_set]
+            else:
+                exp_strikes = relevant_strikes
+            for strike in exp_strikes:
+                for right in option_types:
+                    contract = FuturesOption(
+                        symbol=p.option_symbol,
+                        lastTradeDateOrContractMonth=exp,
+                        strike=strike,
+                        right=right,
+                        exchange=p.exchange,
+                        currency=p.currency,
+                        tradingClass=p.trading_class,
+                    )
+                    key = (strike, exp, right)
+                    self._option_contracts[key] = contract
 
-        # Qualify all option contracts
+        # Qualify all option contracts (single bulk async call across
+        # expiries — IBKR's qualify path is rate-limited internally but
+        # handles hundreds of contracts in one batch fine).
         contracts_to_qualify = list(self._option_contracts.values())
         if contracts_to_qualify:
             qualified = await self.ib.qualifyContractsAsync(*contracts_to_qualify)
             qualified_count = sum(1 for c in qualified if c.conId > 0)
-            logger.info("Qualified %d/%d option contracts", qualified_count, len(contracts_to_qualify))
+            logger.info(
+                "Qualified %d/%d option contracts across %d expiries",
+                qualified_count, len(contracts_to_qualify), len(chosen),
+            )
 
     async def _subscribe_options(self):
         """Subscribe to market data for all discovered option contracts."""
@@ -362,7 +483,15 @@ class MarketDataManager:
             # Set up callback
             ticker.updateEvent += lambda t, k=key: self._on_option_tick(t, k)
 
-        logger.info("Subscribed to %d option contracts", len(self._option_tickers))
+        # Total streaming lines = 1 (underlying) + len(option_tickers).
+        # IBKR paper default cap is ~100 lines; surface the count so
+        # operators can see headroom after a multi-expiry ramp-up.
+        total_lines = len(self._option_tickers) + (1 if self._underlying_ticker else 0)
+        logger.info(
+            "Subscribed to %d option contracts across %d expiries "
+            "(total market data lines: %d)",
+            len(self._option_tickers), len(self.state.expiries), total_lines,
+        )
 
     async def ensure_position_subscribed(self, positions) -> int:
         """Force-subscribe market data for any held position whose option
@@ -480,6 +609,7 @@ class MarketDataManager:
         if quote is None:
             return
 
+        self.state.first_tick_seen = True
         quote.tick_received_ns = time.monotonic_ns()
         prev_bid, prev_ask = quote.bid, quote.ask
         if ticker.bid is not None and ticker.bid > 0:
@@ -569,8 +699,8 @@ class MarketDataManager:
                 our_bid_live = our_ask_live = False
                 if self.quotes is not None:
                     active = self.quotes.get_active_quotes()
-                    bid_info = active.get((quote.strike, quote.put_call, "BUY"))
-                    ask_info = active.get((quote.strike, quote.put_call, "SELL"))
+                    bid_info = active.get((quote.strike, quote.expiry, quote.put_call, "BUY"))
+                    ask_info = active.get((quote.strike, quote.expiry, quote.put_call, "SELL"))
                     if bid_info:
                         our_bid = bid_info["price"]
                         our_bid_live = (bid_info["status"] == "Submitted")
@@ -582,7 +712,8 @@ class MarketDataManager:
                 theo = None
                 if self.quotes is not None and self.quotes.sabr.last_calibration is not None:
                     try:
-                        theo = self.quotes.sabr.get_theo(quote.strike, quote.put_call)
+                        theo = self.quotes.sabr.get_theo(
+                            quote.strike, quote.put_call, expiry=quote.expiry)
                     except Exception:
                         theo = None
 
@@ -654,15 +785,22 @@ class MarketDataManager:
 
     def find_incumbent(self, strike: float, side: str,
                        our_prices: Optional[set] = None,
-                       right: str = "C"):
+                       right: str = "C",
+                       expiry: Optional[str] = None):
         """Scan the depth book for the first 'meaningful' incumbent level.
 
         Returns dict with keys:
             price, level (1-based), size, age_ms, bbo_width, skip_reason
 
         skip_reason is non-empty when no quote should be placed this cycle.
+
+        Multi-expiry: expiry defaults to the front month when None, matching
+        legacy single-expiry behavior. Clean-BBO cache is keyed per expiry
+        so different expiries don't fight each other at the same strike.
         """
-        opt = self.state.get_option(strike, right=right)
+        if expiry is None:
+            expiry = self.state.front_month_expiry
+        opt = self.state.get_option(strike, expiry=expiry, right=right)
         if opt is None:
             return {"price": None, "level": None, "size": None,
                     "age_ms": None, "bbo_width": None, "skip_reason": "no_option"}
@@ -702,7 +840,7 @@ class MarketDataManager:
             # penny-jump ourselves into oblivion.
             tob_bid = opt.bid
             tob_ask = opt.ask
-            cache_key = (strike, right)
+            cache_key = (strike, expiry, right)
             if tob_bid > 0 and is_self(tob_bid):
                 tob_bid = self._last_clean_bid.get(cache_key, 0.0)
             if tob_ask > 0 and is_self(tob_ask):
@@ -715,13 +853,41 @@ class MarketDataManager:
                 return {"price": None, "level": None, "size": None,
                         "age_ms": age_ms, "bbo_width": None, "skip_reason": "stale"}
 
-        # Cache the most recent clean (non-self) top-of-book prices so we
-        # can fall back to them next cycle if our order becomes the BBO.
-        cache_key = (strike, right)
-        if opt.bid > 0 and not is_self(opt.bid):
-            self._last_clean_bid[cache_key] = opt.bid
-        if opt.ask > 0 and not is_self(opt.ask):
-            self._last_clean_ask[cache_key] = opt.ask
+        # Cache the best non-self price for THIS SIDE ONLY so get_clean_bbo
+        # can show the dashboard what we're competing against. Only update the
+        # side we're querying — is_self is built from our_prices for the
+        # requested side, so it can't correctly identify our orders on the
+        # opposite side. Without this guard, the SELL call would re-cache our
+        # own bid as "clean" because is_self only knows about our ask prices.
+        cache_key = (strike, expiry, right)
+        if side == "BUY":
+            if depth_fresh:
+                clean_bid = 0.0
+                for px, sz in bids:
+                    if not is_self(px) and px > 0:
+                        clean_bid = px
+                        break
+                if clean_bid > 0:
+                    self._last_clean_bid[cache_key] = clean_bid
+                else:
+                    self._last_clean_bid.pop(cache_key, None)
+            else:
+                if opt.bid > 0 and not is_self(opt.bid):
+                    self._last_clean_bid[cache_key] = opt.bid
+        else:  # SELL
+            if depth_fresh:
+                clean_ask = 0.0
+                for px, sz in asks:
+                    if not is_self(px) and px > 0:
+                        clean_ask = px
+                        break
+                if clean_ask > 0:
+                    self._last_clean_ask[cache_key] = clean_ask
+                else:
+                    self._last_clean_ask.pop(cache_key, None)
+            else:
+                if opt.ask > 0 and not is_self(opt.ask):
+                    self._last_clean_ask[cache_key] = opt.ask
 
         best_bid = bids[0][0] if bids else 0.0
         best_ask = asks[0][0] if asks else 0.0
@@ -764,27 +930,45 @@ class MarketDataManager:
         return {"price": None, "level": None, "size": None,
                 "age_ms": age_ms, "bbo_width": bbo_width, "skip_reason": "self_only"}
 
-    def get_clean_bbo(self, strike: float, right: str) -> Tuple[float, float]:
+    def get_clean_bbo(self, strike: float, right: str,
+                      expiry: Optional[str] = None) -> Tuple[float, float]:
         """Return the L1 BBO with our own resting orders subtracted out.
         Used by the snapshot writer so the dashboard's 'market' columns
         show the book we're competing against, not our own quotes.
 
         Falls back to raw L1 when the clean cache is empty (first cycle
-        before find_incumbent has populated it)."""
-        opt = self.state.get_option(strike, right=right)
+        before find_incumbent has populated it). Expiry defaults to the
+        front month for backward compat.
+        """
+        if expiry is None:
+            expiry = self.state.front_month_expiry
+        opt = self.state.get_option(strike, expiry=expiry, right=right)
         if opt is None:
             return (0.0, 0.0)
-        key = (strike, right)
-        bid = self._last_clean_bid.get(key, opt.bid) if opt.bid > 0 else 0.0
-        ask = self._last_clean_ask.get(key, opt.ask) if opt.ask > 0 else 0.0
+        key = (strike, expiry, right)
+        # Use the clean (non-self) cache populated by find_incumbent.
+        # The old code fell back to raw L1 (opt.bid/opt.ask) when the
+        # cache was empty, but that returns our OWN order when we're the
+        # best bid/ask — making the dashboard think we're matching the
+        # market when we're actually ahead. Return 0 if no clean price
+        # is cached; the dashboard shows "-" which is correct (no
+        # visible non-self market on that side).
+        bid = self._last_clean_bid.get(key, 0.0)
+        ask = self._last_clean_ask.get(key, 0.0)
         return (bid, ask)
 
-    def get_quotable_strikes(self) -> List[Tuple[float, str]]:
+    def get_quotable_strikes(self, expiry: str = None) -> List[Tuple[float, str]]:
         """Return list of (strike, right) pairs eligible for quoting.
 
         Each option type (calls, puts) has its own quoting range and on/off
         toggle. Calls range comes from product.quote_range_*; puts range
         comes from puts.quote_range_* and is gated by puts.enabled.
+
+        Multi-expiry note: takes an optional `expiry` arg to restrict the
+        underlying option lookups to a specific chain. Defaults to the
+        front month (back-compat — matches legacy single-expiry callers).
+        Caller is responsible for iterating expiries if quoting more than
+        one at a time.
         """
         config = self.config
         state = self.state
@@ -794,8 +978,11 @@ class MarketDataManager:
         if inc <= 0 or state.atm_strike <= 0:
             return quotable
 
+        if expiry is None:
+            expiry = state.front_month_expiry
+
         tick = config.quoting.tick_size
-        all_strikes = state.get_all_strikes()
+        all_strikes = state.get_all_strikes(expiry=expiry)
 
         # Build list of (right, low, high) windows to evaluate.
         windows: List[Tuple[str, float, float]] = []
@@ -816,7 +1003,7 @@ class MarketDataManager:
             for strike in all_strikes:
                 if strike < low or strike > high:
                     continue
-                option = state.get_option(strike, right=right)
+                option = state.get_option(strike, expiry=expiry, right=right)
                 if option is None:
                     continue
                 dte = days_to_expiry(option.expiry)

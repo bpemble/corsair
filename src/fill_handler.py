@@ -93,8 +93,17 @@ class FillHandler:
         spread_captured_theo = 0.0
         spread_captured_mid = 0.0
         if trade is not None:
+            # Multi-expiry fix: both get_theo and get_clean_bbo default to
+            # the front month when expiry isn't passed. Without threading
+            # the fill's expiry through, a back-month fill gets compared
+            # against front-month theo/mid — wildly different strikes' same
+            # K/R, wildly different TTE — producing nonsense edge values.
+            # Observed 2026-04-09: a back-month C2600 sell at $89.50 was
+            # compared against front-month C2600 theo (~$0.50 because
+            # deep OTM 15 DTE), booking a fake +$4,450 spread capture and
+            # polluting the running total for the session.
             try:
-                theo = self.quotes.sabr.get_theo(strike, put_call)
+                theo = self.quotes.sabr.get_theo(strike, put_call, expiry=expiry)
                 if theo and theo > 0:
                     edge_theo = (theo - fill_price) * sign
                     spread_captured_theo = edge_theo * mult * abs(quantity)
@@ -102,7 +111,8 @@ class FillHandler:
                 pass
 
             try:
-                bid, ask = self.market_data.get_clean_bbo(strike, put_call)
+                bid, ask = self.market_data.get_clean_bbo(
+                    strike, put_call, expiry=expiry)
                 if bid > 0 and ask > 0 and ask > bid:
                     mid = (bid + ask) / 2.0
                     edge_mid = (mid - fill_price) * sign

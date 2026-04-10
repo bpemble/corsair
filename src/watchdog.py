@@ -44,6 +44,16 @@ WATCHDOG_FAST_CANCEL_STALE_SEC = 5.0
 # enough to ride out a quiet ETH options market without false-positive
 # cancels (verified against the freshest_signal_age min() semantics).
 WATCHDOG_STALE_THRESHOLD_SEC = 12.0
+# Post-discovery grace period. After a successful discover_and_subscribe()
+# the data feed can take 20-30s to start delivering ticks — especially
+# during the ETH options daily close window (CLAUDE.md §4, 16:00-17:00 CT)
+# or immediately after a gateway volume wipe. Skipping the stale-tick
+# check during the grace window prevents a false-positive reconnect storm
+# where each warm-up cycle fires the watchdog before the first tick lands.
+# Set generously because the real disconnect paths (connection drop,
+# exception storm) have independent detection that does NOT wait for
+# this grace window — this only affects the passive freshness check.
+WATCHDOG_POST_DISCOVERY_GRACE_SEC = 30.0
 WATCHDOG_FAILURES_BEFORE_ACTION = 2
 WATCHDOG_BACKOFF_SEC = (5, 10, 30, 60, 60)  # last value repeats
 # Quote-loop exception storm: if QuoteManager.consecutive_quote_errors
@@ -54,7 +64,15 @@ WATCHDOG_BACKOFF_SEC = (5, 10, 30, 60, 60)  # last value repeats
 WATCHDOG_QUOTE_ERROR_STORM_THRESHOLD = 10
 # Hard timeout on discover_and_subscribe. IB Gateway can complete connect()
 # but then hang inside reqSecDefOptParams/reqContractDetails indefinitely.
-DISCOVERY_TIMEOUT_SEC = 30.0
+# Bumped from 30s → 75s on 2026-04-09 to accommodate the multi-expiry
+# discovery path: `reqContractDetails(FuturesOption stub)` scans IBKR's
+# entire contract database for the symbol and empirically takes ~28-30s
+# on the ETH futures option chain — with only 1-2 seconds of margin
+# against the old 30s ceiling we were hitting boundary-kill timeouts on
+# every cold boot. 75s gives real headroom without masking a genuine
+# gateway hang (the gateway-process hang we're guarding against here is
+# observationally 60+ seconds deep, so a 75s cap still catches it).
+DISCOVERY_TIMEOUT_SEC = 75.0
 STARTUP_RETRY_BACKOFF_SEC = (5, 10, 30, 60, 60)
 # After this many consecutive failed in-engine recoveries (connect or
 # discovery), escalate to a docker-level container restart of the gateway.
@@ -257,13 +275,36 @@ def _check_health(ib, market_data, quotes=None) -> tuple:
         ))
     freshest_signal_age = min(ages) if ages else 0.0
 
-    if freshest_signal_age >= WATCHDOG_STALE_THRESHOLD_SEC:
+    # Tick-staleness gate — skip the check if either of these holds:
+    #   (a) We've never seen a tick on this session (first_tick_seen False).
+    #       The initial last_update timestamps are just construction time,
+    #       not real market events — measuring "staleness" against them
+    #       produces false positives on cold boots during quiet windows
+    #       (especially the ETH options 16:00-17:00 CT close window, when
+    #       even the underlying futures can go 30+s between ticks on
+    #       paper).
+    #   (b) We're still within the post-discovery grace window, as a
+    #       belt-and-suspenders against a first tick landing early and
+    #       then the feed briefly hiccuping during warm-up.
+    # The disconnect + exception-storm branches below run unconditionally
+    # so a real gateway hang still triggers recovery.
+    in_grace = False
+    if not getattr(state, "first_tick_seen", False):
+        in_grace = True
+    elif state.discovery_completed_at is not None:
+        since_discovery = (now - state.discovery_completed_at).total_seconds()
+        if since_discovery < WATCHDOG_POST_DISCOVERY_GRACE_SEC:
+            in_grace = True
+
+    if (not in_grace) and freshest_signal_age >= WATCHDOG_STALE_THRESHOLD_SEC:
         reasons.append(f"no fresh ticks ({freshest_signal_age:.0f}s)")
 
     # Fast-cancel tier: feed stale but not yet at reconnect threshold.
     # Only meaningful while still connected — a real disconnect already
-    # routes through the reconnect path below.
+    # routes through the reconnect path below. Also skipped during the
+    # post-discovery grace window (same rationale as the stale-tick check).
     if (ib.isConnected()
+            and not in_grace
             and freshest_signal_age >= WATCHDOG_FAST_CANCEL_STALE_SEC
             and not reasons):
         fast_cancel = True
@@ -296,6 +337,16 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                 if consecutive_failures > 0:
                     logger.info("WATCHDOG: health restored after %d failed cycles",
                                 consecutive_failures)
+                # Auto-clear disconnect kill when connectivity restores via
+                # Error 1102 (soft-restore). Without this, the kill persists
+                # indefinitely because clear_disconnect_kill() only lived in
+                # the watchdog's own reconnect path — which is never entered
+                # when the health check passes.
+                if risk.killed and risk.kill_source == "disconnect":
+                    if risk.clear_disconnect_kill():
+                        logger.info(
+                            "WATCHDOG: auto-cleared disconnect kill "
+                            "(connectivity restored externally)")
                 consecutive_failures = 0
                 consecutive_recovery_failures = 0
                 backoff_idx = 0
@@ -357,10 +408,11 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                         pass
                 else:
                     await asyncio.sleep(3)  # let initial ticks settle
-                    seeded = portfolio.seed_from_ibkr(ib, account_id)
+                    seeded = portfolio.seed_from_ibkr(
+                        ib, account_id, market_state=market_data.state)
                     logger.info("WATCHDOG: reseeded %d position(s) after reconnect", seeded)
                     margin.invalidate_portfolio()
-                    sabr.set_expiry(market_data.state.front_month_expiry)
+                    sabr.set_expiries(market_data.state.expiries)
                     try:
                         await market_data.ensure_position_subscribed(portfolio.positions)
                     except Exception as e:
@@ -442,13 +494,14 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                     try:
                         if await conn.connect() and await safe_discover_and_subscribe(market_data):
                             await asyncio.sleep(3)
-                            seeded = portfolio.seed_from_ibkr(ib, account_id)
+                            seeded = portfolio.seed_from_ibkr(
+                                ib, account_id, market_state=market_data.state)
                             logger.info(
                                 "WATCHDOG: post-escalation reseed: %d position(s)",
                                 seeded,
                             )
                             margin.invalidate_portfolio()
-                            sabr.set_expiry(market_data.state.front_month_expiry)
+                            sabr.set_expiries(market_data.state.expiries)
                             try:
                                 await market_data.ensure_position_subscribed(portfolio.positions)
                             except Exception as e:

@@ -102,7 +102,7 @@ class PortfolioState:
     def gross_for(self, right: str) -> int:
         return sum(abs(p.quantity) for p in self.positions if p.put_call == right)
 
-    def seed_from_ibkr(self, ib, account_id: str) -> int:
+    def seed_from_ibkr(self, ib, account_id: str, market_state=None) -> int:
         """Sync existing ETHUSDRR option positions from IBKR.
 
         Idempotent: clears the local position list first so multiple calls
@@ -110,6 +110,16 @@ class PortfolioState:
         accumulate duplicates. Filters strictly to symbol='ETHUSDRR' and
         secType='FOP' — ignores everything else (futures, other products,
         equities). Returns the number of positions seeded.
+
+        If `market_state` is provided, immediately calls refresh_greeks()
+        on the freshly-seeded positions. Without this, the new Position
+        objects carry default delta=theta=vega=0 until the next periodic
+        risk.check() (5 minutes later), which made the dashboard read all
+        zeros for greeks during the gap — observed 2026-04-09 after a
+        watchdog reconnect-reseed cycle. Callers that don't have a
+        market_state handle (e.g., very early startup before market data
+        is ready) can omit the arg and accept the stale-until-next-check
+        behavior.
         """
         self.positions.clear()
         seeded = 0
@@ -131,6 +141,11 @@ class PortfolioState:
                 fill_time=datetime.now(),
             ))
             seeded += 1
+        if market_state is not None and seeded > 0:
+            try:
+                self.refresh_greeks(market_state)
+            except Exception:
+                logger.exception("seed_from_ibkr: refresh_greeks failed")
         return seeded
 
     def add_fill(self, strike: float, expiry: str, put_call: str,

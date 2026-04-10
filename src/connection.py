@@ -102,6 +102,36 @@ class IBKRConnection:
             if client_id == 0:
                 ib.reqAutoOpenOrders(True)
 
+            # FA orphan fix: ib_insync's wrapper.orderKey returns
+            # (clientId, orderId) for API orders. placeOrder stores the
+            # Trade under (localClientId, orderId), but openOrder /
+            # orderStatus callbacks arrive with the FA-rewritten clientId
+            # (often -1 from reqAutoOpenOrders adoption). The lookup
+            # misses, ib_insync creates a SECOND Trade for the same
+            # orderId, and the original stays at PendingSubmit forever
+            # (CLAUDE.md §2). This is the root cause of every orphan
+            # Trade issue on FA accounts.
+            #
+            # Fix: patch orderKey to fall back to an orderId-only scan
+            # of wrapper.trades when the (clientId, orderId) key misses.
+            # If we find exactly one existing Trade with that orderId,
+            # return its key so the callback updates it in place instead
+            # of creating a duplicate.
+            _orig_orderKey = ib.wrapper.orderKey
+
+            def _fa_orderKey(clientId_cb, orderId_cb, permId_cb):
+                key = _orig_orderKey(clientId_cb, orderId_cb, permId_cb)
+                if key not in ib.wrapper.trades and orderId_cb > 0:
+                    # orderId-only fallback: find an existing Trade whose
+                    # orderId matches, regardless of clientId.
+                    for existing_key, t in ib.wrapper.trades.items():
+                        if (isinstance(existing_key, tuple)
+                                and t.order.orderId == orderId_cb):
+                            return existing_key
+                return key
+
+            ib.wrapper.orderKey = _fa_orderKey
+
             # 2-4. Minimal initializing requests, run concurrently. Each gets
             #      its own timeout so a single slow one doesn't block the rest.
             reqs = {

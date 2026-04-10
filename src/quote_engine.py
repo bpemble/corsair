@@ -81,8 +81,64 @@ class TokenBucket:
     def tokens(self) -> float:
         return self._tokens
 
-OrderKey = Tuple[float, str, str]  # (strike, right, side)
+OrderKey = Tuple[float, str, str, str]  # (strike, expiry, right, side)
 ORDER_REF_PREFIX = "corsair2"
+
+
+def resolve_enabled_expiries(tokens, subscribed: list) -> list:
+    """Resolve config.quoting.enabled_expiries tokens to concrete YYYYMMDD
+    strings using the live subscribed expiry list (front-first, sorted).
+
+    Accepted token formats:
+      - "front"       → subscribed[0]
+      - "front+N"     → subscribed[N] (if present)
+      - "back1"..     → subscribed[1]
+      - explicit "YYYYMMDD" → passed through if present in subscribed
+
+    Tokens that don't resolve are logged and skipped. Returns the resolved
+    list in the order given. Deduped preserving order.
+    """
+    if not subscribed:
+        return []
+    out: list = []
+    seen: set = set()
+    for tok in tokens or []:
+        resolved = None
+        t = str(tok).strip().lower()
+        if t == "front":
+            resolved = subscribed[0]
+        elif t.startswith("front+"):
+            try:
+                idx = int(t.split("+", 1)[1])
+                if 0 <= idx < len(subscribed):
+                    resolved = subscribed[idx]
+            except ValueError:
+                pass
+        elif t.startswith("back"):
+            try:
+                idx = int(t[4:])
+                if 0 <= idx < len(subscribed):
+                    resolved = subscribed[idx]
+            except ValueError:
+                pass
+        elif len(t) == 8 and t.isdigit():
+            if t.upper() in subscribed:
+                resolved = t.upper()
+            else:
+                # original casing
+                if str(tok) in subscribed:
+                    resolved = str(tok)
+        if resolved is None:
+            logger.warning(
+                "enabled_expiries: token %r did not resolve against subscribed=%s",
+                tok, subscribed,
+            )
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append(resolved)
+    return out
 
 # Orders auto-cancel after this many seconds if not refreshed. The engine's
 # last-resort deadman — bounds how long a quote can sit with stale data if
@@ -136,7 +192,7 @@ class QuoteManager:
         self.sabr = sabr
         self.constraint_checker = constraint_checker
         self.csv_logger = csv_logger
-        self.active_orders: Dict[OrderKey, int] = {}  # {(strike, right, side): order_id}
+        self.active_orders: Dict[OrderKey, int] = {}  # {(strike, expiry, right, side): order_id}
         # Consecutive update_quotes() exception counter — incremented by
         # main.py's catch block, reset on a successful cycle. The
         # watchdog reads this to detect quote-loop exception storms
@@ -187,8 +243,12 @@ class QuoteManager:
         # Cleared on fill_handler when the fill arrives. Distinct from
         # _pending_rtt which clears on Submitted ack.
         self._placed_at_ns: Dict[int, int] = {}
-        # Most recent tick_received_ns per (strike, right) at decision time.
-        self._decision_tick_ns: Dict[Tuple[float, str], int] = {}
+        # Most recent tick_received_ns per (strike, expiry, right) at decision time.
+        self._decision_tick_ns: Dict[Tuple[float, str, str], int] = {}
+        # Resolved enabled_expiries cache. Refreshed each cycle in update_quotes
+        # from the live state.expiries list. Tokens from config.quoting.enabled_expiries
+        # are resolved via resolve_enabled_expiries().
+        self._enabled_expiries_resolved: list = []
         # Consecutive theo_edge skip count per key — used for hysteresis so a
         # single tick of theo_edge violation doesn't drop a resting order
         # that would re-qualify on the next tick. Reset on any non-theo path
@@ -215,11 +275,6 @@ class QuoteManager:
             config.quoting, "max_resting_per_side", 60))
         # Theo-vs-incumbent sanity gate (defense vector #3): if SABR theo
         # disagrees with the market mid by more than this many ticks, treat
-        # the incumbent as garbage and refuse to quote against it. Catches
-        # stale incumbents AND broken SABR fits that slipped past the
-        # quality gate.
-        self._theo_vs_mid_max_ticks = float(getattr(
-            config.pricing, "theo_vs_incumbent_max_ticks", 6.0))
         # Per-cycle canonical trade index — populated by _build_our_prices_index
         # at the top of each update_quotes / get_active_quotes call. Reading
         # from this dict is O(1) vs an O(N) walk of openTrades, which matters
@@ -282,14 +337,20 @@ class QuoteManager:
                 latest = t
         return latest
 
-    def _build_our_prices_index(self) -> Dict[Tuple[float, str], set]:
-        """One-pass build of {(strike, right): set(prices)} for self-filter
-        use across an entire update_quotes cycle. Walks openTrades exactly
-        once per cycle instead of N times (one per quotable strike/right).
+    def _build_our_prices_index(self) -> Dict[Tuple[float, str, str, str], set]:
+        """One-pass build of {(strike, expiry, right, side): set(prices)} for
+        self-filter use across an entire update_quotes cycle. Walks
+        openTrades exactly once per cycle instead of N times.
+
+        Keyed by side (BUY/SELL) so the self-filter for the bid incumbent
+        only sees our resting BUY prices, not our SELL prices (and vice
+        versa). Without this, a SELL at $X causes is_self($X) to fire on
+        the BUY path, falling back to a stale _last_clean_bid cache and
+        penny-jumping an old price — leaving the bid many ticks behind.
 
         Two-step to handle ib_insync's multi-Trade-per-orderId quirk: first
         build {orderId: canonical_trade} (last-write-wins picks the canonical
-        non-orphan instance), then bucket by (strike, right).
+        non-orphan instance), then bucket by (strike, expiry, right, side).
 
         Side effect: populates `self._canonical_idx` so `_canonical_trade()`
         can do O(1) lookups during the rest of the cycle instead of walking
@@ -310,14 +371,16 @@ class QuoteManager:
             if ref.startswith(ORDER_REF_PREFIX):
                 canonical[t.order.orderId] = t
         self._canonical_idx = canonical  # cache for _canonical_trade reads
-        out: Dict[Tuple[float, str], set] = {}
+        out: Dict[Tuple[float, str, str, str], set] = {}
         for t in canonical.values():
             if not self._is_order_live(t):
                 continue
             c = t.contract
             if c.symbol != "ETHUSDRR":
                 continue
-            key = (float(c.strike), c.right)
+            exp = getattr(c, "lastTradeDateOrContractMonth", "") or ""
+            side = "BUY" if t.order.action == "BUY" else "SELL"
+            key = (float(c.strike), exp, c.right, side)
             out.setdefault(key, set()).add(float(t.order.lmtPrice))
         return out
 
@@ -347,16 +410,21 @@ class QuoteManager:
         if should_recal:
             self._last_sabr_attempt = now
             self._last_sabr_forward = state.underlying_price
-            self.sabr.set_expiry(state.front_month_expiry)
+            self.sabr.set_expiries(state.expiries)
             self.sabr.calibrate(state.underlying_price, state.options)
 
     def update_quotes(self, portfolio, dirty: Optional[set] = None):
         """Reprice and re-issue quotes.
 
-        If `dirty` is provided, only those (strike, right) pairs are evaluated
-        (event-driven path: caller has identified which options received ticks
-        since the last cycle). If None, every quotable (strike, right) is
-        evaluated (periodic full-refresh path).
+        Iterates every enabled expiry × (strike, right) in the subscribed
+        quoting window. If `dirty` is provided, only those (strike, expiry,
+        right) triples are evaluated (event-driven path: caller has
+        identified which options received ticks since the last cycle). If
+        None, every quotable combo is evaluated (periodic full-refresh).
+
+        Multi-expiry: resolves config.quoting.enabled_expiries tokens
+        against state.expiries each cycle (cheap, captures reconnects and
+        expiry rollover). Quoting is a no-op when no tokens resolve.
         """
         state = self.market_data.state
         config = self.config
@@ -367,105 +435,211 @@ class QuoteManager:
         # handler and the per-strike send. Theo for this cycle uses whatever
         # surface was last calibrated.
 
-        quotable = self.market_data.get_quotable_strikes()  # list of (strike, right)
-        quotable_set = set(quotable)
+        enabled_tokens = getattr(config.quoting, "enabled_expiries", ["front"])
+        self._enabled_expiries_resolved = resolve_enabled_expiries(
+            enabled_tokens, state.expiries or []
+        )
+        if not self._enabled_expiries_resolved:
+            return  # nothing to quote (config misconfigured or pre-discovery)
 
-        if dirty is not None:
-            iter_pairs = [pair for pair in quotable if pair in dirty]
-        else:
-            iter_pairs = quotable
+        # Full set of (strike, expiry, right) tuples we're eligible to quote
+        # this cycle, unioned across all enabled expiries. Used for the
+        # end-of-cycle stale sweep.
+        full_quotable: set = set()
+        # Per-expiry quotable lists for iteration
+        per_expiry_quotable: Dict[str, list] = {}
+        for exp in self._enabled_expiries_resolved:
+            pairs = self.market_data.get_quotable_strikes(expiry=exp)
+            per_expiry_quotable[exp] = pairs
+            for strike, right in pairs:
+                full_quotable.add((strike, exp, right))
 
         # Precompute our resting prices once per cycle. Avoids walking
-        # ib.openTrades() twice per (strike, right) pair inside the loop.
+        # ib.openTrades() twice per (strike, expiry, right) inside the loop.
         our_prices_idx = self._build_our_prices_index()
         _empty_set: set = set()
 
-        for strike, right in iter_pairs:
-            option = state.get_option(strike, right=right)
-            if option is None:
-                continue
+        for exp, pairs in per_expiry_quotable.items():
+            if dirty is not None:
+                # Dirty may be either (strike, right) or (strike, exp, right).
+                # Support both shapes so event-driven callers that are not
+                # expiry-aware keep working.
+                iter_pairs = [
+                    (s, r) for (s, r) in pairs
+                    if (s, r) in dirty or (s, exp, r) in dirty
+                ]
+            else:
+                iter_pairs = pairs
 
-            self._decision_tick_ns[(strike, right)] = option.tick_received_ns
+            for strike, right in iter_pairs:
+                option = state.get_option(strike, expiry=exp, right=right)
+                if option is None:
+                    continue
 
-            # Theo from SABR (per right)
-            theo = None
-            if config.pricing.sabr_enabled and self.sabr.last_calibration is not None:
-                try:
-                    theo = self.sabr.get_theo(strike, right)
-                except Exception:
-                    theo = None
+                self._decision_tick_ns[(strike, exp, right)] = option.tick_received_ns
 
-            our_prices = our_prices_idx.get((strike, right), _empty_set)
-            inc_bid_info = self.market_data.find_incumbent(strike, "BUY", our_prices, right=right)
-            inc_ask_info = self.market_data.find_incumbent(strike, "SELL", our_prices, right=right)
+                # Theo from SABR (per expiry × right)
+                theo = None
+                if config.pricing.sabr_enabled:
+                    _cal = (self.sabr.get_last_calibration(exp)
+                            if hasattr(self.sabr, "get_last_calibration")
+                            else self.sabr.last_calibration)
+                    if _cal is not None:
+                        try:
+                            theo = self.sabr.get_theo(strike, right, expiry=exp)
+                        except TypeError:
+                            # Legacy single-expiry SABR fallback
+                            theo = self.sabr.get_theo(strike, right)
+                        except Exception:
+                            theo = None
 
-            self._process_side(portfolio, option, strike, right, "BUY",
-                               inc_bid_info, theo)
-            self._process_side(portfolio, option, strike, right, "SELL",
-                               inc_ask_info, theo)
+                our_bid_prices = our_prices_idx.get((strike, exp, right, "BUY"), _empty_set)
+                our_ask_prices = our_prices_idx.get((strike, exp, right, "SELL"), _empty_set)
+                inc_bid_info = self.market_data.find_incumbent(
+                    strike, "BUY", our_bid_prices, right=right, expiry=exp)
+                inc_ask_info = self.market_data.find_incumbent(
+                    strike, "SELL", our_ask_prices, right=right, expiry=exp)
 
-        # On full refresh, sweep stale orders for any (strike, right, side) that
-        # is no longer quotable.
+                self._process_side(portfolio, option, strike, exp, right, "BUY",
+                                   inc_bid_info, theo)
+                self._process_side(portfolio, option, strike, exp, right, "SELL",
+                                   inc_ask_info, theo)
+
+        # On full refresh, sweep stale orders for any (strike, expiry, right, side)
+        # whose (strike, expiry, right) is no longer in the full quotable set.
+        # This also cancels orders from expiries that are no longer enabled.
         if dirty is None:
-            for (strike, right, side) in list(self.active_orders.keys()):
-                if (strike, right) not in quotable_set:
-                    self._cancel_quote(strike, right, side)
+            for (strike, exp, right, side) in list(self.active_orders.keys()):
+                if (strike, exp, right) not in full_quotable:
+                    self._cancel_quote(strike, exp, right, side)
 
-    def _process_side(self, portfolio, option, strike: float, right: str,
-                      side: str, inc_info: dict, theo: Optional[float]) -> None:
+    def _process_side(self, portfolio, option, strike: float, expiry: str,
+                      right: str, side: str, inc_info: dict,
+                      theo: Optional[float]) -> None:
         """Apply skip-reason gate, theo-edge gate, constraint check, and
-        order placement for a single (strike, right, side). Centralizes the
-        bid/ask logic that used to be duplicated in update_quotes."""
+        order placement for a single (strike, expiry, right, side)."""
         config = self.config
         tick = config.quoting.tick_size
 
         # Skip-reason gate from market_data
-        if inc_info["skip_reason"]:
+        #
+        # Position-closing bypass (defense vector #16, 2026-04-09):
+        # when the incumbent gate returns `wide_market` for a strike
+        # where we hold a non-zero position AND the requested side
+        # would reduce the position's magnitude (BUY to close a short,
+        # SELL to close a long), bypass the skip and fall through to
+        # a theo-anchored price path. Rationale: in fast-moving or
+        # illiquid markets option spreads can widen past the normal
+        # penny-jump threshold exactly when we most need to unwind
+        # existing exposure (e.g. to satisfy margin escape). Without
+        # this bypass the system wedges — constraint checker says
+        # "close the short to free margin," market_data says "spread
+        # too wide to compute a target," and nothing happens.
+        #
+        # Safety: the theo cap + theo-edge gate downstream still
+        # apply, so the synthesized price is bounded by model-fair
+        # regardless of how wide the market is. We post passively
+        # (theo - edge for BUY close, theo + edge for SELL close),
+        # which rests safely inside our tolerance and waits for a
+        # natural counterparty — it does NOT aggressively cross.
+        _bypass_wide_market = False
+        if (inc_info["skip_reason"] == "wide_market"
+                and theo is not None and theo > 0):
+            pos_qty = 0
+            for _p in portfolio.positions:
+                if (_p.strike == strike and _p.expiry == expiry
+                        and _p.put_call == right):
+                    pos_qty = _p.quantity
+                    break
+            is_closing = ((pos_qty > 0 and side == "SELL")
+                          or (pos_qty < 0 and side == "BUY"))
+            if is_closing:
+                _bypass_wide_market = True
+                logger.info(
+                    "wide_market bypass: closing %+d %s %s%.0f via theo anchor "
+                    "(spread=%.2f, theo=%.2f)",
+                    pos_qty, expiry[-4:], right, strike,
+                    inc_info.get("bbo_width") or 0.0, theo,
+                )
+
+        if inc_info["skip_reason"] and not _bypass_wide_market:
             # self_only = our order is the only level on this side; leave it
             # in place rather than cancelling and losing queue priority.
             if inc_info["skip_reason"] != "self_only":
-                self._cancel_quote(strike, right, side)
+                self._cancel_quote(strike, expiry, right, side)
             self._log_quote_telemetry(strike, right, side, None, inc_info, theo=theo)
             return
 
-        # Theo-vs-mid sanity gate (defense vector #3). If SABR theo and the
-        # market mid disagree by more than _theo_vs_mid_max_ticks, SOMETHING
-        # is wrong — either the market is stale/junk or our SABR fit is
-        # broken (despite passing quality checks). Either way we should not
-        # penny-jump it. Refuse to quote and cancel any resting order on
-        # this side. This is the cheapest defense against bad-theo runaway.
-        #
-        # Note: this used to compare theo against the per-side incumbent
-        # (inc_price), which had a subtle but expensive bug — on a wide
-        # market (e.g. $5+ spread on ETH wing strikes), a correctly-fit
-        # theo near the mid would systematically fail the gate on whichever
-        # side was further from theo, while the closer side passed. The
-        # symptom was every wide-market OTM strike quoting one side only
-        # (typically bid for OTM calls and puts), which roughly halved the
-        # active quoting surface for no real safety benefit. The variable
-        # name `_theo_vs_mid_max_ticks` documents the original intent. Now
-        # the comparison actually uses mid.
-        if theo is not None:
-            mkt_bid, mkt_ask = self.market_data.get_clean_bbo(strike, right)
-            if mkt_bid > 0 and mkt_ask > 0:
-                mid = (mkt_bid + mkt_ask) / 2.0
-                divergence = abs(theo - mid)
-                max_div = self._theo_vs_mid_max_ticks * tick
-                if divergence > max_div:
-                    self._cancel_quote(strike, right, side)
-                    self._log_quote_telemetry(
-                        strike, right, side, None,
-                        {**inc_info, "skip_reason": "theo_vs_mid_divergence"},
-                        theo=theo,
-                    )
-                    return
-
-        # Penny-jump the incumbent
-        if side == "BUY":
-            jumped = inc_info["price"] + (tick * config.quoting.penny_jump_ticks)
+        # Penny-jump the incumbent — or, in the wide_market bypass
+        # case, synthesize a theo-anchored price directly. The bypass
+        # path posts at theo ± min_edge (safe passive price), which
+        # rests inside our model tolerance but doesn't cross the wide
+        # market. If a natural counterparty hits it, great; if not,
+        # the resting order waits for the spread to tighten.
+        if _bypass_wide_market:
+            import math as _math
+            edge_floor = float(config.pricing.min_edge_points or 0.0)
+            if side == "BUY":
+                anchor = theo - edge_floor
+                adj = _math.floor(anchor / tick) * tick
+            else:  # SELL
+                anchor = theo + edge_floor
+                adj = _math.ceil(anchor / tick) * tick
         else:
-            jumped = inc_info["price"] - (tick * config.quoting.penny_jump_ticks)
-        adj = round_to_tick(jumped, tick)
+            if side == "BUY":
+                jumped = inc_info["price"] + (tick * config.quoting.penny_jump_ticks)
+            else:
+                jumped = inc_info["price"] - (tick * config.quoting.penny_jump_ticks)
+            adj = round_to_tick(jumped, tick)
+
+        # Theo-aware aggression cap (defense vector #15, added 2026-04-09).
+        # Never place a bid above (theo − min_edge) or an offer below
+        # (theo + min_edge), regardless of what the incumbent is doing.
+        #
+        # Why: during fast underlying moves, other MMs are slow to reprice
+        # their option bids/asks. If we penny-jump a stale incumbent in a
+        # wide market, we become the best bid at a price that's now above
+        # true fair — and the next natural seller lifts us. The theo-edge
+        # gate below is supposed to catch this, but it fires as an all-or-
+        # nothing CANCEL and only after the violation is strong enough to
+        # clear the hysteresis. This cap is a softer intervention: slide
+        # the quote *down* to the edge of fair instead of cancelling the
+        # strike entirely, so we stay resting at a safer price and retain
+        # queue priority.
+        #
+        # Uses math.floor/ceil to round directionally: for a BUY cap we
+        # want the highest tick at or below (theo − edge); for a SELL cap
+        # we want the lowest tick at or above (theo + edge). round_to_tick
+        # is nearest-tick and could land on the wrong side by one tick.
+        if theo is not None and config.pricing.min_edge_points > 0:
+            import math as _math
+            edge_floor = config.pricing.min_edge_points
+            if side == "BUY":
+                cap_raw = theo - edge_floor
+                capped = _math.floor(cap_raw / tick) * tick
+                if adj > capped:
+                    adj = capped
+            else:  # SELL
+                cap_raw = theo + edge_floor
+                capped = _math.ceil(cap_raw / tick) * tick
+                if adj < capped:
+                    adj = capped
+
+        # Behind-incumbent gate: if the theo cap pushed our price to or
+        # behind the incumbent (bid at/below best bid, ask at/above best
+        # ask), the order has zero queue value — we'd match the incumbent
+        # with worse time priority. Cancel rather than rest dead weight.
+        if inc_info["price"] is not None and not _bypass_wide_market:
+            behind = ((side == "BUY" and adj <= inc_info["price"])
+                      or (side == "SELL" and adj >= inc_info["price"]))
+            if behind:
+                self._cancel_quote(strike, expiry, right, side)
+                self._log_quote_telemetry(
+                    strike, right, side, None,
+                    {**inc_info, "skip_reason": "behind_incumbent"},
+                    theo=theo,
+                )
+                return
 
         # Theo edge gate: reject if our price wouldn't sit min_edge_points
         # away from theo on the favorable side. Hysteresis: require N
@@ -473,7 +647,7 @@ class QuoteManager:
         # single boundary tick doesn't churn a resting order. Default N=1
         # (no hysteresis); set theo_edge_hysteresis_ticks: 2 in config to
         # smooth at the cost of slightly higher behind% on stale quotes.
-        key = (strike, right, side)
+        key = (strike, expiry, right, side)
         if theo is not None and config.pricing.min_edge_points > 0:
             edge = config.pricing.min_edge_points
             hyst = int(getattr(config.pricing, "theo_edge_hysteresis_ticks", 1))
@@ -482,7 +656,7 @@ class QuoteManager:
                 streak = self._theo_edge_streak.get(key, 0) + 1
                 self._theo_edge_streak[key] = streak
                 if streak >= hyst:
-                    self._cancel_quote(strike, right, side)
+                    self._cancel_quote(strike, expiry, right, side)
                 self._log_quote_telemetry(strike, right, side, None,
                                           {**inc_info, "skip_reason": "theo_edge"},
                                           theo=theo)
@@ -491,7 +665,7 @@ class QuoteManager:
                 self._theo_edge_streak.pop(key, None)
 
         if adj <= 0:
-            self._cancel_quote(strike, right, side)
+            self._cancel_quote(strike, expiry, right, side)
             self._log_quote_telemetry(strike, right, side, None,
                                       {**inc_info, "skip_reason": "invalid_price"},
                                       theo=theo)
@@ -502,11 +676,11 @@ class QuoteManager:
             self.constraint_checker, self.sabr, config,
         )
         if can_quote:
-            self._send_or_update(strike, right, side, adj,
+            self._send_or_update(strike, expiry, right, side, adj,
                                  config.product.quote_size, option)
             self._log_quote_telemetry(strike, right, side, adj, inc_info, theo=theo)
         else:
-            self._cancel_quote(strike, right, side)
+            self._cancel_quote(strike, expiry, right, side)
             self._log_rejection(strike, right, side, reason)
             self._log_quote_telemetry(strike, right, side, None,
                                       {**inc_info, "skip_reason": reason},
@@ -603,14 +777,15 @@ class QuoteManager:
             return False
         return trade.orderStatus.status not in OrderStatus.DoneStates
 
-    def _send_or_update(self, strike: float, right: str, side: str,
+    def _send_or_update(self, strike: float, expiry: str, right: str, side: str,
                         price: float, qty: int, option):
         """Send new order or modify existing if price changed."""
-        key = (strike, right, side)
+        key = (strike, expiry, right, side)
         contract = option.contract
 
         if contract is None:
-            logger.warning("No contract for %s%s, cannot send order", int(strike), right)
+            logger.warning("No contract for %s %s%s, cannot send order",
+                           expiry, int(strike), right)
             return
 
         if key in self.active_orders:
@@ -651,7 +826,7 @@ class QuoteManager:
                         "cancel-replace",
                         int(strike), right, side, order_id, len(window),
                     )
-                    self._cancel_quote(strike, right, side)
+                    self._cancel_quote(strike, expiry, right, side)
                     self._modify_times_per_oid.pop(order_id, None)
                     return
                 window.append(now_ns_storm)
@@ -701,7 +876,7 @@ class QuoteManager:
                 trade.order.totalQuantity = qty
                 trade.order.tif = "GTD"
                 trade.order.goodTillDate = _gtd_string()
-                self._record_send_latency(strike, right, order_id)
+                self._record_send_latency(strike, expiry, right, order_id)
                 self._pending_amend[order_id] = now_ns
                 if len(self._pending_amend) > TRACKING_DICT_MAX:
                     self._evict_oldest_half(self._pending_amend)
@@ -751,7 +926,7 @@ class QuoteManager:
         # outstanding count, so a logic bug that kept calling
         # update_quotes against an ever-growing strike set could otherwise
         # accumulate unbounded resting size.
-        resting_on_side = sum(1 for (_s, _r, sd) in self.active_orders if sd == side)
+        resting_on_side = sum(1 for (_s, _e, _r, sd) in self.active_orders if sd == side)
         if resting_on_side >= self._max_resting_per_side:
             logger.warning(
                 "Per-side resting cap reached (%s=%d ≥ %d) — refusing new "
@@ -766,6 +941,11 @@ class QuoteManager:
         # account= is REQUIRED on multi-account logins (DFP/DUP paper sub-
         # accounts) — IBKR returns Error 436 "You must specify an allocation"
         # if it's missing. Verified 2026-04-08.
+        # orderRef includes expiry (last 4 digits of YYYYMMDD — MMDD) for
+        # trace-friendly per-expiry filtering in logs/csv when multi-expiry
+        # quoting is active. The ORDER_REF_PREFIX prefix stays intact so the
+        # canonical-trade filter in _build_our_prices_index still matches.
+        exp_tag = (expiry or "")[-4:] or "xxxx"
         order = LimitOrder(
             action=action,
             totalQuantity=qty,
@@ -773,7 +953,7 @@ class QuoteManager:
             tif="GTD",
             goodTillDate=_gtd_string(),
             account=self._account,
-            orderRef=f"{ORDER_REF_PREFIX}_{int(strike)}{right}_{side}",
+            orderRef=f"{ORDER_REF_PREFIX}_{exp_tag}_{int(strike)}{right}_{side}",
         )
         # Defensive wrap: ib_insync.placeOrder asserts on
         # `trade.orderStatus.status not in OrderStatus.DoneStates`. After a
@@ -798,7 +978,7 @@ class QuoteManager:
         if trade is None:
             return  # bucket dropped — next cycle re-attempts
         self.active_orders[key] = trade.order.orderId
-        self._record_send_latency(strike, right, trade.order.orderId)
+        self._record_send_latency(strike, expiry, right, trade.order.orderId)
 
     @staticmethod
     def _evict_oldest_half(d: dict) -> None:
@@ -811,7 +991,7 @@ class QuoteManager:
         for k in keys[: len(keys) // 2]:
             d.pop(k, None)
 
-    def _record_send_latency(self, strike: float, right: str, order_id: int):
+    def _record_send_latency(self, strike: float, expiry: str, right: str, order_id: int):
         """Capture TTT (tick→placeOrder) and arm RTT/fill timers for this order.
 
         TTT is only sampled when the underlying tick is fresh (<50ms old).
@@ -827,7 +1007,7 @@ class QuoteManager:
         the next snapshot, cancelled by the broker, etc).
         """
         now_ns = time.monotonic_ns()
-        tick_ns = self._decision_tick_ns.get((strike, right), 0)
+        tick_ns = self._decision_tick_ns.get((strike, expiry, right), 0)
         if tick_ns > 0:
             ttt_us = (now_ns - tick_ns) // 1000
             if 0 <= ttt_us < 50_000:
@@ -930,9 +1110,10 @@ class QuoteManager:
             return
         try:
             self._error_104_count += 1
-            # active_orders is keyed by (strike, right, side); the value is
-            # the orderId. Reverse-lookup is O(N) but N <= ~100, so this is
-            # cheap and only fires on actual races.
+            # active_orders is keyed by (strike, expiry, right, side); the
+            # value is the orderId. Reverse-lookup is O(N) but N <= ~300
+            # with 3-expiry quoting, so this is cheap and only fires on
+            # actual races.
             dead_key = None
             for key, oid in self.active_orders.items():
                 if oid == reqId:
@@ -970,8 +1151,8 @@ class QuoteManager:
             "amend_us": stats(self._amend_us),
         }
 
-    def _cancel_quote(self, strike: float, right: str, side: str):
-        """Cancel a quote at a specific (strike, right, side).
+    def _cancel_quote(self, strike: float, expiry: str, right: str, side: str):
+        """Cancel a quote at a specific (strike, expiry, right, side).
 
         Skips cancellation when the order was placed less than
         MIN_ORDER_LIFETIME_MS ago AND is still in PendingSubmit (i.e., IBKR
@@ -981,7 +1162,7 @@ class QuoteManager:
         for nothing. The next quote tick will re-evaluate and cancel then if
         the skip condition still holds.
         """
-        key = (strike, right, side)
+        key = (strike, expiry, right, side)
         if key not in self.active_orders:
             return
         order_id = self.active_orders[key]
@@ -1080,7 +1261,7 @@ class QuoteManager:
         return len(self.active_orders)
 
     def get_active_quotes(self) -> Dict:
-        """Return dict keyed by (strike, right, side) -> live quote info.
+        """Return dict keyed by (strike, expiry, right, side) -> live quote info.
 
         Refreshes the canonical-trade index up front so the per-order lookups
         below are O(1) instead of O(N) per call. This is the snapshot writer's
@@ -1090,10 +1271,10 @@ class QuoteManager:
         # Side-effect: populates self._canonical_idx that _canonical_trade reads.
         self._build_our_prices_index()
         quotes = {}
-        for (strike, right, side), order_id in self.active_orders.items():
+        for (strike, expiry, right, side), order_id in self.active_orders.items():
             trade = self._canonical_trade(order_id)
             if trade is not None:
-                quotes[(strike, right, side)] = {
+                quotes[(strike, expiry, right, side)] = {
                     "order_id": order_id,
                     "price": trade.order.lmtPrice,
                     "qty": trade.order.totalQuantity,

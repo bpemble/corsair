@@ -11,18 +11,28 @@ product:
   currency: "USD"
   option_type: "both"         # "calls_only", "puts_only", "both"
   # Subscription/display range — wider window we receive market data for.
-  # Per spec: 5-strike buffer below the put quoting range (ATM-20) and 5
-  # strikes above the call quoting range (ATM+20). Subscribes both rights
-  # at every strike in this range, so total streaming lines = 2 × (high - low + 1) + 1.
-  # At -25/+25 that's 103 lines, just over IB's standard 100-line cap —
-  # tighten if any strikes fail to subscribe at startup.
-  strike_range_low: -25       # Strikes below ATM to subscribe (negative = below)
-  strike_range_high: 25       # Strikes above ATM to subscribe
-  # CALL quoting range — narrower window we actually quote calls in.
+  # 5-strike buffer on each side of the quoting band so the dashboard shows
+  # wings we don't actively quote (useful for spotting mispriced strikes
+  # and for debugging "why aren't we quoting X"). Subscribes both rights
+  # at every strike in this range, so total streaming lines per expiry =
+  # 2 × (high - low + 1). With multi-expiry subscribe fan-out the final
+  # count is lower than the naive product because back-month expiries
+  # have narrower native strike grids (see _per_expiry_strikes intersect
+  # in market_data.py). Watch the "total market data lines" log at boot
+  # to confirm we're under the IBKR cap.
+  strike_range_low: -30       # Strikes below ATM to subscribe (negative = below)
+  strike_range_high: 30       # Strikes above ATM to subscribe
+  # CALL quoting range — actual window we submit call orders in.
   quote_range_low: 0          # 0 = ATM
-  quote_range_high: 20        # Number of strikes above ATM to quote
+  quote_range_high: 25        # Number of strikes above ATM to quote
   min_dte: 3                  # Skip options with <= 3 DTE
-  expiry: "front_month"       # "front_month" only for now
+  expiry: "front_month"       # DEPRECATED — kept for one release; replaced by subscribed_expiries
+  # How many consecutive future expiries to subscribe to (market data +
+  # contract qualification + SABR calibration). 1 = front month only
+  # (legacy behavior). 3 = front / front+1 / front+2 chains all live in
+  # MarketState + dashboard snapshot. Separate from quoting.enabled_expiries
+  # so we can subscribe without submitting orders.
+  subscribed_expiries: 3
   quote_size: 1               # Lot size per quote
   underlying_symbol: "ETHUSDRR"
   option_symbol: "ETH"
@@ -43,6 +53,16 @@ constraints:
   margin_ceiling_pct: 0.50    # 50% of $200K = $100K synthetic
   delta_ceiling: 3.0          # |portfolio net_delta| must be <= this
   theta_floor: -200           # portfolio net_theta $/day, must be >= this
+  # Margin-priority escape: when margin is currently breached, allow
+  # fills that strictly reduce post-fill margin even if they degrade
+  # tier-2 constraints (delta, theta) into soft-breach territory — as
+  # long as no hard kill (delta_kill / theta_kill / margin_kill_pct)
+  # is crossed. Tier-1 (margin = solvency) takes priority over tier-2
+  # (P&L drag / directional exposure) because without margin relief
+  # the system can wedge with no permitted unwind path (observed
+  # 2026-04-09 after an adverse-fill burst). Set false to disable
+  # and revert to strict per-constraint independence.
+  margin_escape_enabled: true
 
 puts:
   # Puts now share the constraints/kill_switch budget with calls (combined
@@ -50,16 +70,29 @@ puts:
   # on/off toggle and the put-side quoting range — there are no longer
   # independent margin/delta/theta budgets for puts.
   enabled: true
-  quote_range_low: -20        # 20 strikes below ATM
+  quote_range_low: -25        # 25 strikes below ATM
   quote_range_high: 0         # up to ATM (inclusive)
 
 kill_switch:
   margin_kill_pct: 0.70       # 70% of $200K = $140K (Stage 1)
   max_daily_loss: -2500       # Dollars (Stage 1)
   delta_kill: 5.0             # Combined |net_delta| kill threshold
-  vega_kill: 1000             # |net_vega| (per vol pt) kill threshold (NEW)
+  vega_kill: 1000             # |net_vega| (per vol pt) kill threshold
+  # Hard floor on portfolio theta ($/day). Only enforced in
+  # margin-escape mode (see constraints.margin_escape_enabled) — the
+  # normal path uses the softer constraints.theta_floor ceiling.
+  # Set to -$500/day: roughly $3.5K/week of decay bleed, aggressive
+  # enough to surface a bad position but still rescuable via unwind.
+  theta_kill: -500
 
 quoting:
+  # Which subscribed expiries the quote engine should actually place orders
+  # on. Tokens: "front" | "front+1" | "front+2" (or "front+N") resolve at
+  # runtime against state.expiries. Default [front] reproduces legacy
+  # single-expiry behavior. Flip to [front, front+1, front+2] (or similar)
+  # to enable quoting on multiple expiries — requires active_orders key
+  # shape to include expiry (see quote_engine.py OrderKey).
+  enabled_expiries: ["front", "front+1", "front+2"]
   tick_size: 0.50             # ETHUSDRR minimum tick ($0.50 per point = $25 per contract)
   penny_jump_ticks: 1         # Number of ticks inside incumbent's spread
   # Modify dead-band: skip a re-price unless the new target differs from
@@ -112,10 +145,6 @@ pricing:
                               # is ~±$1, so the effective real-world edge floor is
                               # still ~$1.5; we're trading some model-confidence
                               # cushion for ~3x the quotable surface area.
-  # Theo-vs-incumbent sanity gate (defense vector #3). If SABR theo and
-  # the incumbent price disagree by more than this many ticks, refuse to
-  # quote — either the incumbent is stale junk or the SABR fit is broken.
-  theo_vs_incumbent_max_ticks: 6.0
   theo_edge_hysteresis_ticks: 1  # Consecutive theo_edge violations required before
                                  # cancelling a resting order. 1 = no hysteresis
                                  # (cancel on first violation, original behavior).
@@ -124,8 +153,19 @@ pricing:
                                  # measurement). Default 1 until we have data
                                  # justifying the trade-off.
   sabr_recalibrate_seconds: 60
-  sabr_fast_recal_dollars: 10.0  # Force a recal when underlying moves > $N since last fit
-  sabr_beta: 1.0              # Fixed backbone (1.0 = lognormal, matches v1)
+  # Force a SABR recal when the futures forward moves > $N since the last
+  # fit. Lowered from 10.0 → 2.0 on 2026-04-09 after an adverse-selection
+  # burst caused by theo lag in a $20 underlying move: SABR's forward was
+  # reading the parity-implied (laggy option-market) value, and the
+  # theo-edge gate couldn't fire because theo tracked the stale option
+  # market instead of the true futures. $2 trigger means ~10 recals during
+  # a $20 move (each ~100-300ms), keeping theo fresh against futures.
+  # Cost is higher CPU during fast moves; we pay that willingly to avoid
+  # getting picked off. Paired with the theo-aware penny-jump cap in
+  # quote_engine._process_side for defense in depth.
+  sabr_fast_recal_dollars: 2.0
+  vol_model: "svi"            # "svi" (5-param, better skew fit) or "sabr" (3-param, original). Change to "sabr" to revert.
+  sabr_beta: 0.5              # Only used when vol_model=sabr. 0.5=sqrt-CEV, 1.0=lognormal.
   sabr_max_rmse: 0.03         # Reject SABR fit if RMSE exceeds this
   sabr_min_strikes: 8         # Reject fit if fewer than N strikes contributed (quality gate)
   stale_iv_threshold: 0.10    # IV discrepancy threshold for stale detection

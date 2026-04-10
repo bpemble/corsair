@@ -23,7 +23,7 @@ from .connection import IBKRConnection
 from .market_data import MarketDataManager
 from .position_manager import PortfolioState
 from .constraint_checker import IBKRMarginChecker, ConstraintChecker
-from .sabr import SABRSurface
+from .sabr import MultiExpirySABR
 from .quote_engine import QuoteManager
 from .fill_handler import FillHandler
 from .risk_monitor import RiskMonitor
@@ -206,7 +206,7 @@ async def main():
     if seeded:
         logger.info("Reconciled %d existing ETHUSDRR option position(s) from IBKR", seeded)
 
-    sabr = SABRSurface(config)
+    sabr = MultiExpirySABR(config)
     # SABR is passed to the margin checker so it can fall back to fitted vol
     # when a position's strike has no fresh bid/ask tick (otherwise positions
     # at quiet wing strikes get silently dropped from the SPAN calc).
@@ -335,7 +335,7 @@ async def main():
     )
 
     # Set SABR expiry
-    sabr.set_expiry(market_data.state.front_month_expiry)
+    sabr.set_expiries(market_data.state.expiries)
 
     # Force-subscribe market data for any seeded position whose strike sits
     # outside the initial ATM±N discovery window. Without this, off-window
@@ -511,6 +511,36 @@ async def main():
         except Exception as e:
             logger.warning("SABR recal error: %s", e)
 
+        # ── Snapshot + daily-state persistence ────────────────────────
+        # Runs even when killed/paused so Docker's healthcheck (which reads
+        # chain_snapshot.json age) doesn't falsely declare the container
+        # unhealthy and restart a process that's otherwise alive and
+        # recoverable. Previously these lived after the quote phase, so
+        # the `continue` below starved the snapshot writer for hours.
+        mono = _time.monotonic()
+        if (mono - last_snapshot_write) >= snapshot_interval:
+            try:
+                write_chain_snapshot(market_data, quotes, portfolio, sabr,
+                                     margin, ib, config.account.account_id, config)
+            except Exception as e:
+                logger.warning("Snapshot write error: %s", e)
+            last_snapshot_write = mono
+
+        if (mono - last_daily_state_save) >= 1.0:
+            try:
+                daily_state.save(
+                    session_day,
+                    fills_today=portfolio.fills_today,
+                    spread_capture_today=portfolio.spread_capture_today,
+                    spread_capture_mid_today=portfolio.spread_capture_mid_today,
+                    daily_pnl=portfolio.daily_pnl,
+                    realized_pnl=portfolio.realized_pnl_persisted,
+                    seen_exec_ids=list(fills._seen_exec_ids),
+                )
+            except Exception as e:
+                logger.warning("daily_state save error: %s", e)
+            last_daily_state_save = mono
+
         # ── Event-driven quote phase ─────────────────────────────────
         if risk.killed or weekend_paused:
             await asyncio.sleep(fallback_interval)
@@ -602,32 +632,6 @@ async def main():
                         logger.error("panic_cancel after storm failed: %s", ee)
                     risk.kill("Quote loop exception storm", source="exception_storm")
                     quotes.consecutive_quote_errors = 0
-
-        # Throttled snapshot write for dashboard
-        if (mono - last_snapshot_write) >= snapshot_interval:
-            try:
-                write_chain_snapshot(market_data, quotes, portfolio, sabr,
-                                     margin, ib, config.account.account_id, config)
-            except Exception as e:
-                logger.warning("Snapshot write error: %s", e)
-            last_snapshot_write = mono
-
-        # Persist daily counters at most once per second so they survive
-        # a process restart within the same CME session day.
-        if (mono - last_daily_state_save) >= 1.0:
-            try:
-                daily_state.save(
-                    session_day,
-                    fills_today=portfolio.fills_today,
-                    spread_capture_today=portfolio.spread_capture_today,
-                    spread_capture_mid_today=portfolio.spread_capture_mid_today,
-                    daily_pnl=portfolio.daily_pnl,
-                    realized_pnl=portfolio.realized_pnl_persisted,
-                    seen_exec_ids=list(fills._seen_exec_ids),
-                )
-            except Exception as e:
-                logger.warning("daily_state save error: %s", e)
-            last_daily_state_save = mono
 
     # ── 8. Shutdown ──────────────────────────────────────────────────
     logger.info("Shutting down...")

@@ -51,13 +51,16 @@ def _read_account_state(ib, account_id: str) -> dict:
 
 
 def _build_side(state, market_data, quotes, sabr, portfolio, active_quotes,
-                strike: float, right: str) -> Optional[dict]:
+                strike: float, right: str, expiry: str = None) -> Optional[dict]:
     """Build the per-right block for one strike, or None if no contract."""
-    opt = state.get_option(strike, right=right)
+    if expiry is None:
+        expiry = state.front_month_expiry
+    opt = state.get_option(strike, expiry=expiry, right=right)
     if opt is None:
         return None
-    bid_info = active_quotes.get((strike, right, "BUY"))
-    ask_info = active_quotes.get((strike, right, "SELL"))
+    # Multi-expiry quoting: active_quotes is keyed by (strike, expiry, right, side).
+    bid_info = active_quotes.get((strike, expiry, right, "BUY"))
+    ask_info = active_quotes.get((strike, expiry, right, "SELL"))
     our_bid = bid_info["price"] if bid_info else None
     our_ask = ask_info["price"] if ask_info else None
     # PreSubmitted and Submitted both mean the order is resting on IBKR's
@@ -68,14 +71,15 @@ def _build_side(state, market_data, quotes, sabr, portfolio, active_quotes,
     bid_live = bid_info["status"] in _LIVE if bid_info else False
     ask_live = ask_info["status"] in _LIVE if ask_info else False
     theo = None
-    if sabr.last_calibration is not None:
+    _last_cal = sabr.get_last_calibration(expiry) if hasattr(sabr, "get_last_calibration") else sabr.last_calibration
+    if _last_cal is not None:
         try:
-            theo = round(sabr.get_theo(strike, right), 2)
+            theo = round(sabr.get_theo(strike, right, expiry=expiry), 2)
         except Exception:
             pass
     pos = sum(
         p.quantity for p in portfolio.positions
-        if p.strike == strike and p.expiry == state.front_month_expiry
+        if p.strike == strike and p.expiry == expiry
         and p.put_call == right
     )
     if bid_live or ask_live:
@@ -84,7 +88,7 @@ def _build_side(state, market_data, quotes, sabr, portfolio, active_quotes,
         status = "pending"
     else:
         status = "idle"
-    clean_bid, clean_ask = market_data.get_clean_bbo(strike, right)
+    clean_bid, clean_ask = market_data.get_clean_bbo(strike, right, expiry=expiry)
     return {
         "market_bid": clean_bid,
         "market_ask": clean_ask,
@@ -112,15 +116,26 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         return
 
     active_quotes = quotes.get_active_quotes()
-    strikes_data = {}
-    for strike in state.get_all_strikes():
-        block = {
-            "call": _build_side(state, market_data, quotes, sabr, portfolio, active_quotes, strike, "C"),
-            "put": _build_side(state, market_data, quotes, sabr, portfolio, active_quotes, strike, "P"),
-        }
-        if block["call"] is None and block["put"] is None:
-            continue
-        strikes_data[str(int(strike))] = block
+    chains_data: dict = {}
+    expiries_list = list(state.expiries) if state.expiries else (
+        [state.front_month_expiry] if state.front_month_expiry else []
+    )
+    for exp in expiries_list:
+        exp_strikes: dict = {}
+        for strike in state.get_all_strikes(expiry=exp):
+            block = {
+                "call": _build_side(state, market_data, quotes, sabr, portfolio, active_quotes, strike, "C", expiry=exp),
+                "put": _build_side(state, market_data, quotes, sabr, portfolio, active_quotes, strike, "P", expiry=exp),
+            }
+            if block["call"] is None and block["put"] is None:
+                continue
+            exp_strikes[str(int(strike))] = block
+        chains_data[exp] = {"strikes": exp_strikes}
+    # Legacy top-level strikes = front-month chain (for older dashboard).
+    strikes_data = (
+        chains_data.get(state.front_month_expiry, {}).get("strikes", {})
+        if state.front_month_expiry else {}
+    )
 
     # Per-position detail with MtM P&L. If we don't yet have a fresh
     # bid/ask for this strike (just-subscribed, mid-rotation, etc.), fall
@@ -197,6 +212,8 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         "underlying_price": state.underlying_price,
         "atm_strike": state.atm_strike,
         "front_month_expiry": state.front_month_expiry,
+        "expiries": expiries_list,
+        "chains": chains_data,
         "account": account,
         "latency": quotes.get_latency_snapshot(),
         "limits": limits,
