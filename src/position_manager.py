@@ -7,7 +7,7 @@ expiry settlement, and daily accounting.
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 from .utils import time_to_expiry_years
 
@@ -281,17 +281,4 @@ class PortfolioState:
         self.realized_pnl_persisted = 0.0
         logger.info("Daily counters reset")
 
-    def get_summary(self) -> Dict:
-        """Return a summary dict of current portfolio state."""
-        return {
-            "positions": self.gross_positions,
-            "longs": self.long_count,
-            "shorts": self.short_count,
-            "net_delta": self.net_delta,
-            "net_theta": self.net_theta,
-            "net_vega": self.net_vega,
-            "net_gamma": self.net_gamma,
-            "fills_today": self.fills_today,
-            "spread_capture": self.spread_capture_today,
-            "unrealized_pnl": self.compute_mtm_pnl(),
-        }
+

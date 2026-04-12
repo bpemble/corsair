@@ -53,7 +53,7 @@ def _read_account_state(ib, account_id: str) -> dict:
     return out
 
 
-def _build_side(state, market_data, quotes, sabr, portfolio, active_quotes,
+def _build_side(state, market_data, sabr, portfolio, active_quotes,
                 strike: float, right: str, expiry: str = None) -> Optional[dict]:
     """Build the per-right block for one strike, or None if no contract."""
     if expiry is None:
@@ -127,8 +127,8 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         exp_strikes: dict = {}
         for strike in state.get_all_strikes(expiry=exp):
             block = {
-                "call": _build_side(state, market_data, quotes, sabr, portfolio, active_quotes, strike, "C", expiry=exp),
-                "put": _build_side(state, market_data, quotes, sabr, portfolio, active_quotes, strike, "P", expiry=exp),
+                "call": _build_side(state, market_data, sabr, portfolio, active_quotes, strike, "C", expiry=exp),
+                "put": _build_side(state, market_data, sabr, portfolio, active_quotes, strike, "P", expiry=exp),
             }
             if block["call"] is None and block["put"] is None:
                 continue

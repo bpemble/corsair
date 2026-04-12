@@ -151,7 +151,7 @@ def _gtd_string(seconds_from_now: int = GTD_EXPIRY_SECONDS) -> str:
 
 
 def should_quote_side(
-    portfolio, option, side: str, quote_price: float,
+    option, side: str,
     constraint_checker, sabr, config,
 ) -> Tuple[bool, str]:
     """Check all constraints and filters for a potential quote.
@@ -679,7 +679,7 @@ class QuoteManager:
             return
 
         can_quote, reason = should_quote_side(
-            portfolio, option, side, adj,
+            option, side,
             self.constraint_checker, self.sabr, config,
         )
         if can_quote:
