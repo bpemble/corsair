@@ -23,12 +23,7 @@ product:
   strike_range_low: -30       # Strikes below ATM to subscribe (negative = below)
   strike_range_high: 30       # Strikes above ATM to subscribe
   # CALL quoting range — actual window we submit call orders in.
-  # Skip the 5 strikes closest to ATM (inclusive of ATM) — highest gamma,
-  # highest adverse-selection risk per $0.50 tick of edge. Wings retain
-  # full quoting out to ATM+25. Subscription range (strike_range_*) still
-  # covers ATM, so the dashboard sees the skipped strikes. Reversible: set
-  # quote_range_low back to 0 to restore full coverage.
-  quote_range_low: 5          # Start 5 strikes above ATM (skip ATM±0..+4)
+  quote_range_low: 0          # 0 = ATM
   quote_range_high: 25        # Number of strikes above ATM to quote
   min_dte: 3                  # Skip options with <= 3 DTE
   expiry: "front_month"       # DEPRECATED — kept for one release; replaced by subscribed_expiries
@@ -75,11 +70,8 @@ puts:
   # on/off toggle and the put-side quoting range — there are no longer
   # independent margin/delta/theta budgets for puts.
   enabled: true
-  # Mirror of the call-side skip: drop the 5 strikes closest to ATM
-  # (ATM-4..ATM inclusive) to avoid highest-gamma adverse selection.
-  # Wings retain full coverage out to ATM-25.
   quote_range_low: -25        # 25 strikes below ATM
-  quote_range_high: -5        # End 5 strikes below ATM (skip ATM-4..ATM)
+  quote_range_high: 0         # up to ATM (inclusive)
 
 kill_switch:
   margin_kill_pct: 0.70       # 70% of $200K = $140K (Stage 1)
