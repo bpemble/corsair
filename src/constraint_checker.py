@@ -47,7 +47,8 @@ class IBKRMarginChecker:
       - per-strike: when IV moves > 1 vol pt or F moves > $5
     """
 
-    def __init__(self, ib: IB, config, market_data, portfolio, sabr=None):
+    def __init__(self, ib: IB, config, market_data, portfolio, sabr=None,
+                 csv_logger=None):
         self.ib = ib
         self.config = config
         self.market_data = market_data
@@ -57,6 +58,7 @@ class IBKRMarginChecker:
         # tick (otherwise those positions are silently dropped from the
         # margin calc, which silently bypasses risk constraints).
         self.sabr = sabr
+        self.csv_logger = csv_logger
         self.span = SyntheticSpan(config)
         self.cached_ibkr_margin: float = 0.0
         # Calibration ratio synthetic ÷ ibkr_actual, refreshed at every recon.
@@ -240,6 +242,8 @@ class IBKRMarginChecker:
                 if item.tag == "MaintMarginReq" and item.currency == "USD":
                     self.cached_ibkr_margin = float(item.value)
                     raw_synth = self._raw_current_margin()
+                    ratio = 0.0
+                    clamped = False
                     if raw_synth > 0 and self.cached_ibkr_margin > 0:
                         ratio = raw_synth / self.cached_ibkr_margin
                         # Bound the scale to a sensible range.
@@ -253,10 +257,22 @@ class IBKRMarginChecker:
                             self.ibkr_scale = 1.0 / ratio
                         else:
                             self.ibkr_scale = 1.0
+                            clamped = True
                         logger.info(
                             "MARGIN RECON: synthetic=$%.0f ibkr=$%.0f ratio=%.2f scale=%.2f",
                             raw_synth, self.cached_ibkr_margin, ratio, self.ibkr_scale,
                         )
+                    if self.csv_logger is not None:
+                        try:
+                            self.csv_logger.log_margin_scale(
+                                raw_synthetic=raw_synth,
+                                ibkr_actual=self.cached_ibkr_margin,
+                                ratio=ratio,
+                                ibkr_scale=self.ibkr_scale,
+                                clamped=clamped,
+                            )
+                        except Exception as e:
+                            logger.debug("margin scale telemetry log failed: %s", e)
                     return
         except Exception as e:
             logger.warning("Failed to refresh IBKR margin: %s", e)

@@ -410,8 +410,9 @@ class SABRSurface:
     2. Stale quote detection -- flag incumbent quotes implying abnormal IV
     """
 
-    def __init__(self, config):
+    def __init__(self, config, csv_logger=None):
         self.config = config
+        self.csv_logger = csv_logger
         self.beta = config.pricing.sabr_beta
         self.forward = 0.0
         self.last_calibration: Optional[datetime] = None
@@ -540,6 +541,18 @@ class SABRSurface:
                     side, result.a, result.b, result.rho, result.m, result.sigma,
                     result.rmse, result.n_points,
                 )
+                if self.csv_logger is not None:
+                    try:
+                        self.csv_logger.log_calibration(
+                            expiry=self._front_month_expiry or "",
+                            side=side, model="svi",
+                            forward=forward, tte_years=tte,
+                            n_points=result.n_points, rmse=result.rmse,
+                            a=result.a, b=result.b, rho_svi=result.rho,
+                            m=result.m, sigma=result.sigma,
+                        )
+                    except Exception as e:
+                        logger.debug("calibration telemetry log failed: %s", e)
             else:
                 result = calibrate_sabr(
                     F=forward, T=tte, strikes=strikes, market_ivs=ivs,
@@ -580,6 +593,18 @@ class SABRSurface:
                     "SABR %s calibrated: alpha=%.4f rho=%.3f nu=%.3f RMSE=%.4f (n=%d)",
                     side, result.alpha, result.rho, result.nu, result.rmse, result.n_points,
                 )
+                if self.csv_logger is not None:
+                    try:
+                        self.csv_logger.log_calibration(
+                            expiry=self._front_month_expiry or "",
+                            side=side, model="sabr",
+                            forward=forward, tte_years=tte,
+                            n_points=result.n_points, rmse=result.rmse,
+                            alpha=result.alpha, beta=self.beta,
+                            rho_sabr=result.rho, nu=result.nu,
+                        )
+                    except Exception as e:
+                        logger.debug("calibration telemetry log failed: %s", e)
 
             # Drift detection (shared across both models)
             rmse_val = result.rmse
@@ -675,8 +700,9 @@ class MultiExpirySABR:
     (first element of the expiry list).
     """
 
-    def __init__(self, config):
+    def __init__(self, config, csv_logger=None):
         self.config = config
+        self.csv_logger = csv_logger
         self._surfaces: dict = {}
         self._expiries: List[str] = []
 
@@ -688,7 +714,7 @@ class MultiExpirySABR:
         # Add new
         for exp in expiries:
             if exp not in self._surfaces:
-                surf = SABRSurface(self.config)
+                surf = SABRSurface(self.config, csv_logger=self.csv_logger)
                 surf.set_expiry(exp)
                 self._surfaces[exp] = surf
             else:
