@@ -15,8 +15,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-SNAPSHOT_PATH = "data/chain_snapshot.json"
-SNAPSHOT_TMP = "data/chain_snapshot.json.tmp"
+# Default snapshot path — overridable via config.logging.snapshot_path for
+# multi-product deployments (each product writes its own file). The docker
+# healthcheck and dashboard still look here, so don't change the default
+# without also updating docker-compose.yml and scripts/dashboard.py.
+DEFAULT_SNAPSHOT_PATH = "data/chain_snapshot.json"
 
 
 _TAG_MAP = {
@@ -246,10 +249,12 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         "strikes": strikes_data,
     }
 
+    path = getattr(config.logging, "snapshot_path", DEFAULT_SNAPSHOT_PATH)
+    tmp = path + ".tmp"
     try:
-        os.makedirs(os.path.dirname(SNAPSHOT_TMP), exist_ok=True)
-        with open(SNAPSHOT_TMP, "w") as f:
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        with open(tmp, "w") as f:
             json.dump(snapshot, f, indent=2)
-        os.replace(SNAPSHOT_TMP, SNAPSHOT_PATH)
+        os.replace(tmp, path)
     except Exception as e:
         logger.warning("Failed to write chain snapshot: %s", e)

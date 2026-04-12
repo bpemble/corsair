@@ -105,13 +105,14 @@ class PortfolioState:
         return sum(abs(p.quantity) for p in self.positions if p.put_call == right)
 
     def seed_from_ibkr(self, ib, account_id: str, market_state=None) -> int:
-        """Sync existing ETHUSDRR option positions from IBKR.
+        """Sync existing option positions from IBKR for the configured product.
 
         Idempotent: clears the local position list first so multiple calls
         (initial startup + each watchdog reseed after a reconnect) don't
-        accumulate duplicates. Filters strictly to symbol='ETHUSDRR' and
-        secType='FOP' — ignores everything else (futures, other products,
-        equities). Returns the number of positions seeded.
+        accumulate duplicates. Filters strictly to
+        symbol==config.product.underlying_symbol and secType='FOP' — ignores
+        everything else (futures, other products, equities). Returns the
+        number of positions seeded.
 
         If `market_state` is provided, immediately calls refresh_greeks()
         on the freshly-seeded positions. Without this, the new Position
@@ -125,9 +126,10 @@ class PortfolioState:
         """
         self.positions.clear()
         seeded = 0
+        underlying = self.config.product.underlying_symbol
         for ib_pos in ib.positions(account_id):
             c = ib_pos.contract
-            if c.symbol != "ETHUSDRR":
+            if c.symbol != underlying:
                 continue
             if c.secType != "FOP":
                 continue

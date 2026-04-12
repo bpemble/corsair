@@ -1,4 +1,4 @@
-"""Synthetic SPAN margin calculator for ETHUSDRR.
+"""Synthetic SPAN margin calculator for CME futures options.
 
 Approximates CME SPAN margin by re-pricing every position under 16 risk
 scenarios (futures price × vol shifts) using Black-76. No CME .pa2 files

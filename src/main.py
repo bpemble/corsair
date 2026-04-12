@@ -1,8 +1,9 @@
 """Corsair v2 — Main Event Loop.
 
-Automated options market-making system for CME ETHUSDRR.
-Quotes two-sided markets on OTM calls, earns spread per fill,
-manages risk through SPAN margin and portfolio theta constraints.
+Automated options market-making system for CME futures options.
+Product selected via config.product.underlying_symbol (ETHUSDRR at the
+time of writing). Quotes two-sided markets on OTM options, earns spread
+per fill, manages risk through SPAN margin and portfolio theta constraints.
 """
 
 import asyncio
@@ -61,9 +62,10 @@ def _validate_safety_config(cfg) -> None:
     p = cfg.product
     c = cfg.constraints
     k = cfg.kill_switch
-    assert p.multiplier == 50, (
-        f"FATAL: product.multiplier must be 50 (CME ETH FOP spec), got {p.multiplier}. "
-        "Wrong multiplier silently corrupts margin and P&L by 2×."
+    assert 1 <= int(p.multiplier) <= 1000, (
+        f"FATAL: product.multiplier out of safe range [1,1000], got {p.multiplier}. "
+        "Wrong multiplier silently corrupts margin and P&L proportionally. "
+        "CME ETH FOP = 50; common futures-option multipliers fall in this band."
     )
     assert 1 <= int(p.quote_size) <= 5, (
         f"FATAL: product.quote_size out of safe range [1,5], got {p.quote_size}"
@@ -98,13 +100,14 @@ def _validate_safety_config(cfg) -> None:
     )
 
 
-def _reconcile_positions(portfolio, ib, account_id: str) -> list:
+def _reconcile_positions(portfolio, ib, account_id: str, config) -> list:
     """Compare in-memory portfolio against IBKR's authoritative position view.
 
     Defense vector #9: catches the 2026-04-08 failure mode where order-status
     routing was broken and fills accumulated invisibly. Returns a list of
     (strike, expiry, right) keys that disagree; empty list = clean.
     """
+    underlying = config.product.underlying_symbol
     ours: dict = {}
     for p in portfolio.positions:
         if p.quantity != 0:
@@ -112,7 +115,7 @@ def _reconcile_positions(portfolio, ib, account_id: str) -> list:
     theirs: dict = {}
     for ib_pos in ib.positions(account_id):
         c = ib_pos.contract
-        if c.symbol != "ETHUSDRR" or c.secType != "FOP":
+        if c.symbol != underlying or c.secType != "FOP":
             continue
         if not c.right or c.right not in ("C", "P"):
             continue
@@ -201,16 +204,18 @@ async def main():
     market_data = MarketDataManager(ib, config, csv_logger=csv_logger)
     portfolio = PortfolioState(config)
 
-    # Reconcile any existing ETHUSDRR option positions from IBKR
+    # Reconcile any existing option positions from IBKR for the configured product
     seeded = portfolio.seed_from_ibkr(ib, config.account.account_id)
     if seeded:
-        logger.info("Reconciled %d existing ETHUSDRR option position(s) from IBKR", seeded)
+        logger.info("Reconciled %d existing %s option position(s) from IBKR",
+                    seeded, config.product.underlying_symbol)
 
-    sabr = MultiExpirySABR(config)
+    sabr = MultiExpirySABR(config, csv_logger=csv_logger)
     # SABR is passed to the margin checker so it can fall back to fitted vol
     # when a position's strike has no fresh bid/ask tick (otherwise positions
     # at quiet wing strikes get silently dropped from the SPAN calc).
-    margin = IBKRMarginChecker(ib, config, market_data, portfolio, sabr=sabr)
+    margin = IBKRMarginChecker(ib, config, market_data, portfolio, sabr=sabr,
+                               csv_logger=csv_logger)
     constraint_checker = ConstraintChecker(margin, portfolio, config)
     quotes = QuoteManager(ib, config, market_data, sabr, constraint_checker,
                           csv_logger=csv_logger)
@@ -479,7 +484,7 @@ async def main():
         # against a stale position book.
         if (now - last_reconcile).total_seconds() >= reconcile_interval_sec:
             try:
-                mismatches = _reconcile_positions(portfolio, ib, config.account.account_id)
+                mismatches = _reconcile_positions(portfolio, ib, config.account.account_id, config)
                 if mismatches:
                     logger.critical(
                         "POSITION RECONCILIATION MISMATCH (%d): %s — killing",

@@ -366,7 +366,7 @@ class QuoteManager:
             if not self._is_order_live(t):
                 continue
             c = t.contract
-            if c.symbol != "ETHUSDRR":
+            if c.symbol != self.config.product.underlying_symbol:
                 continue
             exp = getattr(c, "lastTradeDateOrContractMonth", "") or ""
             side = "BUY" if t.order.action == "BUY" else "SELL"
