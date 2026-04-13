@@ -580,9 +580,18 @@ class QuoteManager:
                       current_underlying: float = 0.0) -> None:
         """Apply skip-reason gate, theo-edge gate, constraint check, and
         order placement for a single (strike, expiry, right, side)."""
-        # Skip if IBKR previously rejected this key for margin.
+        # Skip if IBKR previously rejected this key for margin — but
+        # never suppress closing orders (they reduce margin, not increase it).
         if (strike, expiry, right, side) in self._margin_rejected:
-            return
+            is_closing = False
+            for _p in portfolio.positions:
+                if (_p.strike == strike and _p.expiry == expiry
+                        and _p.put_call == right):
+                    is_closing = ((_p.quantity > 0 and side == "SELL")
+                                  or (_p.quantity < 0 and side == "BUY"))
+                    break
+            if not is_closing:
+                return
         config = self.config
         tick = config.quoting.tick_size
 
