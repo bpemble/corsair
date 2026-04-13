@@ -235,6 +235,10 @@ class QuoteManager:
         # Cleared on fill_handler when the fill arrives. Distinct from
         # _pending_rtt which clears on Submitted ack.
         self._placed_at_ns: Dict[int, int] = {}
+        # Underlying price at last place/modify per order_id. Used by
+        # delta-retreat to detect when F has moved enough that the resting
+        # order should be shifted by delta × ΔF instead of penny-jumping.
+        self._order_underlying: Dict[int, float] = {}
         # Most recent tick_received_ns per (strike, expiry, right) at decision time.
         self._decision_tick_ns: Dict[Tuple[float, str, str], int] = {}
         # Resolved enabled_expiries cache. Refreshed each cycle in update_quotes
@@ -623,6 +627,13 @@ class QuoteManager:
         # $5+ off mid on wide-spread near-ATM strikes, leading to
         # adverse fills where we think we have edge but are actually
         # on the wrong side of fair.
+        #
+        # Delta-retreat: when F has moved more than delta_retreat_threshold
+        # since the order was last placed/modified, shift the resting price
+        # by delta × ΔF instead of penny-jumping the incumbent. This
+        # protects against AS during fast moves where the incumbent is
+        # also stale. Falls through to penny-jump in calm markets.
+        _retreated = False
         if _bypass_wide_market:
 
             edge_floor = float(config.pricing.min_edge_points or 0.0)
@@ -639,11 +650,32 @@ class QuoteManager:
                 anchor = mid + edge_floor
                 adj = ceil_to_tick(anchor, tick)
         else:
-            if side == "BUY":
-                jumped = inc_info["price"] + (tick * config.quoting.penny_jump_ticks)
-            else:
-                jumped = inc_info["price"] - (tick * config.quoting.penny_jump_ticks)
-            adj = round_to_tick(jumped, tick)
+            retreat_threshold = float(
+                getattr(config.quoting, "delta_retreat_threshold", 0))
+            key = (strike, expiry, right, side)
+            if (retreat_threshold > 0
+                    and key in self.active_orders
+                    and option is not None
+                    and current_underlying > 0):
+                oid = self.active_orders[key]
+                f_at_modify = self._order_underlying.get(oid)
+                if f_at_modify is not None and f_at_modify > 0:
+                    f_move = current_underlying - f_at_modify
+                    if abs(f_move) > retreat_threshold:
+                        trade = self._canonical_trade(oid)
+                        if trade is not None:
+                            old_price = trade.order.lmtPrice
+                            delta = option.delta
+                            adj = round_to_tick(
+                                old_price + delta * f_move, tick)
+                            _retreated = True
+
+            if not _retreated:
+                if side == "BUY":
+                    jumped = inc_info["price"] + (tick * config.quoting.penny_jump_ticks)
+                else:
+                    jumped = inc_info["price"] - (tick * config.quoting.penny_jump_ticks)
+                adj = round_to_tick(jumped, tick)
 
         # Theo-aware aggression cap (defense vector #15, added 2026-04-09).
         # Never place a bid above (theo − min_edge) or an offer below
@@ -939,6 +971,8 @@ class QuoteManager:
                         # tracking entry so the latency ring isn't
                         # poisoned. The next cycle will retry.
                         self._pending_amend.pop(order_id, None)
+                    else:
+                        self._order_underlying[order_id] = self.market_data.state.underlying_price
                 except AssertionError:
                     # Race: wrapper.trades flipped to a DoneState between
                     # our liveness check and placeOrder. Drop tracking
@@ -1030,6 +1064,7 @@ class QuoteManager:
         if trade is None:
             return  # bucket dropped — next cycle re-attempts
         self.active_orders[key] = trade.order.orderId
+        self._order_underlying[trade.order.orderId] = self.market_data.state.underlying_price
         self._record_send_latency(strike, expiry, right, trade.order.orderId)
 
     @staticmethod
@@ -1269,6 +1304,7 @@ class QuoteManager:
             if trade is not None:
                 self._try_cancel_order(trade.order)
         self.active_orders.clear()
+        self._order_underlying.clear()
         logger.info("All quotes cancelled")
 
     def panic_cancel(self) -> None:
@@ -1301,6 +1337,7 @@ class QuoteManager:
         n = len(self.active_orders)
         self.active_orders.clear()
         self._pending_amend.clear()
+        self._order_underlying.clear()
         logger.critical("PANIC CANCEL: reqGlobalCancel sent, cleared %d local order refs", n)
 
     def _log_quote_telemetry(self, strike: float, right: str, side: str,

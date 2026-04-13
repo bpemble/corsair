@@ -102,6 +102,11 @@ quoting:
   # follow-up to small incumbent moves. Ported from corsair v1's tick-level
   # short-circuit (order_manager.py:188-205).
   min_modify_ticks: 2
+  # Delta-retreat: when F moves more than this many dollars since the order
+  # was last placed/modified, shift the resting price by delta × ΔF instead
+  # of penny-jumping the incumbent. Protects against AS during fast moves.
+  # Set to 0 to disable. Calibrated to ~2× the ETH p99 tick-to-tick ($4.25).
+  delta_retreat_threshold: 5.0
   # Outbound API token bucket (IBKR ~50 msg/sec hard throttle). 250 capacity
   # absorbs short bursts; 250/sec refill caps sustained rate at the throttle.
   # Modifies and cancels that exceed the bucket are silently dropped — the
@@ -139,7 +144,7 @@ operations:
 
 pricing:
   sabr_enabled: true
-  min_edge_points: 0.5        # Reject quote if our price is within $N of SABR theo.
+  min_edge_points: 1.0        # Reject quote if our price is within $N of SABR theo.
                               # Loosened from 1.0 to 0.5 (one tick) on 2026-04-08
                               # to test capture rate. SABR's structural fit residual
                               # is ~±$1, so the effective real-world edge floor is
