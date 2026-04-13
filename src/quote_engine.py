@@ -467,7 +467,7 @@ class QuoteManager:
         # fresh attempt every 60s. Adapts to changing margin conditions
         # (position closes, cash deposited, market moves) without restart.
         _now_mono = time.monotonic()
-        if _now_mono - self._margin_rejected_last_clear > 60.0:
+        if _now_mono - self._margin_rejected_last_clear > 300.0:
             self._margin_rejected.clear()
             self._margin_rejected_last_clear = _now_mono
 
