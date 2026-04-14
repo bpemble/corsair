@@ -414,10 +414,16 @@ class QuoteManager:
             or forward_move >= fast_recal_dollars
         )
         if should_recal:
-            self._last_sabr_attempt = now
-            self._last_sabr_forward = state.underlying_price
+            # Only advance the "attempted" clock when we actually submit.
+            # calibrate_async returns False if a prior recal is still in
+            # flight — in that case we want the next cycle to try again
+            # rather than waiting another 60s.
             self.sabr.set_expiries(state.expiries)
-            self.sabr.calibrate(state.underlying_price, state.options)
+            submitted = self.sabr.calibrate_async(
+                state.underlying_price, state.options)
+            if submitted:
+                self._last_sabr_attempt = now
+                self._last_sabr_forward = state.underlying_price
 
     def update_quotes(self, portfolio, dirty: Optional[set] = None):
         """Reprice and re-issue quotes.

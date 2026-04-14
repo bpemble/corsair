@@ -765,6 +765,16 @@ async def main():
         csv_logger.shutdown(timeout=5.0)
     except Exception as e:
         logger.warning("csv_logger shutdown error: %s", e)
+    # Stop SABR calibration pools (primary + per-product).
+    try:
+        sabr.shutdown()
+    except Exception:
+        pass
+    for obs in observers:
+        try:
+            obs["sabr"].shutdown()
+        except Exception:
+            pass
     logger.info("Corsair v2 shutdown complete.")
 
 

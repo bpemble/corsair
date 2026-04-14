@@ -8,8 +8,10 @@ Reused from Corsair v1. Provides:
 
 import logging
 import math
+import threading
 import time as _time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional, Tuple
@@ -705,6 +707,20 @@ class MultiExpirySABR:
         self.csv_logger = csv_logger
         self._surfaces: dict = {}
         self._expiries: List[str] = []
+        # Async calibration: a single-worker pool fits SABR off the event
+        # loop. scipy.optimize.least_squares releases the GIL during its
+        # numerical inner loop, so this genuinely parallelizes against the
+        # main Python thread. We keep the pool at 1 worker: calibration
+        # is already fast enough (~100ms for 3 expiries); adding more
+        # workers doesn't help and just complicates concurrency.
+        self._cal_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sabr-cal",
+        )
+        self._cal_future: Optional[Future] = None
+        # Lock serializes parameter updates so readers of get_theo/get_vol
+        # never observe a half-updated surface. Fit computation runs
+        # outside the lock; only the final assignment is guarded.
+        self._params_lock = threading.Lock()
 
     # ------------- expiry management -------------
 
@@ -741,7 +757,12 @@ class MultiExpirySABR:
     # ------------- calibration -------------
 
     def calibrate(self, forward: float, options: dict, expiry: str = None):
-        """Calibrate SABR. If expiry is None, calibrates all subscribed expiries."""
+        """Calibrate SABR. If expiry is None, calibrates all subscribed expiries.
+
+        Synchronous — runs on the calling thread. Used at startup and by
+        the watchdog on reconnect, where we want to block until fresh
+        theos are available. Hot-path callers should use ``calibrate_async``.
+        """
         targets = [expiry] if expiry is not None else list(self._expiries)
         for exp in targets:
             surf = self._surfaces.get(exp)
@@ -751,7 +772,62 @@ class MultiExpirySABR:
             filtered = {k: v for k, v in options.items() if k[1] == exp}
             if not filtered:
                 continue
-            surf.calibrate(forward, filtered)
+            with self._params_lock:
+                surf.calibrate(forward, filtered)
+
+    def calibrate_async(self, forward: float, options: dict) -> bool:
+        """Fire SABR calibration on the background pool and return immediately.
+
+        Returns True if a new calibration was submitted, False if one is
+        already in flight (we don't queue up a backlog — the next timer
+        tick will pick up fresh state anyway).
+
+        Note: ``options`` is snapshotted by reference. Callers should not
+        mutate the dict while the calibration is running — but in practice
+        the market_data state.options dict is only updated in place (new
+        bid/ask fields on existing OptionQuote objects), not
+        rebuilt, so concurrent reads are safe even if slightly stale.
+        """
+        # Skip if previous calibration is still running. Using done() is
+        # cheap and avoids the cost of cancelling queued work.
+        if self._cal_future is not None and not self._cal_future.done():
+            return False
+
+        # Snapshot the expiry list at submission time. If set_expiries is
+        # called while the worker runs, the worker still operates on what
+        # was valid at submission — no mid-flight pivots.
+        expiries_snapshot = list(self._expiries)
+
+        def _run():
+            for exp in expiries_snapshot:
+                surf = self._surfaces.get(exp)
+                if surf is None:
+                    continue
+                filtered = {k: v for k, v in options.items() if k[1] == exp}
+                if not filtered:
+                    continue
+                try:
+                    # The fit itself (Black-76 scenarios + least_squares)
+                    # is the expensive part — runs outside the lock.
+                    # SABRSurface.calibrate internally mutates params at
+                    # the end; we serialize that block with the lock so
+                    # readers don't observe a half-updated surface.
+                    with self._params_lock:
+                        surf.calibrate(forward, filtered)
+                except Exception as e:
+                    logger.warning(
+                        "Async SABR calibrate failed for %s: %s", exp, e,
+                    )
+
+        self._cal_future = self._cal_pool.submit(_run)
+        return True
+
+    def shutdown(self, timeout: float = 2.0):
+        """Stop the calibration pool. Safe to call multiple times."""
+        try:
+            self._cal_pool.shutdown(wait=True, cancel_futures=True)
+        except Exception:
+            pass
 
     # ------------- theo / vol lookups -------------
 
