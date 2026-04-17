@@ -80,7 +80,7 @@ STARTUP_RETRY_BACKOFF_SEC = (5, 10, 30, 60, 60)
 # gateway process; only a fresh container does. ~3 cycles ≈ 50s of trying.
 RECOVERY_FAILS_BEFORE_GATEWAY_RESTART = 3
 GATEWAY_CONTAINER_NAME = os.environ.get(
-    "CORSAIR_GATEWAY_CONTAINER", "corsair2-ib-gateway-1"
+    "CORSAIR_GATEWAY_CONTAINER", "corsair-ib-gateway-1"
 )
 # Seconds to wait after a container restart before resuming watchdog
 # health checks (gives the gateway JVM time to come up + IBC to log in).
@@ -429,7 +429,7 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                     cancelled = 0
                     for trade in ib.openTrades():
                         ref = getattr(trade.order, "orderRef", "") or ""
-                        if ref.startswith("corsair2"):
+                        if ref.startswith("corsair"):
                             try:
                                 ib.cancelOrder(trade.order)
                                 cancelled += 1

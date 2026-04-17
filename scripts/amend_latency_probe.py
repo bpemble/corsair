@@ -10,7 +10,7 @@ is paper-Gateway latency (in which case nothing client-side helps) or a
 corsair-side artifact (in which case we tune our own pipeline).
 
 Run via:
-    docker compose run --rm -v ~/corsair2/scripts:/app/scripts corsair \
+    docker compose run --rm -v ~/corsair/scripts:/app/scripts corsair \
         python3 /app/scripts/amend_latency_probe.py
 
 REQUIRES corsair to be stopped (clientId=0 conflict). Stop with:

@@ -15,10 +15,13 @@ import pytest
 from src.position_manager import PortfolioState, Position
 
 
-def _add(portfolio, strike, put_call, qty, delta=0.0, theta=0.0, vega=0.0):
+def _add(portfolio, strike, put_call, qty, delta=0.0, theta=0.0, vega=0.0,
+         product="ETHUSDRR", multiplier=50.0):
     portfolio.positions.append(Position(
+        product=product,
         strike=strike, expiry="20260424", put_call=put_call, quantity=qty,
         avg_fill_price=80.0, fill_time=datetime.now(),
+        multiplier=multiplier,
         delta=delta, gamma=0.0, theta=theta, vega=vega,
     ))
 
@@ -79,6 +82,7 @@ def _ib_pos(symbol, secType, right, strike, qty, expiry="20260424"):
 
 def test_seed_from_ibkr_keeps_eth_options_only(cfg):
     p = PortfolioState(cfg)
+    p.register_product("ETHUSDRR", 50.0, market_data=None, sabr=None)
     ib = _FakeIB([
         _ib_pos("ETHUSDRR", "FOP", "C", 2100, 1),
         _ib_pos("ETHUSDRR", "FOP", "P", 2050, 2),
@@ -93,10 +97,31 @@ def test_seed_from_ibkr_keeps_eth_options_only(cfg):
     assert all(pos.strike in (2100, 2050) for pos in p.positions)
 
 
+def test_seed_from_ibkr_multi_product(cfg):
+    """When multiple products are registered, seed must pick up all of them."""
+    p = PortfolioState(cfg)
+    p.register_product("ETHUSDRR", 50.0, market_data=None, sabr=None)
+    p.register_product("HG", 25000.0, market_data=None, sabr=None)
+    ib = _FakeIB([
+        _ib_pos("ETHUSDRR", "FOP", "C", 2100, 1),
+        _ib_pos("HG", "FOP", "P", 5.80, 5),
+        _ib_pos("HG", "FOP", "C", 6.20, -2),
+        _ib_pos("MCL", "FOP", "C", 95, 3),  # unregistered — drop
+    ])
+    seeded = p.seed_from_ibkr(ib, "U1234567")
+    assert seeded == 3
+    assert sum(1 for x in p.positions if x.product == "HG") == 2
+    assert sum(1 for x in p.positions if x.product == "ETHUSDRR") == 1
+    # Multipliers must propagate per-product
+    hg = [x for x in p.positions if x.product == "HG"][0]
+    assert hg.multiplier == 25000.0
+
+
 def test_seed_from_ibkr_is_idempotent(cfg):
     """Calling seed_from_ibkr twice (e.g., initial startup + watchdog
     reseed after a reconnect) must NOT double the position list."""
     p = PortfolioState(cfg)
+    p.register_product("ETHUSDRR", 50.0, market_data=None, sabr=None)
     ib = _FakeIB([
         _ib_pos("ETHUSDRR", "FOP", "C", 2100, 1),
         _ib_pos("ETHUSDRR", "FOP", "P", 2050, 2),

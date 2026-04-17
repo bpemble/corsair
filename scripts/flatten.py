@@ -5,7 +5,7 @@ configured product on the configured account (clears the per-contract
 working-order limit), then sends MARKET orders sized to take each position
 to zero.
 
-    docker compose run --rm -v ~/corsair2/scripts:/app/scripts corsair python3 /app/scripts/flatten.py
+    docker compose run --rm -v ~/corsair/scripts:/app/scripts corsair python3 /app/scripts/flatten.py
 
 DO NOT run while corsair is up — stop the corsair container first.
 """

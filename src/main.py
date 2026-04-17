@@ -24,7 +24,7 @@ from .utils import setup_logging
 from .connection import IBKRConnection
 from .market_data import MarketDataManager
 from .position_manager import PortfolioState
-from .constraint_checker import IBKRMarginChecker, ConstraintChecker
+from .constraint_checker import IBKRMarginChecker, ConstraintChecker, MarginCoordinator
 from .sabr import MultiExpirySABR
 from .quote_engine import QuoteManager
 from .fill_handler import FillHandler
@@ -106,23 +106,30 @@ def _reconcile_positions(portfolio, ib, account_id: str, config) -> list:
 
     Defense vector #9: catches the 2026-04-08 failure mode where order-status
     routing was broken and fills accumulated invisibly. Returns a list of
-    (strike, expiry, right) keys that disagree; empty list = clean.
+    (product, strike, expiry, right) keys that disagree; empty list = clean.
+
+    Multi-product: walks ib.positions(account) once and accepts any position
+    whose contract.symbol matches a product the portfolio knows about (i.e.
+    has been registered via portfolio.register_product). If we used the
+    primary product's underlying as the sole filter, HG positions would be
+    silently ignored — which is the exact bug that let 145 long HG puts
+    accumulate invisibly between 2026-04-13 evening and 2026-04-14 morning.
     """
-    underlying = config.product.underlying_symbol
+    known_products = set(portfolio.products())
     ours: dict = {}
     for p in portfolio.positions:
         if p.quantity != 0:
-            ours[(float(p.strike), p.expiry, p.put_call)] = int(p.quantity)
+            ours[(p.product, float(p.strike), p.expiry, p.put_call)] = int(p.quantity)
     theirs: dict = {}
     for ib_pos in ib.positions(account_id):
         c = ib_pos.contract
-        if c.symbol != underlying or c.secType != "FOP":
+        if c.symbol not in known_products or c.secType != "FOP":
             continue
         if not c.right or c.right not in ("C", "P"):
             continue
         qty = int(ib_pos.position)
         if qty != 0:
-            theirs[(float(c.strike), c.lastTradeDateOrContractMonth, c.right)] = qty
+            theirs[(c.symbol, float(c.strike), c.lastTradeDateOrContractMonth, c.right)] = qty
     mismatches = []
     for k in set(ours.keys()) | set(theirs.keys()):
         if ours.get(k, 0) != theirs.get(k, 0):
@@ -205,27 +212,52 @@ async def main():
     market_data = MarketDataManager(ib, config, csv_logger=csv_logger)
     portfolio = PortfolioState(config)
 
-    # Reconcile any existing option positions from IBKR for the configured product
+    sabr = MultiExpirySABR(config, csv_logger=csv_logger)
+    # Register the primary product so seed_from_ibkr knows to keep its
+    # positions. Each secondary (HG, etc.) engine registers its own
+    # product once its market_data is ready, then we re-seed across all
+    # products. seed_from_ibkr is idempotent (clears then refills).
+    portfolio.register_product(
+        config.product.underlying_symbol,
+        config.product.multiplier,
+        market_data, sabr,
+    )
+
+    # Initial primary-product seed. Re-run after observer setup so the
+    # full multi-product position book is in scope for ensure_position_*
+    # and the periodic reconcile.
     seeded = portfolio.seed_from_ibkr(ib, config.account.account_id)
     if seeded:
         logger.info("Reconciled %d existing %s option position(s) from IBKR",
                     seeded, config.product.underlying_symbol)
 
-    sabr = MultiExpirySABR(config, csv_logger=csv_logger)
     # SABR is passed to the margin checker so it can fall back to fitted vol
     # when a position's strike has no fresh bid/ask tick (otherwise positions
     # at quiet wing strikes get silently dropped from the SPAN calc).
     margin = IBKRMarginChecker(ib, config, market_data, portfolio, sabr=sabr,
                                csv_logger=csv_logger)
+    # MarginCoordinator owns IBKR account-value comm and cross-product
+    # synthetic→IBKR scale calibration. Per-product engines register here
+    # so their public margin APIs return COMBINED across-product numbers.
+    margin_coord = MarginCoordinator(ib, config.account.account_id,
+                                     csv_logger=csv_logger)
+    margin_coord.register(margin)
     constraint_checker = ConstraintChecker(margin, portfolio, config)
     quotes = QuoteManager(ib, config, market_data, sabr, constraint_checker,
                           csv_logger=csv_logger)
     # Back-reference so the trade-tape capture in market_data can look up
     # our resting state at print time.
     market_data.quotes = quotes
-    risk = RiskMonitor(portfolio, margin, quotes, csv_logger, config)
+    risk = RiskMonitor(portfolio, margin_coord, quotes, csv_logger, config)
+    # product_filter must be the IBKR underlying symbol (what
+    # fill.contract.symbol returns), NOT the option_symbol. Until 2026-04-14
+    # this was set to option_symbol and silently dropped every fill — which
+    # is how the system accumulated 5 orphan HG short calls in the 2-minute
+    # window between boot and the next reconcile. Fail-loud now via
+    # PortfolioState's add_fill product-registry warning if a stray fill
+    # ever does slip through with the wrong product key.
     fills = FillHandler(ib, portfolio, margin, quotes, market_data, csv_logger, config,
-                        product_filter=config.product.option_symbol)
+                        product_filter=config.product.underlying_symbol)
 
     # ── 4. Register disconnect callback ───────────────────────────────
     def on_disconnect():
@@ -266,7 +298,7 @@ async def main():
     logger.info("Stale-order sweep: %d trades visible in openTrades cache", len(snapshot))
     for trade in snapshot:
         ref = getattr(trade.order, "orderRef", "") or ""
-        if not ref.startswith("corsair2"):
+        if not ref.startswith("corsair"):
             continue
         status = getattr(getattr(trade, "orderStatus", None), "status", "") or ""
         if status not in _CANCELLABLE:
@@ -445,16 +477,30 @@ async def main():
 
             obs_sabr = MultiExpirySABR(obs_config)
             obs_sabr.set_expiries(obs_md.state.expiries)
-            # Shared margin checker and portfolio — margin is portfolio-level
+            # Register THIS product with the shared portfolio so subsequent
+            # seed_from_ibkr / refresh_greeks / reconcile pick up its
+            # positions (uses obs_md and obs_sabr for IV resolution and
+            # Greek calc). Skipping this is exactly the bug that let HG
+            # positions accumulate invisibly between 2026-04-13 evening
+            # and 2026-04-14 morning.
+            portfolio.register_product(
+                obs_config.product.underlying_symbol,
+                obs_config.product.multiplier,
+                obs_md, obs_sabr,
+            )
+            # Per-product synthetic SPAN engine (own scan ranges, own
+            # market_data, own multiplier). Registered with the shared
+            # MarginCoordinator so combined margin = sum across engines.
             obs_margin = IBKRMarginChecker(ib, obs_config, obs_md, portfolio,
                                            sabr=obs_sabr, csv_logger=csv_logger)
+            margin_coord.register(obs_margin)
             obs_cc = ConstraintChecker(obs_margin, portfolio, obs_config)
             obs_quotes = QuoteManager(ib, obs_config, obs_md, obs_sabr, obs_cc,
                                       csv_logger=csv_logger)
             obs_md.quotes = obs_quotes
             obs_fills = FillHandler(ib, portfolio, obs_margin, obs_quotes,
                                     obs_md, csv_logger, obs_config,
-                                    product_filter=obs_config.product.option_symbol)
+                                    product_filter=obs_config.product.underlying_symbol)
             logger.info(
                 "Product %s ready: underlying=%.4f, ATM=%.4f, "
                 "%d options, expiry=%s (quoting enabled)",
@@ -474,6 +520,50 @@ async def main():
         except Exception as e:
             logger.warning("Product %s setup failed: %s", obs_name, e)
 
+    # Multi-product reseed: now that every product has registered with the
+    # portfolio, re-run seed_from_ibkr to pick up positions for ALL products.
+    # The early seed above only saw the primary product. seed_from_ibkr is
+    # idempotent (clears + refills); refresh_greeks runs internally with
+    # each position dispatching to its registered market_data/sabr.
+    if observers:
+        try:
+            reseeded = portfolio.seed_from_ibkr(ib, config.account.account_id)
+            logger.info(
+                "Multi-product reseed across %d product(s): %d position(s) total",
+                len(portfolio.products()), reseeded,
+            )
+        except Exception as e:
+            logger.warning("Multi-product reseed failed: %s", e)
+
+        # Each observer gets its own missed-execution backfill — without
+        # this, HG fills landing during a disconnect window would be
+        # invisible to obs_fills (the live execDetailsEvent only fires
+        # while connected). The primary product's fills.replay above
+        # already handled ETH executions.
+        for obs in observers:
+            try:
+                replayed = await obs["fills"].replay_missed_executions(_session_start)
+                if replayed:
+                    logger.info(
+                        "Product %s: backfilled %d missed fill(s)",
+                        obs["name"], replayed,
+                    )
+            except Exception as e:
+                logger.warning("Product %s replay_missed_executions failed: %s",
+                               obs["name"], e)
+
+        # Off-window position subscriptions for each product's own
+        # market_data, so refresh_greeks gets fresh ticks for HG strikes
+        # held outside HG's initial discovery window.
+        for obs in observers:
+            try:
+                own_positions = portfolio.positions_for_product(
+                    obs["config"].product.underlying_symbol)
+                await obs["md"].ensure_position_subscribed(own_positions)
+            except Exception as e:
+                logger.warning("Product %s ensure_position_subscribed failed: %s",
+                               obs["name"], e)
+
     logger.info(
         "Entering event-driven quote loop (batch=%.0fms, fallback=%.1fs, snapshot=%.1fs)",
         batch_window_sec * 1000, fallback_interval, snapshot_interval,
@@ -482,8 +572,11 @@ async def main():
     # Launch the watchdog in the background. Detects connection loss and
     # silent gateway hangs; auto-reconnects with backoff. Survives the
     # lifetime of the main loop and is cancelled on shutdown.
+    # Pass the MarginCoordinator (not the per-product margin engine): its
+    # invalidate_portfolio() forwards to every registered engine, so a
+    # watchdog reseed evicts cross-product caches in one call.
     watchdog_task = asyncio.create_task(
-        watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
+        watchdog_loop(conn, market_data, quotes, portfolio, margin_coord, risk,
                       sabr, config.account.account_id, shutdown_event,
                       fills=fills,
                       session_start_fn=lambda: _session_start_utc(

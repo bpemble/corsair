@@ -26,11 +26,11 @@ def test_attrs_to_run_kwargs_minimal():
             'RestartPolicy': {'Name': 'unless-stopped', 'MaximumRetryCount': 0},
         },
         'Mounts': [],
-        'Name': '/corsair2-ib-gateway-1',
+        'Name': '/corsair-ib-gateway-1',
     }
     kwargs = watchdog._gateway_attrs_to_run_kwargs(attrs)
     assert kwargs['image'] == 'foo:latest'
-    assert kwargs['name'] == 'corsair2-ib-gateway-1'
+    assert kwargs['name'] == 'corsair-ib-gateway-1'
     assert kwargs['network_mode'] == 'host'
     assert kwargs['environment'] == ['A=1', 'B=2']
     assert kwargs['labels']['com.docker.compose.service'] == 'ib-gateway'
@@ -57,15 +57,15 @@ def test_attrs_to_run_kwargs_with_volume_and_healthcheck():
             'RestartPolicy': {'Name': 'no'},
         },
         'Mounts': [
-            {'Type': 'volume', 'Name': 'corsair2_ib-gateway-data',
+            {'Type': 'volume', 'Name': 'corsair_ib-gateway-data',
              'Destination': '/opt/ibgateway', 'RW': True},
             {'Type': 'bind', 'Source': '/host', 'Destination': '/in_container'},
         ],
-        'Name': '/corsair2-ib-gateway-1',
+        'Name': '/corsair-ib-gateway-1',
     }
     kwargs = watchdog._gateway_attrs_to_run_kwargs(attrs)
     assert kwargs['volumes'] == {
-        'corsair2_ib-gateway-data': {'bind': '/opt/ibgateway', 'mode': 'rw'},
+        'corsair_ib-gateway-data': {'bind': '/opt/ibgateway', 'mode': 'rw'},
     }
     # bind mount should NOT be in volume_binds
     assert len(kwargs['volumes']) == 1

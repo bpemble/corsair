@@ -19,6 +19,10 @@ class RiskMonitor:
 
     def __init__(self, portfolio, margin_checker, quote_manager, csv_logger, config):
         self.portfolio = portfolio
+        # Multi-product: this is normally a MarginCoordinator, which exposes
+        # combined-across-products get_current_margin() / update_cached_margin().
+        # The single-engine IBKRMarginChecker is also accepted (for tests /
+        # legacy paths) — both shape-compat the methods we call.
         self.margin = margin_checker
         self.quotes = quote_manager
         self.csv_logger = csv_logger
@@ -46,7 +50,38 @@ class RiskMonitor:
         current_margin = self.margin.get_current_margin()
         capital = self.config.constraints.capital
 
-        # Log risk snapshot
+        # Multi-product safety: compute per-product delta/vega/theta and
+        # take the worst (max abs / min). Mixing contract-equivalent
+        # numbers across products with different multipliers (ETH 50 vs
+        # HG 25000) is meaningless, so the kill switches gate on the
+        # most-exposed single product instead of a nonsense sum.
+        products = list(self.portfolio.products()) or ["__all__"]
+        worst_delta = 0.0
+        worst_delta_prod = ""
+        worst_vega = 0.0
+        worst_vega_prod = ""
+        worst_theta = 0.0  # most-negative
+        worst_theta_prod = ""
+        if products == ["__all__"]:
+            # No registry — fall back to global summed values (legacy single-
+            # product behavior). Safe in tests / single-product deployments.
+            worst_delta = self.portfolio.net_delta
+            worst_vega = self.portfolio.net_vega
+            worst_theta = self.portfolio.net_theta
+        else:
+            for prod in products:
+                d = self.portfolio.delta_for_product(prod)
+                v = self.portfolio.vega_for_product(prod)
+                t = self.portfolio.theta_for_product(prod)
+                if abs(d) > abs(worst_delta):
+                    worst_delta, worst_delta_prod = d, prod
+                if abs(v) > abs(worst_vega):
+                    worst_vega, worst_vega_prod = v, prod
+                if t < worst_theta:  # most-negative wins
+                    worst_theta, worst_theta_prod = t, prod
+
+        # Log risk snapshot — keep the global net_* fields so the CSV/dashboard
+        # historical schema doesn't change.
         self.csv_logger.log_risk_snapshot(
             underlying_price=market_state.underlying_price,
             margin_used=current_margin,
@@ -62,24 +97,27 @@ class RiskMonitor:
         )
 
         logger.info(
-            "RISK: margin=$%.0f (%.0f%%) delta=%.2f theta=$%.0f vega=$%.0f "
+            "RISK: margin=$%.0f (%.0f%%) worst_delta=%.2f[%s] "
+            "worst_theta=$%.0f[%s] worst_vega=$%.0f[%s] "
             "positions=%d (L%d/S%d) pnl=$%.0f",
             current_margin, (current_margin / capital * 100) if capital > 0 else 0,
-            self.portfolio.net_delta, self.portfolio.net_theta,
-            self.portfolio.net_vega, self.portfolio.gross_positions,
+            worst_delta, worst_delta_prod or "?",
+            worst_theta, worst_theta_prod or "?",
+            worst_vega, worst_vega_prod or "?",
+            self.portfolio.gross_positions,
             self.portfolio.long_count, self.portfolio.short_count,
             self.portfolio.compute_mtm_pnl(),
         )
 
-        # Kill switch checks
+        # Kill switch checks (per-product worst case)
         margin_kill = capital * self.config.kill_switch.margin_kill_pct
         if current_margin > margin_kill:
             self.kill(f"MARGIN KILL: ${current_margin:,.0f} > ${margin_kill:,.0f}")
             return
 
-        if abs(self.portfolio.net_delta) > self.config.kill_switch.delta_kill:
+        if abs(worst_delta) > self.config.kill_switch.delta_kill:
             self.kill(
-                f"DELTA KILL: {self.portfolio.net_delta:.2f} > "
+                f"DELTA KILL [{worst_delta_prod}]: {worst_delta:.2f} > "
                 f"±{self.config.kill_switch.delta_kill}"
             )
             return
@@ -87,9 +125,10 @@ class RiskMonitor:
         # Vega kill switch (Stage 1+). Vega is the largest unmodeled risk
         # at production scale; bound it explicitly.
         vega_kill = float(getattr(self.config.kill_switch, "vega_kill", 0) or 0)
-        if vega_kill > 0 and abs(self.portfolio.net_vega) > vega_kill:
+        if vega_kill > 0 and abs(worst_vega) > vega_kill:
             self.kill(
-                f"VEGA KILL: ${self.portfolio.net_vega:+,.0f} > ±${vega_kill:,.0f}"
+                f"VEGA KILL [{worst_vega_prod}]: ${worst_vega:+,.0f} > "
+                f"±${vega_kill:,.0f}"
             )
             return
 

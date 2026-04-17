@@ -95,6 +95,7 @@ def test_combined_delta_breach_from_calls_rejects(cfg, portfolio):
     """A fill that pushes COMBINED net_delta past +3.0 must be rejected,
     even if the breach comes from the call side alone."""
     portfolio.positions.append(Position(
+        product="ETHUSDRR", multiplier=50.0,
         strike=2100, expiry="20260424", put_call="C", quantity=1,
         avg_fill_price=80.0, fill_time=None,
         delta=2.8, gamma=0, theta=0, vega=0,
@@ -112,11 +113,13 @@ def test_combined_delta_offsetting_puts_allow_call(cfg, portfolio):
     bucket, allowing additional call fills the per-side model would reject."""
     # +2.5 calls + (-1.0) puts = +1.5 net, well within ±3.0
     portfolio.positions.append(Position(
+        product="ETHUSDRR", multiplier=50.0,
         strike=2100, expiry="20260424", put_call="C", quantity=1,
         avg_fill_price=80.0, fill_time=None,
         delta=2.5, gamma=0, theta=0, vega=0,
     ))
     portfolio.positions.append(Position(
+        product="ETHUSDRR", multiplier=50.0,
         strike=2050, expiry="20260424", put_call="P", quantity=1,
         avg_fill_price=80.0, fill_time=None,
         delta=-1.0, gamma=0, theta=0, vega=0,
@@ -133,6 +136,7 @@ def test_combined_delta_offsetting_puts_allow_call(cfg, portfolio):
 def test_combined_theta_breach_rejects(cfg, portfolio):
     """Combined theta floor at -200 should reject fills that deepen below it."""
     portfolio.positions.append(Position(
+        product="ETHUSDRR", multiplier=50.0,
         strike=2100, expiry="20260424", put_call="C", quantity=1,
         avg_fill_price=80.0, fill_time=None,
         delta=0.5, gamma=0, theta=-180, vega=0,
@@ -153,11 +157,13 @@ def test_combined_theta_offsetting_short_puts_allow_long_call(cfg, portfolio):
     #   already, so adding a short with theta=-3 → +3 contribution.
     # Net: -180 + 30 = -150 (using 10 short puts at theta=-3 each)
     portfolio.positions.append(Position(
+        product="ETHUSDRR", multiplier=50.0,
         strike=2100, expiry="20260424", put_call="C", quantity=1,
         avg_fill_price=80.0, fill_time=None,
         delta=0.5, gamma=0, theta=-180, vega=0,
     ))
     portfolio.positions.append(Position(
+        product="ETHUSDRR", multiplier=50.0,
         strike=2050, expiry="20260424", put_call="P", quantity=-10,
         avg_fill_price=5.0, fill_time=None,
         delta=-0.1, gamma=0, theta=-3, vega=0,

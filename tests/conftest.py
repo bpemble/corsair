@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for corsair2 tests.
+"""Shared pytest fixtures for corsair tests.
 
 Provides:
   - cfg: a SimpleNamespace config matching the production YAML schema, with

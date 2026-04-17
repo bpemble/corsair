@@ -15,6 +15,7 @@ from typing import Deque, Dict, Optional, Tuple
 from ib_insync import IB, LimitOrder
 
 from .discord_notify import send_alert
+from .sabr import delta_adjust_theo
 from ib_insync.order import OrderStatus
 from ib_insync.util import UNSET_DOUBLE, UNSET_INTEGER
 
@@ -81,7 +82,7 @@ class TokenBucket:
         return self._tokens
 
 OrderKey = Tuple[float, str, str, str]  # (strike, expiry, right, side)
-ORDER_REF_PREFIX = "corsair2"
+ORDER_REF_PREFIX = "corsair"
 
 
 def resolve_enabled_expiries(tokens, subscribed: list) -> list:
@@ -253,13 +254,13 @@ class QuoteManager:
         # orderIds we've already extracted RTT for (so we don't double-count
         # on subsequent snapshot passes).
         self._rtt_captured_oids: set = set()
-        # Modify-storm guard (defense vector #14): per-orderId rolling
-        # window of recent modify send timestamps (monotonic ns). When a
-        # single order receives more than max_modifies_per_sec_per_oid
-        # modifies in 1s we cancel-replace instead of issuing more amends.
-        # Without this guard a tight reprice loop on a flickering BBO can
-        # generate Error 103 cascades and zombie the order.
-        self._modify_times_per_oid: Dict[int, Deque[int]] = {}
+        # Modify-storm guard (defense vector #14): per-(strike,expiry,right,side)
+        # rolling window of recent modify send timestamps (monotonic ns). Keyed
+        # on the side, not orderId, so cancel-replace doesn't reset the throttle
+        # and let us churn out orderIds at the same effective message rate.
+        # Old single-order behavior is preserved by virtue of being a strict
+        # subset (one orderId per side at a time).
+        self._modify_times_per_side: Dict[OrderKey, Deque[int]] = {}
         self._max_modifies_per_sec_per_oid = int(getattr(
             config.quoting, "max_modifies_per_sec_per_oid", 5))
         # Global per-side resting-order cap (defense vector #11). Hard
@@ -513,8 +514,16 @@ class QuoteManager:
                                       * float(config.constraints.margin_ceiling_pct))
         self._cycle_cur_margin = self.constraint_checker.margin.get_current_margin()
 
+        # Force full re-eval for any expiry whose surface refitted since the
+        # last cycle. Without this, a resting order placed against the
+        # pre-refit theo can stay below the new min_edge floor for the
+        # entire ~250-500ms amend RTT window.
+        refit_expiries = self.sabr.consume_refit_pending()
+
         for exp, pairs in per_expiry_quotable.items():
-            if dirty is not None:
+            if exp in refit_expiries:
+                iter_pairs = pairs
+            elif dirty is not None:
                 # Dirty may be either (strike, right) or (strike, exp, right).
                 # Support both shapes so event-driven callers that are not
                 # expiry-aware keep working.
@@ -601,13 +610,9 @@ class QuoteManager:
         config = self.config
         tick = config.quoting.tick_size
 
-        # Delta-based instant reprice: adjust theo for underlying movement
-        # since the last SVI/SABR calibration. First-order Taylor expansion
-        # collapses repricing latency from ~300ms (full recal) to <1ms.
         if theo is not None and option is not None:
-            delta = option.delta
-            if delta != 0 and cal_forward > 0 and current_underlying > 0:
-                theo = max(theo + delta * (current_underlying - cal_forward), 0.01)
+            theo = delta_adjust_theo(theo, option.delta,
+                                     cal_forward, current_underlying)
 
         # Skip-reason gate from market_data
         #
@@ -793,7 +798,7 @@ class QuoteManager:
         )
         if can_quote:
             self._send_or_update(strike, expiry, right, side, adj,
-                                 config.product.quote_size, option)
+                                 config.product.quote_size, option, theo=theo)
             self._log_quote_telemetry(strike, right, side, adj, inc_info, theo=theo)
         else:
             self._cancel_quote(strike, expiry, right, side)
@@ -894,8 +899,15 @@ class QuoteManager:
         return trade.orderStatus.status not in OrderStatus.DoneStates
 
     def _send_or_update(self, strike: float, expiry: str, right: str, side: str,
-                        price: float, qty: int, option):
-        """Send new order or modify existing if price changed."""
+                        price: float, qty: int, option, theo: float = None):
+        """Send new order or modify existing if price changed.
+
+        ``theo`` enables a dead-band bypass: if the resting price violates
+        the min_edge floor against current theo, modify even when the
+        price delta is below min_modify_ticks. Without this the SABR refit
+        can drop theo by 1 tick and our 1-tick price correction gets
+        suppressed by the noise filter.
+        """
         key = (strike, expiry, right, side)
         contract = option.contract
 
@@ -921,40 +933,50 @@ class QuoteManager:
                 self.active_orders.pop(key, None)
                 self._pending_amend.pop(order_id, None)
             elif trade.order.lmtPrice != price:
-                # Modify-storm guard (defense vector #14). If we've already
-                # sent more than N modifies on this orderId in the last
-                # second, stop amending and force a cancel-replace on the
-                # next cycle. Bounds blast radius of any future regression
-                # in the modify hot path (the area touched by fa2fb16 /
-                # 3a391d2 / d54e60d) without needing to reason about why
-                # the loop is hot.
+                # Modify-storm guard (defense vector #14). Per (strike, expiry,
+                # right, side) so cancel-replace doesn't reset and let us hit
+                # the same effective message rate under a fresh orderId. When
+                # the window saturates we skip the modify entirely (instead of
+                # cancel-replace) — the next quote cycle re-evaluates and
+                # prior cancel-replace was already churning oids at IBKR.
                 now_ns_storm = time.monotonic_ns()
-                window = self._modify_times_per_oid.get(order_id)
+                window = self._modify_times_per_side.get(key)
                 if window is None:
                     window = deque(maxlen=16)
-                    self._modify_times_per_oid[order_id] = window
+                    self._modify_times_per_side[key] = window
                 cutoff = now_ns_storm - 1_000_000_000
                 while window and window[0] < cutoff:
                     window.popleft()
                 if len(window) >= self._max_modifies_per_sec_per_oid:
                     logger.warning(
                         "Modify storm on %s%s %s oid=%d (%d modifies/sec) — "
-                        "cancel-replace",
+                        "skip",
                         int(strike), right, side, order_id, len(window),
                     )
-                    self._cancel_quote(strike, expiry, right, side)
-                    self._modify_times_per_oid.pop(order_id, None)
                     return
                 window.append(now_ns_storm)
                 # Dead-band: skip a re-price unless the new target moves
                 # the resting order by at least min_modify_ticks. This
                 # suppresses 1-tick noise from a flickering BBO without
-                # giving up the leading position. Combined with the
-                # token bucket, this is the main lever cutting our API
-                # message rate below the IBKR throttle. Ported from v1.
+                # giving up the leading position.
+                #
+                # Bypass the dead-band when the *current* resting price
+                # violates min_edge against current theo — otherwise a
+                # 1-tick theo drop after our last modify leaves the order
+                # below the floor, and the very correction that would clear
+                # it gets suppressed as "noise."
                 tick = self.config.quoting.tick_size
                 min_dt = float(getattr(self.config.quoting, "min_modify_ticks", 1))
-                if abs(price - trade.order.lmtPrice) < (min_dt * tick - 1e-9):
+                edge_violation = False
+                if theo is not None and self.config.pricing.min_edge_points > 0:
+                    edge = self.config.pricing.min_edge_points
+                    cur = trade.order.lmtPrice
+                    edge_violation = (
+                        (side == "BUY" and cur > theo - edge)
+                        or (side == "SELL" and cur < theo + edge)
+                    )
+                if (not edge_violation
+                        and abs(price - trade.order.lmtPrice) < (min_dt * tick - 1e-9)):
                     return  # within dead-band, leave the resting order alone
                 # Modify-too-soon guard: don't amend an order that IBKR
                 # hasn't acknowledged yet. If we send a modify while the
@@ -1283,17 +1305,19 @@ class QuoteManager:
             logger.warning("_on_ib_error cleanup failed: %s", e)
 
     def get_latency_snapshot(self) -> dict:
-        """Return rolling p50/p90/p99 in microseconds for TTT, RTT, and amend."""
+        """Return rolling percentiles (microseconds) for TTT, RTT, and amend."""
         def stats(buf):
             if not buf:
-                return {"n": 0, "p50": None, "p90": None, "p99": None}
+                return {"n": 0, "p10": None, "p25": None, "p50": None,
+                        "p75": None, "p90": None, "p99": None, "min": None, "max": None}
             s = sorted(buf)
             n = len(s)
+            def pct(q):
+                return s[min(n - 1, int(n * q))]
             return {
-                "n": n,
-                "p50": s[min(n - 1, int(n * 0.50))],
-                "p90": s[min(n - 1, int(n * 0.90))],
-                "p99": s[min(n - 1, int(n * 0.99))],
+                "n": n, "min": s[0], "max": s[-1],
+                "p10": pct(0.10), "p25": pct(0.25), "p50": pct(0.50),
+                "p75": pct(0.75), "p90": pct(0.90), "p99": pct(0.99),
             }
         return {
             "ttt_us": stats(self._ttt_us),

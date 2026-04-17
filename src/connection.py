@@ -118,16 +118,27 @@ class IBKRConnection:
             # return its key so the callback updates it in place instead
             # of creating a duplicate.
             _orig_orderKey = ib.wrapper.orderKey
+            # Side-index: orderId -> wrapper.trades key. Avoids re-scanning
+            # ib.wrapper.trades on every order event after the first FA
+            # rewrite is resolved. wrapper.trades grows unboundedly across
+            # a session (completed/cancelled orders are retained), so the
+            # naive O(N) fallback was hot in py-spy after a few hours.
+            _fa_orderid_idx: dict = {}
 
             def _fa_orderKey(clientId_cb, orderId_cb, permId_cb):
                 key = _orig_orderKey(clientId_cb, orderId_cb, permId_cb)
-                if key not in ib.wrapper.trades and orderId_cb > 0:
-                    # orderId-only fallback: find an existing Trade whose
-                    # orderId matches, regardless of clientId.
-                    for existing_key, t in ib.wrapper.trades.items():
-                        if (isinstance(existing_key, tuple)
-                                and t.order.orderId == orderId_cb):
-                            return existing_key
+                if key in ib.wrapper.trades:
+                    return key
+                if orderId_cb <= 0:
+                    return key
+                cached = _fa_orderid_idx.get(orderId_cb)
+                if cached is not None and cached in ib.wrapper.trades:
+                    return cached
+                for existing_key, t in ib.wrapper.trades.items():
+                    if (isinstance(existing_key, tuple)
+                            and t.order.orderId == orderId_cb):
+                        _fa_orderid_idx[orderId_cb] = existing_key
+                        return existing_key
                 return key
 
             ib.wrapper.orderKey = _fa_orderKey

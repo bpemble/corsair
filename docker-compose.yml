@@ -1,3 +1,5 @@
+name: corsair
+
 services:
   # ── IB Gateway (Paper) ──────────────────────────────────────────────
   # IBC auto-starts IB Gateway and handles the mandatory daily restart.

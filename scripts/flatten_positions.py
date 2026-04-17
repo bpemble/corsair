@@ -6,7 +6,7 @@ Usage (from inside the corsair container with ib_insync available):
     python3 /app/scripts/flatten_positions.py
 
 Or via docker:
-    docker run --rm --network host -v $PWD:/app corsair2-corsair \
+    docker run --rm --network host -v $PWD:/app corsair-corsair \
         python3 /app/scripts/flatten_positions.py
 """
 
@@ -78,7 +78,7 @@ async def main():
             action=action,
             totalQuantity=abs(qty),
             account=acct,
-            orderRef="corsair2_flatten",
+            orderRef="corsair_flatten",
         )
         trade = ib.placeOrder(c, order)
         trades.append(trade)

@@ -13,6 +13,8 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
+from .sabr import delta_adjust_theo
+
 logger = logging.getLogger(__name__)
 
 # Default snapshot path — overridable via config.logging.snapshot_path for
@@ -54,8 +56,16 @@ def _read_account_state(ib, account_id: str) -> dict:
 
 
 def _build_side(state, market_data, sabr, portfolio, active_quotes,
-                strike: float, right: str, expiry: str = None) -> Optional[dict]:
-    """Build the per-right block for one strike, or None if no contract."""
+                strike: float, right: str, expiry: str = None,
+                product: Optional[str] = None) -> Optional[dict]:
+    """Build the per-right block for one strike, or None if no contract.
+
+    ``product`` (multi-product): when set, only positions tagged with this
+    underlying symbol contribute to the per-strike position count. ETH and
+    HG can in principle share strike numbers; the filter prevents an ETH
+    position from showing up in the HG dashboard's strike row (or vice
+    versa).
+    """
     if expiry is None:
         expiry = state.front_month_expiry
     opt = state.get_option(strike, expiry=expiry, right=right)
@@ -77,13 +87,18 @@ def _build_side(state, market_data, sabr, portfolio, active_quotes,
     _last_cal = sabr.get_last_calibration(expiry)
     if _last_cal is not None:
         try:
-            theo = round(sabr.get_theo(strike, right, expiry=expiry), 4)
+            theo = delta_adjust_theo(
+                sabr.get_theo(strike, right, expiry=expiry),
+                opt.delta, sabr.get_forward(expiry), state.underlying_price,
+            )
+            theo = round(theo, 4)
         except Exception:
             pass
     pos = sum(
         p.quantity for p in portfolio.positions
         if p.strike == strike and p.expiry == expiry
         and p.put_call == right
+        and (product is None or p.product == product)
     )
     if bid_live or ask_live:
         status = "quoting"
@@ -113,10 +128,19 @@ def _build_side(state, market_data, sabr, portfolio, active_quotes,
 
 def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
                          ib, account_id, config):
-    """Write a JSON snapshot of the full option chain for the dashboard."""
+    """Write a JSON snapshot of the full option chain for the dashboard.
+
+    Multi-product: every per-product invocation (primary + each observer)
+    filters portfolio.positions to its own product so the dashboard
+    table doesn't mix HG and ETH rows. Uses each position's own
+    ``multiplier`` for MtM math so a 25000-multiplier HG row doesn't get
+    rendered with ETH's 50, or vice versa.
+    """
     state = market_data.state
     if state.underlying_price <= 0:
         return
+
+    product = config.product.underlying_symbol
 
     active_quotes = quotes.get_active_quotes()
     chains_data: dict = {}
@@ -127,8 +151,12 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         exp_strikes: dict = {}
         for strike in state.get_all_strikes(expiry=exp):
             block = {
-                "call": _build_side(state, market_data, sabr, portfolio, active_quotes, strike, "C", expiry=exp),
-                "put": _build_side(state, market_data, sabr, portfolio, active_quotes, strike, "P", expiry=exp),
+                "call": _build_side(state, market_data, sabr, portfolio,
+                                    active_quotes, strike, "C",
+                                    expiry=exp, product=product),
+                "put": _build_side(state, market_data, sabr, portfolio,
+                                   active_quotes, strike, "P",
+                                   expiry=exp, product=product),
             }
             if block["call"] is None and block["put"] is None:
                 continue
@@ -145,10 +173,17 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
     # bid/ask for this strike (just-subscribed, mid-rotation, etc.), fall
     # back to the avg fill price so unrealized_pnl reads as 0 instead of a
     # nonsensical "compared to zero mark" number.
-    mult = config.product.multiplier
+    #
+    # Multi-product: use pos.multiplier (per-position) — using
+    # config.product.multiplier here would render HG positions with ETH's
+    # 50× when this function is called for the ETH dashboard, or render
+    # ETH positions with HG's 25000× when called for the HG dashboard.
+    # The product filter below also keeps the wrong-product rows out of
+    # the table entirely.
     positions_detail = []
     options_unrealized_total = 0.0
-    for p in portfolio.positions:
+    own_positions = [p for p in portfolio.positions if p.product == product]
+    for p in own_positions:
         opt = state.get_option(p.strike, p.expiry, p.put_call)
         if opt and opt.bid > 0 and opt.ask > 0:
             mark = (opt.bid + opt.ask) / 2
@@ -156,7 +191,7 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
             mark = p.current_price
         else:
             mark = p.avg_fill_price  # no live mark yet; show zero P&L
-        unrealized = (mark - p.avg_fill_price) * p.quantity * mult
+        unrealized = (mark - p.avg_fill_price) * p.quantity * p.multiplier
         options_unrealized_total += unrealized
         positions_detail.append({
             "strike": p.strike,
@@ -211,6 +246,17 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         portfolio.realized_pnl_persisted = _ibkr_realized
     account["realized_pnl"] = round(portfolio.realized_pnl_persisted, 2)
 
+    # Per-product portfolio aggregates: each dashboard shows only its own
+    # product's risk numbers (mixing ETH and HG contract-equivalent delta
+    # in a "net_delta" field is meaningless given different multipliers).
+    # ``margin`` stays cross-product (it's the combined number gating the
+    # constraint check, and that's what the operator wants to see).
+    own_calls = [p for p in own_positions if p.put_call == "C"]
+    own_puts = [p for p in own_positions if p.put_call == "P"]
+
+    def _agg(group, attr):
+        return sum(getattr(p, attr) * p.quantity for p in group)
+
     snapshot = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "underlying_price": state.underlying_price,
@@ -222,29 +268,29 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         "latency": quotes.get_latency_snapshot(),
         "limits": limits,
         "portfolio": {
-            "net_delta": round(portfolio.net_delta, 4),
-            "net_theta": round(portfolio.net_theta, 2),
-            "net_vega": round(portfolio.net_vega, 2),
-            "net_gamma": round(portfolio.net_gamma, 6),
-            "total_contracts": portfolio.gross_positions,
+            "net_delta": round(portfolio.delta_for_product(product), 4),
+            "net_theta": round(portfolio.theta_for_product(product), 2),
+            "net_vega": round(portfolio.vega_for_product(product), 2),
+            "net_gamma": round(_agg(own_positions, "gamma"), 6),
+            "total_contracts": sum(abs(p.quantity) for p in own_positions),
             "margin": _margin_total,
             "fills_today": portfolio.fills_today,
             "spread_capture": round(portfolio.spread_capture_today, 2),
             "spread_capture_mid": round(portfolio.spread_capture_mid_today, 2),
             "positions": positions_detail,
             "calls": {
-                "delta": round(portfolio.delta_for("C"), 4),
-                "theta": round(portfolio.theta_for("C"), 2),
-                "vega": round(portfolio.vega_for("C"), 2),
+                "delta": round(_agg(own_calls, "delta"), 4),
+                "theta": round(_agg(own_calls, "theta"), 2),
+                "vega": round(_agg(own_calls, "vega"), 2),
                 "margin": round(_margin_calls, 0),
-                "gross": portfolio.gross_for("C"),
+                "gross": sum(abs(p.quantity) for p in own_calls),
             },
             "puts": {
-                "delta": round(portfolio.delta_for("P"), 4),
-                "theta": round(portfolio.theta_for("P"), 2),
-                "vega": round(portfolio.vega_for("P"), 2),
+                "delta": round(_agg(own_puts, "delta"), 4),
+                "theta": round(_agg(own_puts, "theta"), 2),
+                "vega": round(_agg(own_puts, "vega"), 2),
                 "margin": round(_margin_puts, 0),
-                "gross": portfolio.gross_for("P"),
+                "gross": sum(abs(p.quantity) for p in own_puts),
             },
         },
         "strikes": strikes_data,

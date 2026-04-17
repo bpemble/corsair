@@ -38,12 +38,20 @@ def send_fill_notification(
 
     right_label = "P" if put_call == "P" else "C"
     exp_short = f"{expiry[4:6]}/{expiry[6:8]}"
-    spread = f"{market_bid:.1f} / {market_ask:.1f}" if market_bid > 0 and market_ask > 0 else "—"
-    theo_str = f"{theo:.2f}" if theo and theo > 0 else "—"
+
+    # Adaptive precision: HG strikes (~$5-7) and prices (~$0.04) need
+    # decimals; ETH strikes (~$2400) and prices (~$80) don't. int(strike)
+    # used to truncate "6.25" → "6" so multiple HG strikes appeared
+    # identical in Discord. Same with .2f on sub-dollar prices.
+    strike_str = (f"{strike:g}" if strike != int(strike) else str(int(strike)))
+    px_fmt = (lambda v: f"{v:.4f}") if abs(fill_price) < 1 else (lambda v: f"{v:.2f}")
+    bbo_fmt = (lambda v: f"{v:.4f}") if (market_bid and abs(market_bid) < 1) else (lambda v: f"{v:.2f}")
+    spread = f"{bbo_fmt(market_bid)} / {bbo_fmt(market_ask)}" if market_bid > 0 and market_ask > 0 else "—"
+    theo_str = px_fmt(theo) if theo and theo > 0 else "—"
     edge_str = f"${spread_captured:+.0f}" if spread_captured != 0 else "$0"
 
     embed = {
-        "title": f"{'🟢' if side == 'BOUGHT' else '🔴'} {side} {quantity} × {int(strike)}{right_label} @ {fill_price:.2f}",
+        "title": f"{'🟢' if side == 'BOUGHT' else '🔴'} {side} {quantity} × {strike_str}{right_label} @ {px_fmt(fill_price)}",
         "color": 0x2ECC71 if side == "BOUGHT" else 0xE74C3C,
         "fields": [
             {"name": "Expiry", "value": exp_short, "inline": True},

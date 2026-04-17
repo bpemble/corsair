@@ -35,6 +35,12 @@ class FillHandler:
         # contract.symbol matches. Enables multi-product routing where
         # each FillHandler instance handles its own product's fills.
         self._product_filter = product_filter
+        # Multi-product portfolio key — the IBKR underlying symbol
+        # (e.g. "ETHUSDRR" or "HG") that the portfolio uses to route
+        # add_fill into the right multiplier/registry. Distinct from
+        # _product_filter (which is option_symbol — what fill events come
+        # back tagged with).
+        self._product_key = config.product.underlying_symbol
 
         # Register fill callback
         self.ib.execDetailsEvent += self._on_exec_details
@@ -104,7 +110,13 @@ class FillHandler:
         # don't pollute the running totals with a fake number; fills_today
         # still increments so the count is right, only the per-fill edge is
         # absent. Users can backfill manually from fills.csv if needed.
-        mult = self.portfolio._multiplier
+        # Per-product multiplier (FillHandler is per-product; PortfolioState's
+        # legacy ``_multiplier`` attribute was removed in the 2026-04-14
+        # multi-product refactor — each Position now carries its own).
+        # Reading the missing attribute used to raise AttributeError, which
+        # the surrounding try/except swallowed silently → every fill was
+        # being lost AFTER passing the product filter and dedup.
+        mult = self.config.product.multiplier
         sign = 1 if quantity > 0 else -1  # buy: want fill < ref; sell: want fill > ref
 
         spread_captured_theo = 0.0
@@ -147,6 +159,7 @@ class FillHandler:
         # and the reconciler immediately kills on the resulting mismatch.
         if trade is not None:
             self.portfolio.add_fill(
+                product=self._product_key,
                 strike=strike, expiry=expiry, put_call=put_call,
                 quantity=quantity, fill_price=fill_price,
                 spread_captured=spread_captured_theo,
@@ -170,10 +183,12 @@ class FillHandler:
         except Exception:
             logger.exception("refresh_greeks after fill failed")
 
-        # Log
+        # Log — adaptive precision for sub-dollar (HG) vs dollar (ETH) strikes/prices
+        _strike_str = (f"{strike:g}" if strike != int(strike) else str(int(strike)))
+        _px_str = (f"{fill_price:.4f}" if abs(fill_price) < 1 else f"{fill_price:.2f}")
         logger.info(
-            "FILL: %s %d %s%.0f@%.2f | margin=$%.0f delta=%.2f theta=$%.0f | fills_today=%d",
-            side, abs(quantity), put_call, strike, fill_price,
+            "FILL: %s %d %s%s@%s | margin=$%.0f delta=%.2f theta=$%.0f | fills_today=%d",
+            side, abs(quantity), put_call, _strike_str, _px_str,
             self.margin.get_current_margin(),
             self.portfolio.net_delta,
             self.portfolio.net_theta,

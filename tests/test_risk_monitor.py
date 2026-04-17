@@ -47,6 +47,7 @@ def _state(F=2100.0):
 
 def _add(p, qty, delta=0, theta=0, vega=0):
     p.positions.append(Position(
+        product="ETHUSDRR", multiplier=50.0,
         strike=2100, expiry="20260424", put_call="C", quantity=qty,
         avg_fill_price=0.0, fill_time=datetime.now(),
         delta=delta, gamma=0, theta=theta, vega=vega,
@@ -80,6 +81,7 @@ def test_vega_kill_uses_combined_net_vega(cfg):
     portfolio = PortfolioState(cfg)
     _add(portfolio, qty=1, vega=600)  # +600
     portfolio.positions.append(Position(
+        product="ETHUSDRR", multiplier=50.0,
         strike=2050, expiry="20260424", put_call="P", quantity=1,
         avg_fill_price=5.0, fill_time=datetime.now(),
         delta=-0.1, gamma=0, theta=0, vega=600,

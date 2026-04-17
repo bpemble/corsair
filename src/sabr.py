@@ -8,10 +8,11 @@ Reused from Corsair v1. Provides:
 
 import logging
 import math
+import multiprocessing
 import threading
 import time as _time
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional, Tuple
@@ -430,203 +431,20 @@ class SABRSurface:
         self.params: Optional[SABRParams] = None
         self._front_month_expiry: Optional[str] = None
         self._theo_cache: dict = {}
-        self._theo_cache_ttl_sec: float = 0.1
+        # fit() clears this cache on every surface update, so real
+        # invalidation is event-driven; the TTL is just a ceiling. 100ms was
+        # shorter than the 250ms snapshot interval so every dashboard build
+        # missed and recomputed scipy.norm.cdf for ~294 options/cycle.
+        self._theo_cache_ttl_sec: float = 5.0
+        # is_quote_stale caches: quote-engine hot path was running brentq
+        # implied_vol solve (~20-40 scipy.norm.cdf calls) per option per
+        # cycle, pegging the event loop and backing up IBKR acks.
+        self._iv_cache: dict = {}
+        self._iv_cache_ttl_sec: float = 2.0
 
     def set_expiry(self, expiry: str):
         """Set the front month expiry for TTE calculations."""
         self._front_month_expiry = expiry
-
-    def calibrate(self, forward: float, options: dict):
-        """Calibrate SABR parameters to current option chain.
-
-        Args:
-            forward: Current underlying futures price (used as the fallback
-                forward and as the outlier reference for parity derivation).
-            options: Dict of {(strike, expiry, right): OptionQuote} with
-                .iv, .bid, .ask, .strike, .put_call attributes.
-        """
-        # Drop strikes with wide BBOs from calibration — synthetic mids on
-        # illiquid (typically deep ITM/OTM) strikes inject garbage IVs that
-        # bias the entire fit. ETH options at this point have widths $5-8 on
-        # liquid strikes vs $30+ on illiquid ones, so a $10 cutoff cleanly
-        # separates them.
-        max_cal_width = float(getattr(self.config.pricing, "max_calibration_bbo_width", 10.0))
-
-        # Blend futures mid with parity-implied forward. Pure futures mid
-        # underprices near-ATM puts (~-$2.50); pure parity overprices OTM
-        # puts (~+$3). The 50/50 blend centers the residuals across both
-        # zones. The parity premium in crypto reflects call demand skew,
-        # not a real forward offset — splitting the difference acknowledges
-        # both signals without committing fully to either.
-        implied = implied_forward_from_parity(
-            options, ref_forward=forward, max_spread=max_cal_width,
-        )
-        if implied is not None:
-            if abs(implied - forward) > 1.0:
-                logger.info(
-                    "SABR forward: futures-mid=%.2f, parity-implied=%.2f (Δ=%+.2f)",
-                    forward, implied, implied - forward,
-                )
-            forward = (forward + implied) / 2.0
-        self.forward = forward
-
-        tte = self._get_tte()
-        if tte <= 0:
-            return
-
-        # Per-side calibration: fit calls and puts independently so each
-        # side gets its own alpha/rho/nu. A single 3-parameter fit across
-        # both sides forces SABR to compromise between two different skew
-        # shapes, producing systematic bias on OTM puts.
-        min_strikes = int(getattr(self.config.pricing, "sabr_min_strikes", 8))
-        max_rmse = self.config.pricing.sabr_max_rmse
-        use_svi = self._vol_model == "svi"
-        any_updated = False
-
-        for side in ("C", "P"):
-            cal_data = []  # (strike, iv, spread)
-            for key, option in options.items():
-                if option.put_call != side:
-                    continue
-                bid = getattr(option, "bid", 0) or 0
-                ask = getattr(option, "ask", 0) or 0
-                if bid > 0 and ask > 0 and (ask - bid) <= max_cal_width:
-                    mid = (bid + ask) / 2.0
-                    iv = PricingEngine.implied_vol(
-                        mid, forward, option.strike, tte, right=side,
-                    )
-                    if iv is not None and iv > 0:
-                        cal_data.append((option.strike, iv, ask - bid))
-
-            min_pts = 5 if use_svi else 3
-            if len(cal_data) < min_pts:
-                continue
-
-            strikes = [s for s, _, _ in cal_data]
-            ivs = [v for _, v, _ in cal_data]
-            spreads = [w for _, _, w in cal_data]
-
-            # Spread-inverse weighting
-            min_spread = min(spreads)
-            weights = [min_spread / s for s in spreads]
-
-            sp = self._side_params[side]
-
-            if use_svi:
-                result = calibrate_svi(
-                    F=forward, T=tte, strikes=strikes, market_ivs=ivs,
-                    max_rmse=max_rmse, weights=weights,
-                )
-                if result is None:
-                    continue
-                quality_ok, quality_reason = _svi_quality_ok(result, min_strikes // 2)
-                if not quality_ok:
-                    logger.warning(
-                        "SVI %s fit rejected (%s): a=%.4f b=%.3f rho=%.3f "
-                        "m=%.3f sig=%.3f RMSE=%.4f n=%d",
-                        side, quality_reason, result.a, result.b, result.rho,
-                        result.m, result.sigma, result.rmse, result.n_points,
-                    )
-                    continue
-                prior = sp["svi_params"]
-                if (prior is not None
-                        and result.rmse > max(prior.rmse * 1.5, 0.01)):
-                    logger.warning(
-                        "SVI %s fit rejected (rmse_regression %.4f > 1.5x prior %.4f)",
-                        side, result.rmse, prior.rmse,
-                    )
-                    continue
-                sp["svi_params"] = result
-                any_updated = True
-                logger.info(
-                    "SVI %s calibrated: a=%.4f b=%.4f rho=%.3f m=%.4f sig=%.4f RMSE=%.4f (n=%d)",
-                    side, result.a, result.b, result.rho, result.m, result.sigma,
-                    result.rmse, result.n_points,
-                )
-                if self.csv_logger is not None:
-                    try:
-                        self.csv_logger.log_calibration(
-                            expiry=self._front_month_expiry or "",
-                            side=side, model="svi",
-                            forward=forward, tte_years=tte,
-                            n_points=result.n_points, rmse=result.rmse,
-                            a=result.a, b=result.b, rho_svi=result.rho,
-                            m=result.m, sigma=result.sigma,
-                        )
-                    except Exception as e:
-                        logger.debug("calibration telemetry log failed: %s", e)
-            else:
-                result = calibrate_sabr(
-                    F=forward, T=tte, strikes=strikes, market_ivs=ivs,
-                    beta=self.beta, max_rmse=max_rmse, weights=weights,
-                )
-                if result is None:
-                    continue
-                quality_ok, quality_reason = _sabr_quality_ok(result, min_strikes // 2)
-                if not quality_ok:
-                    worst_strike, worst_resid = _worst_strike_residual(
-                        result, forward, strikes, ivs, tte,
-                    )
-                    worst_str = (
-                        f" worst_strike={worst_strike:.0f} resid={worst_resid:.4f}"
-                        if worst_strike is not None else ""
-                    )
-                    logger.warning(
-                        "SABR %s fit rejected (%s): alpha=%.4f rho=%.3f nu=%.3f "
-                        "RMSE=%.4f n=%d%s",
-                        side, quality_reason, result.alpha, result.rho, result.nu,
-                        result.rmse, result.n_points, worst_str,
-                    )
-                    continue
-                prior = sp["params"]
-                if (prior is not None
-                        and result.rmse > max(prior.rmse * 1.5, 0.01)):
-                    logger.warning(
-                        "SABR %s fit rejected (rmse_regression %.4f > 1.5x prior %.4f)",
-                        side, result.rmse, prior.rmse,
-                    )
-                    continue
-                sp["alpha"] = result.alpha
-                sp["rho"] = result.rho
-                sp["nu"] = result.nu
-                sp["params"] = result
-                any_updated = True
-                logger.info(
-                    "SABR %s calibrated: alpha=%.4f rho=%.3f nu=%.3f RMSE=%.4f (n=%d)",
-                    side, result.alpha, result.rho, result.nu, result.rmse, result.n_points,
-                )
-                if self.csv_logger is not None:
-                    try:
-                        self.csv_logger.log_calibration(
-                            expiry=self._front_month_expiry or "",
-                            side=side, model="sabr",
-                            forward=forward, tte_years=tte,
-                            n_points=result.n_points, rmse=result.rmse,
-                            alpha=result.alpha, beta=self.beta,
-                            rho_sabr=result.rho, nu=result.nu,
-                        )
-                    except Exception as e:
-                        logger.debug("calibration telemetry log failed: %s", e)
-
-            # Drift detection (shared across both models)
-            rmse_val = result.rmse
-            sp["rmse_history"].append(rmse_val)
-            if len(sp["rmse_history"]) >= 5:
-                median_rmse = float(np.median(sp["rmse_history"]))
-                if (median_rmse > 0
-                        and rmse_val > max(median_rmse * 1.5, 0.005)):
-                    logger.warning(
-                        "%s %s RMSE drift: current=%.4f vs median=%.4f",
-                        "SVI" if use_svi else "SABR",
-                        side, rmse_val, median_rmse,
-                    )
-
-        if any_updated:
-            self.last_calibration = datetime.now()
-            self._theo_cache.clear()
-            # Back-compat: .params exposes the put-side result (primary quoting side)
-            pp = self._side_params["P"]
-            self.params = pp.get("svi_params") or pp.get("params")
 
     def get_vol(self, strike: float, put_call: str = "C") -> float:
         """Return implied vol for a given strike using per-side params."""
@@ -676,10 +494,23 @@ class SABRSurface:
             return True
 
         mid_price = (bid + ask) / 2
-        implied_vol = PricingEngine.implied_vol(
-            mid_price, self.forward, option.strike, tte,
-            right=getattr(option, "put_call", "C"),
-        )
+        put_call = getattr(option, "put_call", "C")
+        # Round mid to pricing tick so small float wobbles still cache-hit.
+        # HG options are 0.0005 ticks, ETH is 0.5; quantize to 4 decimals
+        # which covers both without introducing error.
+        iv_key = (option.strike, put_call, round(mid_price, 4))
+        now = _time.monotonic()
+        cached = self._iv_cache.get(iv_key)
+        if cached is not None and (now - cached[1]) < self._iv_cache_ttl_sec:
+            implied_vol = cached[0]
+        else:
+            implied_vol = PricingEngine.implied_vol(
+                mid_price, self.forward, option.strike, tte,
+                right=put_call,
+            )
+            self._iv_cache[iv_key] = (implied_vol, now)
+            if len(self._iv_cache) > 2000:
+                self._iv_cache.clear()
         if implied_vol is None:
             return True
 
@@ -690,6 +521,111 @@ class SABRSurface:
         if self._front_month_expiry is None:
             return 0.0
         return time_to_expiry_years(self._front_month_expiry)
+
+
+def delta_adjust_theo(theo: float, delta: float,
+                      cal_forward: float, current_underlying: float) -> float:
+    """First-order Taylor reprice: adjust SABR theo by delta × (F − F_cal).
+
+    Bridges the gap between SABR refit cadence (~seconds) and quoting cadence
+    (~ms) so the cap logic enforces against the latest underlying rather than
+    the one at last fit. Floored at 0 — a negative result means the
+    extrapolation has overreached and the strike is effectively worthless.
+    """
+    if delta == 0 or cal_forward <= 0 or current_underlying <= 0:
+        return theo
+    return max(theo + delta * (current_underlying - cal_forward), 0.0)
+
+
+def _parity_implied_forward_dict(opts_list, ref_forward, max_spread, max_dev=50.0):
+    """Picklable variant of implied_forward_from_parity that takes plain dicts
+    instead of OptionQuote instances. Used by the ProcessPool fit worker."""
+    pairs: dict = {}
+    for o in opts_list:
+        bid, ask = o['bid'], o['ask']
+        if bid <= 0 or ask <= 0 or (ask - bid) > max_spread:
+            continue
+        mid = (bid + ask) / 2.0
+        pairs.setdefault(o['strike'], {})[o['put_call']] = mid
+    forwards = []
+    for K, sides in pairs.items():
+        if 'C' not in sides or 'P' not in sides:
+            continue
+        F_K = K + (sides['C'] - sides['P'])
+        if abs(F_K - ref_forward) <= max_dev:
+            forwards.append(F_K)
+    if not forwards:
+        return None
+    forwards.sort()
+    return forwards[len(forwards) // 2]
+
+
+def _async_fit_worker(forward_in: float, expiries_data: dict,
+                      beta: float, max_rmse: float, use_svi: bool,
+                      max_cal_width: float) -> dict:
+    """ProcessPool worker — runs SABR/SVI fits off-process to bypass the GIL.
+
+    Quality gates, drift detection, telemetry, and surface mutation all stay
+    in the main process; this worker is just the scipy.optimize call (which
+    holds the GIL when run in-thread) plus the per-strike brentq IV solves.
+
+    Inputs and outputs are pure-data so they pickle cleanly.
+        expiries_data: {expiry: {'tte': float, 'options': [{'strike','put_call','bid','ask'}, ...]}}
+    Returns: {expiry: {'forward': float|None, 'parity_delta': float|None,
+                       'C': result|None, 'P': result|None,
+                       'C_n': int, 'P_n': int}}
+    """
+    out = {}
+    for exp, data in expiries_data.items():
+        tte = data['tte']
+        opts = data['options']
+        if tte <= 0:
+            out[exp] = {'forward': forward_in, 'parity_delta': None,
+                        'C': None, 'P': None, 'C_n': 0, 'P_n': 0}
+            continue
+        implied = _parity_implied_forward_dict(opts, forward_in, max_cal_width)
+        forward = (forward_in + implied) / 2.0 if implied is not None else forward_in
+        parity_delta = (implied - forward_in) if implied is not None else None
+        side_results = {}
+        side_n = {}
+        for side in ('C', 'P'):
+            cal_data = []
+            for o in opts:
+                if o['put_call'] != side:
+                    continue
+                bid, ask = o['bid'], o['ask']
+                if bid > 0 and ask > 0 and (ask - bid) <= max_cal_width:
+                    mid = (bid + ask) / 2.0
+                    iv = PricingEngine.implied_vol(
+                        mid, forward, o['strike'], tte, right=side)
+                    if iv is not None and iv > 0:
+                        cal_data.append((o['strike'], iv, ask - bid))
+            min_pts = 5 if use_svi else 3
+            if len(cal_data) < min_pts:
+                side_results[side] = None
+                side_n[side] = len(cal_data)
+                continue
+            strikes = [s for s, _, _ in cal_data]
+            ivs = [v for _, v, _ in cal_data]
+            spreads = [w for _, _, w in cal_data]
+            min_spread = min(spreads)
+            weights = [min_spread / s for s in spreads]
+            if use_svi:
+                r = calibrate_svi(F=forward, T=tte, strikes=strikes,
+                                  market_ivs=ivs, max_rmse=max_rmse,
+                                  weights=weights)
+            else:
+                r = calibrate_sabr(F=forward, T=tte, strikes=strikes,
+                                   market_ivs=ivs, beta=beta,
+                                   max_rmse=max_rmse, weights=weights)
+            side_results[side] = r
+            side_n[side] = len(cal_data)
+        out[exp] = {
+            'forward': forward, 'parity_delta': parity_delta,
+            'C': side_results.get('C'), 'P': side_results.get('P'),
+            'C_n': side_n.get('C', 0), 'P_n': side_n.get('P', 0),
+        }
+    return out
 
 
 class MultiExpirySABR:
@@ -707,20 +643,25 @@ class MultiExpirySABR:
         self.csv_logger = csv_logger
         self._surfaces: dict = {}
         self._expiries: List[str] = []
-        # Async calibration: a single-worker pool fits SABR off the event
-        # loop. scipy.optimize.least_squares releases the GIL during its
-        # numerical inner loop, so this genuinely parallelizes against the
-        # main Python thread. We keep the pool at 1 worker: calibration
-        # is already fast enough (~100ms for 3 expiries); adding more
-        # workers doesn't help and just complicates concurrency.
-        self._cal_pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="sabr-cal",
+        # Async calibration runs in a subprocess (ProcessPool, not Thread)
+        # because scipy.optimize Python orchestration code holds the GIL —
+        # measured: a thread-pool fit blocked the main asyncio loop and
+        # spiked openOrder ack RTT to ~3.8s p99. Spawn context (slower
+        # startup, ~1s) avoids fork() races with asyncio/threads already
+        # running in the parent at lazy-init time.
+        self._cal_pool = ProcessPoolExecutor(
+            max_workers=1, mp_context=multiprocessing.get_context("spawn"),
         )
         self._cal_future: Optional[Future] = None
         # Lock serializes parameter updates so readers of get_theo/get_vol
         # never observe a half-updated surface. Fit computation runs
         # outside the lock; only the final assignment is guarded.
         self._params_lock = threading.Lock()
+        # Expiries whose surface just refitted (theo changed). Quote engine
+        # consumes this each cycle to force re-eval of active orders for
+        # those expiries — eliminates the temporal race where a resting
+        # price stays at its pre-refit edge after theo drifts.
+        self._refit_pending: set = set()
 
     # ------------- expiry management -------------
 
@@ -764,63 +705,204 @@ class MultiExpirySABR:
         theos are available. Hot-path callers should use ``calibrate_async``.
         """
         targets = [expiry] if expiry is not None else list(self._expiries)
-        for exp in targets:
+        params = self._fit_params()
+        if params is None:
+            return
+        expiries_data = self._build_fit_input(targets, options)
+        if not expiries_data:
+            return
+        out = _async_fit_worker(forward, expiries_data, *params)
+        with self._params_lock:
+            for exp, res in out.items():
+                surf = self._surfaces.get(exp)
+                if surf is not None:
+                    self._apply_fit_to_surface(surf, exp, res)
+
+    def _fit_params(self):
+        """Read fit hyper-parameters off the front surface. Returns
+        (beta, max_rmse, use_svi, max_cal_width) tuple suitable for splat
+        into ``_async_fit_worker``, or None if no surface is set up yet."""
+        front_surf = self._front_surface()
+        if front_surf is None:
+            return None
+        return (
+            front_surf.beta,
+            self.config.pricing.sabr_max_rmse,
+            front_surf._vol_model == "svi",
+            float(getattr(self.config.pricing, "max_calibration_bbo_width", 10.0)),
+        )
+
+    def _build_fit_input(self, expiries, options) -> dict:
+        """Flatten the OptionQuote chain into picklable per-expiry input.
+        Same shape consumed by ``_async_fit_worker`` whether the call goes
+        through a process pool or runs in-process from the sync path."""
+        out = {}
+        for exp in expiries:
+            opts_list = []
+            for (_, expiry, _), opt in options.items():
+                if expiry != exp:
+                    continue
+                opts_list.append({
+                    'strike': opt.strike,
+                    'put_call': opt.put_call,
+                    'bid': float(getattr(opt, 'bid', 0) or 0),
+                    'ask': float(getattr(opt, 'ask', 0) or 0),
+                })
+            if opts_list:
+                out[exp] = {
+                    'tte': time_to_expiry_years(exp),
+                    'options': opts_list,
+                }
+        return out
+
+    def calibrate_async(self, forward: float, options: dict) -> bool:
+        """Fire SABR calibration on the background ProcessPool, return
+        immediately. Returns True if submitted, False if a prior fit is still
+        in flight (we don't queue a backlog — the next tick picks up fresh
+        state anyway)."""
+        if self._cal_future is not None and not self._cal_future.done():
+            return False
+        if not self._expiries:
+            return False
+        params = self._fit_params()
+        if params is None:
+            return False
+        expiries_data = self._build_fit_input(self._expiries, options)
+        if not expiries_data:
+            return False
+        try:
+            self._cal_future = self._cal_pool.submit(
+                _async_fit_worker, forward, expiries_data, *params,
+            )
+        except Exception as e:
+            logger.warning("ProcessPool submit failed: %s", e)
+            return False
+        # add_done_callback fires on a pool-internal thread; surface mutation
+        # acquires _params_lock so readers never see torn state.
+        self._cal_future.add_done_callback(self._apply_fit_results)
+        return True
+
+    def _apply_fit_to_surface(self, surf, exp: str, res: dict):
+        """Apply a per-expiry fit result to one surface. Caller must hold
+        ``self._params_lock``. Shared by the async ProcessPool callback and
+        the synchronous startup/watchdog calibrate path."""
+        surf.forward = res['forward']
+        pd = res.get('parity_delta')
+        if pd is not None and abs(pd) > 1.0:
+            logger.info(
+                "SABR forward [%s]: blended=%.2f parity_delta=%+.2f",
+                exp, res['forward'], pd,
+            )
+        use_svi = (surf._vol_model == "svi")
+        model_name = "SVI" if use_svi else "SABR"
+        min_strikes = int(getattr(
+            self.config.pricing, "sabr_min_strikes", 8))
+        any_updated = False
+        for side in ("C", "P"):
+            result = res.get(side)
+            if result is None:
+                continue
+            quality_ok, quality_reason = (
+                _svi_quality_ok(result, min_strikes // 2) if use_svi
+                else _sabr_quality_ok(result, min_strikes // 2)
+            )
+            if not quality_ok:
+                logger.warning(
+                    "%s %s [%s] fit rejected (%s): RMSE=%.4f n=%d",
+                    model_name, side, exp, quality_reason,
+                    result.rmse, result.n_points,
+                )
+                continue
+            sp = surf._side_params[side]
+            prior = sp.get("svi_params") if use_svi else sp.get("params")
+            if prior is not None and result.rmse > max(prior.rmse * 1.5, 0.01):
+                logger.warning(
+                    "%s %s [%s] fit rejected (rmse_regression %.4f > 1.5x prior %.4f)",
+                    model_name, side, exp, result.rmse, prior.rmse,
+                )
+                continue
+            if use_svi:
+                sp["svi_params"] = result
+            else:
+                sp["alpha"] = result.alpha
+                sp["rho"] = result.rho
+                sp["nu"] = result.nu
+                sp["params"] = result
+            any_updated = True
+            if use_svi:
+                logger.info(
+                    "SVI %s [%s] calibrated: a=%.4f b=%.4f rho=%.3f m=%.4f sig=%.4f RMSE=%.4f (n=%d)",
+                    side, exp, result.a, result.b, result.rho,
+                    result.m, result.sigma, result.rmse, result.n_points,
+                )
+            else:
+                logger.info(
+                    "SABR %s [%s] calibrated: alpha=%.4f rho=%.3f nu=%.3f RMSE=%.4f (n=%d)",
+                    side, exp, result.alpha, result.rho, result.nu,
+                    result.rmse, result.n_points,
+                )
+            if surf.csv_logger is not None:
+                try:
+                    if use_svi:
+                        surf.csv_logger.log_calibration(
+                            expiry=exp, side=side, model="svi",
+                            forward=res['forward'],
+                            tte_years=time_to_expiry_years(exp),
+                            n_points=result.n_points, rmse=result.rmse,
+                            a=result.a, b=result.b, rho_svi=result.rho,
+                            m=result.m, sigma=result.sigma,
+                        )
+                    else:
+                        surf.csv_logger.log_calibration(
+                            expiry=exp, side=side, model="sabr",
+                            forward=res['forward'],
+                            tte_years=time_to_expiry_years(exp),
+                            n_points=result.n_points, rmse=result.rmse,
+                            alpha=result.alpha, beta=surf.beta,
+                            rho_sabr=result.rho, nu=result.nu,
+                        )
+                except Exception as e:
+                    logger.debug("calibration telemetry log failed: %s", e)
+            sp["rmse_history"].append(result.rmse)
+            if len(sp["rmse_history"]) >= 5:
+                median_rmse = float(np.median(sp["rmse_history"]))
+                if median_rmse > 0 and result.rmse > max(median_rmse * 1.5, 0.005):
+                    logger.warning(
+                        "%s %s [%s] RMSE drift: current=%.4f vs median=%.4f",
+                        model_name, side, exp, result.rmse, median_rmse,
+                    )
+        if any_updated:
+            surf.last_calibration = datetime.now()
+            surf._theo_cache.clear()
+            surf._iv_cache.clear()
+            pp = surf._side_params["P"]
+            surf.params = pp.get("svi_params") or pp.get("params")
+            self._refit_pending.add(exp)
+
+    def _apply_fit_results(self, future: Future):
+        """Async callback: apply ProcessPool fit output to surfaces."""
+        try:
+            out = future.result()
+        except Exception as e:
+            logger.warning("Async SABR fit failed: %s", e)
+            return
+        for exp, res in out.items():
             surf = self._surfaces.get(exp)
             if surf is None:
                 continue
-            # Filter options dict by this expiry
-            filtered = {k: v for k, v in options.items() if k[1] == exp}
-            if not filtered:
-                continue
             with self._params_lock:
-                surf.calibrate(forward, filtered)
+                self._apply_fit_to_surface(surf, exp, res)
 
-    def calibrate_async(self, forward: float, options: dict) -> bool:
-        """Fire SABR calibration on the background pool and return immediately.
-
-        Returns True if a new calibration was submitted, False if one is
-        already in flight (we don't queue up a backlog — the next timer
-        tick will pick up fresh state anyway).
-
-        Note: ``options`` is snapshotted by reference. Callers should not
-        mutate the dict while the calibration is running — but in practice
-        the market_data state.options dict is only updated in place (new
-        bid/ask fields on existing OptionQuote objects), not
-        rebuilt, so concurrent reads are safe even if slightly stale.
-        """
-        # Skip if previous calibration is still running. Using done() is
-        # cheap and avoids the cost of cancelling queued work.
-        if self._cal_future is not None and not self._cal_future.done():
-            return False
-
-        # Snapshot the expiry list at submission time. If set_expiries is
-        # called while the worker runs, the worker still operates on what
-        # was valid at submission — no mid-flight pivots.
-        expiries_snapshot = list(self._expiries)
-
-        def _run():
-            for exp in expiries_snapshot:
-                surf = self._surfaces.get(exp)
-                if surf is None:
-                    continue
-                filtered = {k: v for k, v in options.items() if k[1] == exp}
-                if not filtered:
-                    continue
-                try:
-                    # The fit itself (Black-76 scenarios + least_squares)
-                    # is the expensive part — runs outside the lock.
-                    # SABRSurface.calibrate internally mutates params at
-                    # the end; we serialize that block with the lock so
-                    # readers don't observe a half-updated surface.
-                    with self._params_lock:
-                        surf.calibrate(forward, filtered)
-                except Exception as e:
-                    logger.warning(
-                        "Async SABR calibrate failed for %s: %s", exp, e,
-                    )
-
-        self._cal_future = self._cal_pool.submit(_run)
-        return True
+    def consume_refit_pending(self) -> set:
+        """Return and clear the set of expiries that have refitted since
+        the last call. Quote engine uses this to force a full re-eval of
+        active orders for those expiries on the next cycle, closing the
+        race where a resting price stayed at its pre-refit edge after
+        theo drifted."""
+        with self._params_lock:
+            r = self._refit_pending
+            self._refit_pending = set()
+        return r
 
     def shutdown(self, timeout: float = 2.0):
         """Stop the calibration pool. Safe to call multiple times."""

@@ -75,9 +75,17 @@ puts:
 
 kill_switch:
   margin_kill_pct: 0.70       # 70% of $1M = $700K
-  max_daily_loss: -2500       # Dollars (Stage 1)
-  delta_kill: 5.0             # Combined |net_delta| kill threshold
-  vega_kill: 1000             # |net_vega| (per vol pt) kill threshold
+  # TEMPORARY (2026-04-14): widened from -2500. Today's realized P&L sits
+  # at ~-$50K from flattening the HG ghost positions (marks were stale, so
+  # closing 200 contracts crystallized losses that don't reflect market-
+  # making performance). Restore to -2500 after the next CME session reset
+  # (5pm CT) wipes today's realized count.
+  max_daily_loss: -100000     # Dollars (Stage 1)
+  # Per-product thresholds (RiskMonitor checks each product's worst-case;
+  # mixing ETH mult=50 and HG mult=25000 contract-equivalent values in
+  # one sum is meaningless).
+  delta_kill: 5.0             # Per-product |net_delta| kill threshold
+  vega_kill: 1000             # Per-product |net_vega| (per vol pt) kill threshold
   # Hard floor on portfolio theta ($/day). Only enforced in
   # margin-escape mode (see constraints.margin_escape_enabled) — the
   # normal path uses the softer constraints.theta_floor ceiling.
@@ -239,6 +247,15 @@ observe_products:
       delta_retreat_threshold: 0.02  # Retreat on $0.02 underlying move (~2× HG p99 tick)
       max_resting_per_side: 120   # 35 strikes × 3 expiries + headroom
       max_active_depth_subs: 2    # IBKR caps at 5/connection; ETH takes 3, HG takes 2
+      # HG tick is 1/1000 of ETH's, so ETH's 2-tick dead-band ($1.00) becomes
+      # $0.001 here — ~0.5% of a $0.20 option, well inside SABR refit noise.
+      # Result was a continuous modify storm: engine wanted to re-price every
+      # SABR cycle, hit the 5/sec cap, silently dropped the modify, and
+      # resting prices went stale (2026-04-16). Widen the dead-band to $0.01
+      # (4% of a $0.25 option) and raise the per-oid cap so genuine moves
+      # still land.
+      min_modify_ticks: 20              # $0.01 dead-band
+      max_modifies_per_sec_per_oid: 20  # headroom for real moves
     pricing:
       min_edge_points: 0.001      # Minimum $0.001 edge vs theo ($25/contract)
       max_calibration_bbo_width: 0.05  # Drop wide BBOs from SABR calibration

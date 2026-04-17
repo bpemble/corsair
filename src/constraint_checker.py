@@ -60,19 +60,34 @@ class IBKRMarginChecker:
         self.sabr = sabr
         self.csv_logger = csv_logger
         self.span = SyntheticSpan(config)
+        # Multi-product: positions in self.portfolio.positions span every
+        # product trading on the IBKR sub-account. This engine is per-
+        # product and must filter to its own product whenever it walks the
+        # position list — otherwise it would price HG strikes through ETH's
+        # SPAN scan ranges (or vice versa), which is nonsense.
+        self._product = config.product.underlying_symbol
+        # Set by MarginCoordinator.register(); the coordinator owns IBKR
+        # account-value comm and the shared ibkr_scale calibration. Engines
+        # delegate get_current_margin / check_fill_margin through it so the
+        # number returned is the COMBINED (all-product) margin, not just
+        # this engine's own contribution. Until registered, get_current_*
+        # falls back to local-only behavior with ibkr_scale=1.0 — useful
+        # for unit tests, dangerous in production.
+        self.coordinator = None
         self.cached_ibkr_margin: float = 0.0
         # Calibration ratio synthetic ÷ ibkr_actual, refreshed at every recon.
         # Used to scale synthetic numbers down to IBKR-equivalent so the
         # constraint checker isn't gating on the structural overstatement
         # documented in synthetic_span.py (verticals/strangles run ~25-30%
         # high vs IBKR's actual margin). 1.0 means "no scaling, use synthetic
-        # as-is" — applies before we have a recon datapoint.
+        # as-is" — applies before we have a recon datapoint. The coordinator
+        # writes through to this attribute so engines can read it cheaply.
         self.ibkr_scale: float = 1.0
         self._account_id = config.account.account_id
         self._mult = float(config.product.multiplier)
 
-        # Combined portfolio state cache (Stage 1+: shared budget across
-        # calls and puts). One entry covering ALL positions.
+        # Per-product portfolio state cache. Filtered to positions whose
+        # ``product`` matches self._product.
         self._port_state: Optional[dict] = None
         self._port_F: float = 0.0
         self._port_time: float = 0.0
@@ -174,10 +189,18 @@ class IBKRMarginChecker:
         }
 
     def _get_portfolio_state(self, F: float) -> dict:
-        """Cached aggregate of the entire position book (calls + puts)."""
+        """Cached aggregate of THIS engine's product positions only.
+
+        Multi-product: filters self.portfolio.positions to p.product ==
+        self._product so HG positions don't get scored through ETH's SPAN
+        engine (or vice versa). Combined-across-products margin is computed
+        by MarginCoordinator by summing each engine's per-product result.
+        """
         if self._portfolio_cache_valid(F):
             return self._port_state
-        state = self._accumulate(self.portfolio.positions, F)
+        own_positions = (p for p in self.portfolio.positions
+                         if p.product == self._product)
+        state = self._accumulate(own_positions, F)
         self._port_state = state
         self._port_F = F
         self._port_time = time.monotonic()
@@ -196,20 +219,23 @@ class IBKRMarginChecker:
     def get_current_margin(self, right: Optional[str] = None) -> float:
         """SPAN margin over current positions, scaled to IBKR-equivalent.
 
-        Returns raw synthetic × ibkr_scale, where ibkr_scale is the live
-        calibration factor refreshed in update_cached_margin. This grounds
-        the gating decision (and dashboard display) in real IBKR margin
-        rather than synthetic's structural overstatement.
+        Multi-product: when registered with a MarginCoordinator,
+        ``get_current_margin()`` returns the COMBINED margin across all
+        engines (so callers reading "what margin am I using right now"
+        see the same number IBKR sees). Standalone (no coordinator) it
+        falls back to this engine's own product only.
 
-        Combined-budget mode: there is no per-side margin. The `right`
-        argument is accepted for backward compatibility with callers that
-        still pass it (snapshot writer's per-side display) — when passed,
-        we return the contribution of just that side's positions to the
-        combined SPAN. With no argument or right=None, returns the total."""
+        ``right`` parameter retained for the snapshot writer's per-side
+        display; per-side breakdown is always engine-local (per-product)
+        since "calls vs puts" only makes sense within one product.
+        """
         F = self._get_forward()
         if F <= 0:
             return 0.0
         if right is None:
+            if self.coordinator is not None:
+                return self.coordinator.combined_margin()
+            # Standalone fallback
             st = self._get_portfolio_state(F)
             raw = self._margin_from_state(
                 st["portfolio_ra"], st["nov"],
@@ -221,65 +247,21 @@ class IBKRMarginChecker:
         return self._margin_for_side(F, right) * self.ibkr_scale
 
     def _margin_for_side(self, F: float, right: str) -> float:
-        """Display-only per-side SPAN. Uncached; called by the snapshot
-        writer at ~1 Hz for the per-side dashboard breakdown."""
-        side_positions = (p for p in self.portfolio.positions if p.put_call == right)
+        """Display-only per-side SPAN for this engine's product. Uncached;
+        called by the snapshot writer at ~1 Hz for the per-side dashboard
+        breakdown."""
+        side_positions = (p for p in self.portfolio.positions
+                          if p.product == self._product and p.put_call == right)
         st = self._accumulate(side_positions, F)
         return self._margin_from_state(
             st["portfolio_ra"], st["nov"], st["long_premium"], st["short_count"],
         )
 
-    def update_cached_margin(self):
-        """Refresh IBKR's reported maintenance margin (for reconciliation)
-        and recompute the synthetic-to-IBKR scaling ratio.
-
-        We need to read RAW synthetic here (not the scaled get_current_margin
-        output, which would be 1.0× tautologically) — so we call the span
-        engine directly with the same portfolio state get_current_margin uses.
-        """
-        try:
-            for item in self.ib.accountValues(self._account_id):
-                if item.tag == "MaintMarginReq" and item.currency == "USD":
-                    self.cached_ibkr_margin = float(item.value)
-                    raw_synth = self._raw_current_margin()
-                    ratio = 0.0
-                    clamped = False
-                    if raw_synth > 0 and self.cached_ibkr_margin > 0:
-                        ratio = raw_synth / self.cached_ibkr_margin
-                        # Bound the scale to a sensible range.
-                        # ratio > 1.0 = IBKR margin is LOWER than synthetic
-                        #   (expected: SPAN offsets, or unmodeled hedges like
-                        #   manual futures positions). Trust the IBKR number.
-                        # ratio < 0.8 = IBKR margin is HIGHER than synthetic
-                        #   (unexpected: synthetic is underestimating risk).
-                        #   Fall back to raw synthetic (conservative).
-                        if ratio >= 0.8:
-                            self.ibkr_scale = 1.0 / ratio
-                        else:
-                            self.ibkr_scale = 1.0
-                            clamped = True
-                        logger.info(
-                            "MARGIN RECON: synthetic=$%.0f ibkr=$%.0f ratio=%.2f scale=%.2f",
-                            raw_synth, self.cached_ibkr_margin, ratio, self.ibkr_scale,
-                        )
-                    if self.csv_logger is not None:
-                        try:
-                            self.csv_logger.log_margin_scale(
-                                raw_synthetic=raw_synth,
-                                ibkr_actual=self.cached_ibkr_margin,
-                                ratio=ratio,
-                                ibkr_scale=self.ibkr_scale,
-                                clamped=clamped,
-                            )
-                        except Exception as e:
-                            logger.debug("margin scale telemetry log failed: %s", e)
-                    return
-        except Exception as e:
-            logger.warning("Failed to refresh IBKR margin: %s", e)
-
     def _raw_current_margin(self) -> float:
-        """Internal: synthetic SPAN over current positions, NO scaling.
-        Used by update_cached_margin to compute the calibration ratio."""
+        """Internal: synthetic SPAN over THIS engine's product positions, NO
+        scaling. The MarginCoordinator sums this across all engines to
+        compute the combined synthetic that calibrates against IBKR's
+        account-wide MaintMarginReq."""
         F = self._get_forward()
         if F <= 0:
             return 0.0
@@ -289,16 +271,13 @@ class IBKRMarginChecker:
             st["long_premium"], st["short_count"],
         )
 
-    def check_fill_margin(self, option_quote, quantity: int) -> Dict:
-        """Compute current and post-fill synthetic SPAN margin against the
-        combined portfolio (calls + puts share one budget).
-
-        Hot path: ~0 Black-76 calls when caches are warm. Just numpy adds
-        against the cached combined portfolio state.
-        """
+    def _raw_check_fill_margin(self, option_quote, quantity: int) -> Dict:
+        """Internal: per-product RAW (unscaled) current + post-fill margin
+        for use by MarginCoordinator. Returns a dict with 'current_raw',
+        'post_raw', 'current_long_premium', 'post_long_premium'."""
         F = self._get_forward()
         if F <= 0:
-            return {"current_margin": 0.0, "post_fill_margin": 0.0,
+            return {"current_raw": 0.0, "post_raw": 0.0,
                     "current_long_premium": 0.0, "post_long_premium": 0.0}
 
         K = option_quote.strike
@@ -309,12 +288,11 @@ class IBKRMarginChecker:
             st["long_premium"], st["short_count"],
         )
 
-        # Candidate contribution
         opt = self.market_data.state.get_option(K, option_quote.expiry, right)
         iv = self._resolve_iv(opt, K, right)
         T = max(days_to_expiry(option_quote.expiry), 0) / 365.0
         if iv <= 0 or T <= 0:
-            return {"current_margin": cur, "post_fill_margin": cur,
+            return {"current_raw": cur, "post_raw": cur,
                     "current_long_premium": st["long_premium"],
                     "post_long_premium": st["long_premium"]}
 
@@ -329,16 +307,179 @@ class IBKRMarginChecker:
             post_short = st["short_count"] + abs(quantity)
 
         post = self._margin_from_state(post_ra, post_nov, post_long, post_short)
-        # Scale both current and post into IBKR-equivalent units so the
-        # gating decision compares against the real margin we have to spend,
-        # not synthetic's structural overstatement. ibkr_scale is bounded
-        # in update_cached_margin to a sensible range with a 1.0 fallback.
         return {
-            "current_margin": cur * self.ibkr_scale,
-            "post_fill_margin": post * self.ibkr_scale,
+            "current_raw": cur,
+            "post_raw": post,
             "current_long_premium": st["long_premium"],
             "post_long_premium": post_long,
         }
+
+    def check_fill_margin(self, option_quote, quantity: int) -> Dict:
+        """Pre-trade margin check: returns combined-across-products current
+        and post-fill margin (IBKR-equivalent), plus this product's long-
+        premium accounting.
+
+        With a MarginCoordinator: delegates so the caller sees the COMBINED
+        margin. Without one (e.g. unit tests): falls back to per-engine.
+        """
+        if self.coordinator is not None:
+            return self.coordinator.check_fill_margin(self, option_quote, quantity)
+        # Standalone fallback (no coordinator wired): single-engine margin.
+        own = self._raw_check_fill_margin(option_quote, quantity)
+        return {
+            "current_margin": own["current_raw"] * self.ibkr_scale,
+            "post_fill_margin": own["post_raw"] * self.ibkr_scale,
+            "current_long_premium": own["current_long_premium"],
+            "post_long_premium": own["post_long_premium"],
+        }
+
+
+class MarginCoordinator:
+    """Cross-product margin orchestration.
+
+    Owns the IBKR account-value subscription (one per sub-account) and the
+    shared synthetic→IBKR scale factor. Per-product IBKRMarginChecker
+    engines register here at startup; this class:
+
+    1. Sums each engine's RAW per-product synthetic margin to compute the
+       combined synthetic the constraint checker should compare against
+       both IBKR's MaintMarginReq (for calibration) and the configured cap.
+    2. Computes ibkr_scale = 1/ratio (bounded) once per recon, then
+       broadcasts it to every engine so their per-side display values stay
+       coherent with the combined gating decision.
+    3. Provides a check_fill_margin() that handles a candidate fill in one
+       product while including every other product's current contribution,
+       so the constraint check sees the true combined post-fill state.
+
+    The split between this class and the engines is: engines do per-product
+    SPAN math (their own SABR, market_data, scan ranges, multiplier);
+    coordinator does cross-product aggregation and IBKR comm.
+    """
+
+    def __init__(self, ib: IB, account_id: str, csv_logger=None):
+        self.ib = ib
+        self.account_id = account_id
+        self.csv_logger = csv_logger
+        self.engines: list = []
+        self.ibkr_scale: float = 1.0
+        self.cached_ibkr_margin: float = 0.0
+
+    def register(self, engine: "IBKRMarginChecker") -> None:
+        """Wire a per-product engine into the cross-product aggregation.
+        Sets the engine's ``coordinator`` back-reference so its public
+        get_current_margin / check_fill_margin delegate here."""
+        if engine in self.engines:
+            return
+        engine.coordinator = self
+        self.engines.append(engine)
+        logger.info("MarginCoordinator registered engine for product=%s",
+                    engine._product)
+
+    def combined_raw_margin(self) -> float:
+        """Sum per-product RAW synthetic across every registered engine."""
+        return sum(e._raw_current_margin() for e in self.engines)
+
+    def combined_margin(self) -> float:
+        """Combined synthetic margin in IBKR-equivalent units (× scale)."""
+        return self.combined_raw_margin() * self.ibkr_scale
+
+    # Shape-compat alias so callers (risk_monitor, snapshot) can talk to a
+    # MarginCoordinator with the same API surface as a single IBKRMarginChecker.
+    def get_current_margin(self, right=None) -> float:
+        return self.combined_margin()
+
+    def check_fill_margin(self, asking_engine, option_quote, quantity: int) -> Dict:
+        """Combined current + post-fill margin for a candidate trade.
+
+        Other engines contribute their cached per-product current margin
+        unchanged; the asking engine contributes its post-fill numbers.
+        Returns the same dict shape as IBKRMarginChecker.check_fill_margin
+        (current_margin, post_fill_margin, current_long_premium,
+        post_long_premium) so ConstraintChecker doesn't care whether it's
+        talking to a coordinator or a standalone engine.
+        """
+        own = asking_engine._raw_check_fill_margin(option_quote, quantity)
+        total_cur = own["current_raw"]
+        total_post = own["post_raw"]
+        for e in self.engines:
+            if e is asking_engine:
+                continue
+            m = e._raw_current_margin()
+            total_cur += m
+            total_post += m
+        s = self.ibkr_scale
+        return {
+            "current_margin": total_cur * s,
+            "post_fill_margin": total_post * s,
+            # Long-premium budget is per-product solvency (cash outlay for
+            # this product's long positions). Each product compares against
+            # its own ConstraintChecker's capital, so don't aggregate.
+            "current_long_premium": own["current_long_premium"],
+            "post_long_premium": own["post_long_premium"],
+        }
+
+    def update_cached_margin(self) -> None:
+        """Refresh IBKR's reported MaintMarginReq for the sub-account and
+        recompute the synthetic→IBKR scale factor from COMBINED synthetic
+        across all registered products. Broadcasts the new scale to every
+        engine so per-side display values track gating decisions.
+        """
+        try:
+            for item in self.ib.accountValues(self.account_id):
+                if item.tag == "MaintMarginReq" and item.currency == "USD":
+                    self.cached_ibkr_margin = float(item.value)
+                    raw_synth = self.combined_raw_margin()
+                    ratio = 0.0
+                    clamped = False
+                    if raw_synth > 0 and self.cached_ibkr_margin > 0:
+                        ratio = raw_synth / self.cached_ibkr_margin
+                        # Bound the scale to a sensible range. Same logic
+                        # as the original single-engine path:
+                        #   ratio >= 0.8 → scale = 1/ratio (trust IBKR)
+                        #   ratio  < 0.8 → fall back to scale=1.0
+                        # This is intentionally CONSERVATIVE when synthetic
+                        # underestimates IBKR (could mean real risk we
+                        # haven't modeled — don't downscale into it).
+                        if ratio >= 0.8:
+                            self.ibkr_scale = 1.0 / ratio
+                        else:
+                            self.ibkr_scale = 1.0
+                            clamped = True
+                        # Broadcast — engines read scale via self.ibkr_scale
+                        # in a few legacy paths (per-side display).
+                        for e in self.engines:
+                            e.ibkr_scale = self.ibkr_scale
+                            e.cached_ibkr_margin = self.cached_ibkr_margin
+                        per_product = ", ".join(
+                            f"{e._product}=${e._raw_current_margin():,.0f}"
+                            for e in self.engines)
+                        logger.info(
+                            "MARGIN RECON [combined]: synthetic=$%.0f "
+                            "(%s) ibkr=$%.0f ratio=%.2f scale=%.2f",
+                            raw_synth, per_product, self.cached_ibkr_margin,
+                            ratio, self.ibkr_scale,
+                        )
+                    if self.csv_logger is not None:
+                        try:
+                            self.csv_logger.log_margin_scale(
+                                raw_synthetic=raw_synth,
+                                ibkr_actual=self.cached_ibkr_margin,
+                                ratio=ratio,
+                                ibkr_scale=self.ibkr_scale,
+                                clamped=clamped,
+                            )
+                        except Exception as e:
+                            logger.debug("margin scale telemetry log failed: %s", e)
+                    return
+        except Exception as e:
+            logger.warning("MarginCoordinator: failed to refresh IBKR margin: %s", e)
+
+    def invalidate_portfolio(self) -> None:
+        """Forward portfolio cache invalidation to every engine so a fill on
+        one product also evicts cross-product reads. Cheap; safe to call
+        from any FillHandler."""
+        for e in self.engines:
+            e.invalidate_portfolio()
 
 
 class ConstraintChecker:
@@ -354,6 +495,11 @@ class ConstraintChecker:
         self.margin = margin_checker
         self.portfolio = portfolio
         self.config = config
+        # Multi-product: delta/theta caps are per-product (each product has
+        # its own multiplier and behavior — mixing contract-equivalent
+        # delta across ETH (mult 50) and HG (mult 25000) is meaningless).
+        # Combined-across-products margin still goes through the coordinator.
+        self._product = config.product.underlying_symbol
 
     def _ceilings(self) -> Tuple[float, float, float]:
         """Return (margin_ceiling, delta_ceiling, theta_floor) — the single
@@ -395,11 +541,14 @@ class ConstraintChecker:
         cur_margin = margin_result["current_margin"]
         post_margin = margin_result["post_fill_margin"]
 
-        cur_delta = self.portfolio.net_delta
+        # Per-product delta/theta — see __init__ note. Each product has its
+        # own ConstraintChecker with its own caps; mixing HG's net delta into
+        # ETH's gating decision (or vice versa) would silently break both.
+        cur_delta = self.portfolio.delta_for_product(self._product)
         post_delta = cur_delta + (option_quote.delta * fill_qty)
 
         option_theta = option_quote.theta * multiplier
-        cur_theta = self.portfolio.net_theta
+        cur_theta = self.portfolio.theta_for_product(self._product)
         post_theta = cur_theta + (option_theta * fill_qty)
 
         cur_long_premium = margin_result["current_long_premium"]

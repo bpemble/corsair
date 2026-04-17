@@ -119,10 +119,34 @@ def load_snapshot(path=None):
 
 
 # ---------------------------------------------------------------------------
+# Product selector — single source of truth for which product's view drives
+# every section below (header metrics, risk by side, open positions, chain).
+# Account fields are shared across products (single IBKR sub-account) so the
+# choice doesn't affect those — but per-product aggregates (delta/theta/vega,
+# per-side margin, position list) and the chain table all follow this dropdown.
+#
+# Resolved here from session_state so the snapshot can load BEFORE the header
+# renders (the status pill depends on the snapshot timestamp). The actual
+# selectbox widget is rendered visually further down, between the header and
+# the key-metrics row — Streamlit reruns the entire script when the user
+# changes the value, and on that rerun st.session_state["selected_product"]
+# already carries the new selection before this point executes.
+# ---------------------------------------------------------------------------
+
+_product_names = [p[0] for p in PRODUCTS]
+_product_paths = {p[0]: p[1] for p in PRODUCTS}
+
+_selected_product = st.session_state.get(
+    "selected_product", _product_names[0] if _product_names else "ETH",
+)
+_active_snap_path = _product_paths.get(_selected_product, SNAPSHOT_PATH)
+
+# ---------------------------------------------------------------------------
 # Load data
 # ---------------------------------------------------------------------------
 
-snapshot = load_snapshot()
+# Selected product drives every section that reads `snapshot` below.
+snapshot = load_snapshot(_active_snap_path)
 
 # ---------------------------------------------------------------------------
 # Determine status
@@ -199,6 +223,18 @@ st.markdown(f"""
     </div>
 </div>
 """, unsafe_allow_html=True)
+
+# Product selector — visually positioned between the header and the
+# Underlying / metrics row. Backed by st.session_state["selected_product"]
+# which the top-of-script logic already consulted to load the right snapshot.
+_psel_col, _ = st.columns([1, 8])
+with _psel_col:
+    st.selectbox(
+        "Product", options=_product_names,
+        index=(_product_names.index(_selected_product)
+               if _selected_product in _product_names else 0),
+        key="selected_product",
+    )
 
 # ---------------------------------------------------------------------------
 # Key Metrics Row
@@ -368,19 +404,36 @@ if snapshot is not None:
         if not side_positions:
             return '<div class="empty-positions">No open positions.</div>'
         rows = ""
-        for p in sorted(side_positions, key=lambda x: (x["expiry"], x["strike"])):
+        # Sort by product first so each product's rows cluster together.
+        for p in sorted(side_positions,
+                        key=lambda x: (x.get("product", ""), x["expiry"], x["strike"])):
             qty = p["qty"]
             qty_class = "pos-long" if qty > 0 else "pos-short"
             unr = p["unrealized_pnl"]
             unr_class = "positive" if unr >= 0 else "negative"
             exp = p.get('expiry', '')
             exp_label = f"{exp[4:6]}/{exp[6:8]}" if len(exp) == 8 else exp
+            # Strike formatting: HG strikes are sub-dollar (e.g. 5.85)
+            # so int() would truncate to 5; keep two decimals when needed.
+            strike = p['strike']
+            strike_label = (f"{strike:g}" if strike != int(strike)
+                            else str(int(strike)))
+            prod = p.get("product", "—")
+            # Adaptive price precision: HG options trade at ~$0.04
+            # (multiplier 25000 → $1,000/contract premium), where 2dp
+            # rounds away the bid/ask spread entirely. Show 4dp when
+            # below $1, 2dp otherwise — covers ETH (~$80) and HG
+            # (~$0.04) without burying ETH in noise.
+            avg = p['avg_price']; mark = p['mark']
+            avg_fmt = f"{avg:.4f}" if abs(avg) < 1 else f"{avg:.2f}"
+            mark_fmt = f"{mark:.4f}" if abs(mark) < 1 else f"{mark:.2f}"
             rows += f"""<tr>
-                <td>{int(p['strike'])}{p['right']}</td>
+                <td>{prod}</td>
+                <td>{strike_label}{p['right']}</td>
                 <td>{exp_label}</td>
                 <td class="{qty_class}">{qty:+d}</td>
-                <td>${p['avg_price']:.2f}</td>
-                <td>${p['mark']:.2f}</td>
+                <td>${avg_fmt}</td>
+                <td>${mark_fmt}</td>
                 <td class="chain-edge {unr_class}">${unr:+,.0f}</td>
                 <td>{p['delta']:+.3f}</td>
                 <td>{p['theta']:+,.0f}</td>
@@ -388,13 +441,19 @@ if snapshot is not None:
         return f"""
         <table class="chain-table">
             <thead><tr>
-                <th>Contract</th><th>Exp</th><th>Qty</th><th>Avg</th><th>Mark</th>
+                <th>Product</th><th>Contract</th><th>Exp</th><th>Qty</th><th>Avg</th><th>Mark</th>
                 <th>P&amp;L</th><th>&Delta;</th><th>&Theta;</th>
             </tr></thead>
             <tbody>{rows}</tbody>
         </table>
         """
 
+    # Selected product drives this section too — the top-of-page dropdown
+    # is the single source of truth. Switching to HG shows HG positions;
+    # ETH shows ETH. Tag each row with the active product so the Product
+    # column renders consistently with the chain table.
+    for _p in positions:
+        _p.setdefault("product", _selected_product)
     calls_positions = [p for p in positions if p.get("right") == "C"]
     puts_positions = [p for p in positions if p.get("right") == "P"]
 
@@ -423,23 +482,15 @@ if snapshot is not None:
 
 st.markdown('<div class="section-header">Option Chain</div>', unsafe_allow_html=True)
 
-# Product + expiry selectors (rendered outside the fragment so selectboxes
-# survive chain refreshes). Reads one snapshot to get the expiry list; the
-# fragment then reads its own snapshot each tick.
-_product_names = [p[0] for p in PRODUCTS]
-_product_paths = {p[0]: p[1] for p in PRODUCTS}
-
-_prod_col, _sel_col, _ = st.columns([1, 1, 4])
-with _prod_col:
-    _selected_product = st.selectbox(
-        "Product", options=_product_names, index=0,
-        key="selected_product",
-    )
-
-_chain_snap_path = _product_paths.get(_selected_product, SNAPSHOT_PATH)
-_sel_snap = load_snapshot(_chain_snap_path) or {}
+# Expiry selector (product is set by the top-of-page dropdown). Rendered
+# outside the fragment so the selectbox survives chain refreshes. Reads
+# the active product's snapshot to get the expiry list; the fragment then
+# re-reads its own snapshot each tick.
+_sel_snap = snapshot or {}
 _expiries = _sel_snap.get("expiries") or []
 _front = _sel_snap.get("front_month_expiry")
+
+_sel_col, _ = st.columns([1, 5])
 with _sel_col:
     if _expiries:
         _default_idx = _expiries.index(_front) if _front in _expiries else 0
