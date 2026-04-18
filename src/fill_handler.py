@@ -5,8 +5,6 @@ and triggers immediate quote re-evaluation.
 """
 
 import logging
-import threading
-import time
 from datetime import datetime, timezone
 
 from ib_insync import ExecutionFilter
@@ -14,9 +12,6 @@ from ib_insync import ExecutionFilter
 from .discord_notify import send_fill_notification
 
 logger = logging.getLogger(__name__)
-
-# Delay (seconds) before capturing the post-fill mark for AS classification.
-POST_FILL_MARK_DELAY = 5.0
 
 
 class FillHandler:
@@ -179,7 +174,7 @@ class FillHandler:
         # the new Position carries zeros until the next 5-minute refresh tick,
         # which makes per-fill decomposition (spread vs theta vs MtM) useless.
         try:
-            self.portfolio.refresh_greeks(self.market_data.state)
+            self.portfolio.refresh_greeks()
         except Exception:
             logger.exception("refresh_greeks after fill failed")
 
@@ -244,17 +239,6 @@ class FillHandler:
             underlying_price=underlying_at_fill,
         )
 
-        # Delayed post-fill mark capture for adverse selection classification.
-        # After POST_FILL_MARK_DELAY seconds, read the current mid and
-        # compare to fill price. Log the result as a separate CSV row.
-        if trade is not None:
-            threading.Thread(
-                target=self._delayed_mark_check,
-                args=(strike, expiry, put_call, side, fill_price,
-                      underlying_at_fill, abs(quantity)),
-                daemon=True,
-            ).start()
-
         # Immediately re-evaluate all quotes (fill changes portfolio state).
         # For replayed fills (trade=None), the quote loop is not yet running
         # — skip this to avoid running update_quotes before the main loop has
@@ -264,57 +248,6 @@ class FillHandler:
             # conditions so previously-rejected keys may now be acceptable.
             self.quotes._margin_rejected.clear()
             self.quotes.update_quotes(self.portfolio)
-
-    def _delayed_mark_check(self, strike, expiry, put_call, side, fill_price,
-                            underlying_at_fill, quantity):
-        """Capture the mark POST_FILL_MARK_DELAY seconds after a fill and
-        classify as adverse selection or favorable."""
-        time.sleep(POST_FILL_MARK_DELAY)
-        try:
-            mult = self.config.product.multiplier
-            underlying_now = self.market_data.state.underlying_price
-            bid, ask = self.market_data.get_clean_bbo(
-                strike, put_call, expiry=expiry)
-            if bid > 0 and ask > 0:
-                mark = (bid + ask) / 2.0
-            else:
-                mark = 0.0
-                return  # can't classify without a mark
-
-            underlying_move = underlying_now - underlying_at_fill
-            # Realized edge: positive = we did well, negative = AS
-            if side == "BOUGHT":
-                realized_edge = mark - fill_price
-            else:
-                realized_edge = fill_price - mark
-            realized_pnl = realized_edge * mult * quantity
-
-            if realized_edge < 0:
-                classification = "adverse_selection"
-            elif realized_edge > 0:
-                classification = "favorable"
-            else:
-                classification = "neutral"
-
-            logger.info(
-                "FILL CLASSIFICATION [%ds]: %s %s%.0f filled@%.2f mark=%.2f "
-                "realized_edge=%.2f (%.0f) F_at_fill=%.2f F_now=%.2f ΔF=%.2f → %s",
-                int(POST_FILL_MARK_DELAY), side, put_call, strike,
-                fill_price, mark, realized_edge, realized_pnl,
-                underlying_at_fill, underlying_now, underlying_move,
-                classification,
-            )
-
-            self.csv_logger.log_fill_classification(
-                strike=strike, expiry=expiry, put_call=put_call,
-                side=side, fill_price=fill_price, mark=mark,
-                realized_edge=realized_edge, realized_pnl=realized_pnl,
-                underlying_at_fill=underlying_at_fill,
-                underlying_now=underlying_now,
-                classification=classification,
-            )
-        except Exception as e:
-            logger.warning("Delayed mark check failed: %s", e)
 
     async def replay_missed_executions(self, session_start_utc: datetime) -> int:
         """Backfill any executions that happened while we were disconnected.

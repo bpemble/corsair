@@ -53,6 +53,13 @@ class OptionQuote:
     dom_bids: List[Tuple[float, int]] = field(default_factory=list)
     dom_asks: List[Tuple[float, int]] = field(default_factory=list)
     dom_last_update: datetime = field(default_factory=datetime.now)
+    # IV inversion cache: brentq is ~200-500us per call and fires every
+    # time bid/ask changes. Bids/asks frequently flicker back to a value
+    # that was already inverted a moment ago (same tick level, same F ±
+    # a few bps) — in that case the cached IV is still valid and we can
+    # skip the solve entirely.
+    _iv_cache_mid: float = 0.0
+    _iv_cache_F: float = 0.0
 
 
 @dataclass
@@ -683,17 +690,27 @@ class MarketDataManager:
         # the tick path (~200-500us per call) and pure waste on volume/last-only
         # ticks. IBKR's modelGreeks.impliedVol uses a different reference and
         # produces ~2% inflated values, so we always compute our own.
+        # Second-level cache: when (mid, F) match the last successful solve
+        # (tick flicker back to a prior value, F barely moved), reuse.
         if (bid_ask_changed and quote.bid > 0 and quote.ask > 0
                 and self.state.underlying_price > 0):
             mid = (quote.bid + quote.ask) / 2
+            F = self.state.underlying_price
             tte = days_to_expiry(quote.expiry) / 365.0
             if tte > 0:
-                iv = PricingEngine.implied_vol(
-                    mid, self.state.underlying_price, quote.strike, tte,
-                    right=quote.put_call,
-                )
-                if iv is not None:
-                    quote.iv = iv
+                if (quote.iv > 0
+                        and mid == quote._iv_cache_mid
+                        and quote._iv_cache_F > 0
+                        and abs(F - quote._iv_cache_F) < 0.0005 * quote._iv_cache_F):
+                    pass  # cached IV still valid
+                else:
+                    iv = PricingEngine.implied_vol(
+                        mid, F, quote.strike, tte, right=quote.put_call,
+                    )
+                    if iv is not None:
+                        quote.iv = iv
+                        quote._iv_cache_mid = mid
+                        quote._iv_cache_F = F
 
         quote.last_update = datetime.now()
 

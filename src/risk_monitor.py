@@ -41,7 +41,7 @@ class RiskMonitor:
             return
 
         # Refresh Greeks
-        self.portfolio.refresh_greeks(market_state)
+        self.portfolio.refresh_greeks()
 
         # Update cached margin
         if hasattr(self.margin, 'update_cached_margin'):

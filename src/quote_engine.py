@@ -1269,6 +1269,10 @@ class QuoteManager:
 
         # Error 201: margin rejection. Track the key so we don't re-submit
         # the same order every cycle. Cleared on fills (margin may change).
+        # Also invalidate the cross-product margin cache: IBKR's view of
+        # used capital just moved, so any sibling engine's cached portfolio
+        # (e.g. HG while this rejection came from ETH) is now stale and
+        # could pass a check that the shared budget won't actually allow.
         if errorCode == 201:
             for key, oid in list(self.active_orders.items()):
                 if oid == reqId:
@@ -1276,6 +1280,12 @@ class QuoteManager:
                     self.active_orders.pop(key, None)
                     self._order_underlying.pop(oid, None)
                     break
+            mc = self.constraint_checker.margin
+            coord = getattr(mc, "coordinator", None)
+            if coord is not None:
+                coord.invalidate_portfolio()
+            else:
+                mc.invalidate_portfolio()
             return
 
         if errorCode != 104:

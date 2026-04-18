@@ -7,6 +7,7 @@ write via temp file + os.replace so the dashboard never sees a partial
 snapshot.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -297,6 +298,13 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
     }
 
     path = getattr(config.logging, "snapshot_path", DEFAULT_SNAPSHOT_PATH)
+    _schedule_snapshot_write(snapshot, path)
+
+
+def _write_snapshot_to_disk(snapshot: dict, path: str) -> None:
+    """Atomic-write one snapshot dict to *path*. Always runs in a worker
+    thread via the asyncio default executor (fall back to inline on paths
+    that have no running loop, e.g. unit tests)."""
     tmp = path + ".tmp"
     try:
         os.makedirs(os.path.dirname(tmp), exist_ok=True)
@@ -305,5 +313,17 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         os.replace(tmp, path)
     except Exception as e:
         logger.warning("Failed to write chain snapshot: %s", e)
+
+
+def _schedule_snapshot_write(snapshot: dict, path: str) -> None:
+    """Fire-and-forget the JSON encode + disk write. `json.dump(indent=2)`
+    on our ~10KB payload plus the atomic rename add up to several ms per
+    snapshot at 4Hz — doing that on the event loop blocks tick handling."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _write_snapshot_to_disk(snapshot, path)
+        return
+    loop.run_in_executor(None, _write_snapshot_to_disk, snapshot, path)
 
 

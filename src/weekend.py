@@ -44,7 +44,7 @@ def monday_startup(market_state, portfolio, margin_checker, config) -> bool:
         return False
 
     # 2. Refresh Greeks with Monday's prices
-    portfolio.refresh_greeks(market_state)
+    portfolio.refresh_greeks()
 
     # 3. Check margin
     current_margin = margin_checker.get_current_margin()

@@ -160,7 +160,7 @@ class PortfolioState:
     def vega_for_product(self, product: str) -> float:
         return sum(p.vega * p.quantity for p in self.positions if p.product == product)
 
-    def seed_from_ibkr(self, ib, account_id: str, market_state=None) -> int:
+    def seed_from_ibkr(self, ib, account_id: str) -> int:
         """Sync existing option positions from IBKR for ALL registered products.
 
         Multi-product: walks ``ib.positions(account_id)`` once and accepts
@@ -174,10 +174,6 @@ class PortfolioState:
         (initial startup + each watchdog reseed after a reconnect) don't
         accumulate duplicates. Filters require secType='FOP' and a real
         option right — ignores everything else (futures, equities).
-
-        ``market_state`` is accepted for backward compat but ignored;
-        ``refresh_greeks`` now dispatches to each position's product-
-        specific market_data via the registry.
         """
         self.positions.clear()
         if not self._products:
@@ -274,13 +270,11 @@ class PortfolioState:
         self.spread_capture_today += spread_captured
         self.spread_capture_mid_today += spread_captured_mid
 
-    def refresh_greeks(self, market_state=None):
+    def refresh_greeks(self):
         """Recompute all position Greeks using current market data.
 
         Multi-product: each position dispatches to its product's registered
-        market_data and SABR (for IV fallback). The legacy ``market_state``
-        argument is accepted but ignored — kept so existing call sites in
-        risk_monitor / weekend / fill_handler don't have to change.
+        market_data and SABR (for IV fallback).
         """
         for pos in self.positions:
             prod_entry = self._products.get(pos.product)

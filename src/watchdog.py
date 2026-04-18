@@ -408,8 +408,7 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                         pass
                 else:
                     await asyncio.sleep(3)  # let initial ticks settle
-                    seeded = portfolio.seed_from_ibkr(
-                        ib, account_id, market_state=market_data.state)
+                    seeded = portfolio.seed_from_ibkr(ib, account_id)
                     logger.info("WATCHDOG: reseeded %d position(s) after reconnect", seeded)
                     margin.invalidate_portfolio()
                     sabr.set_expiries(market_data.state.expiries)
@@ -494,8 +493,7 @@ async def watchdog_loop(conn, market_data, quotes, portfolio, margin, risk,
                     try:
                         if await conn.connect() and await safe_discover_and_subscribe(market_data):
                             await asyncio.sleep(3)
-                            seeded = portfolio.seed_from_ibkr(
-                                ib, account_id, market_state=market_data.state)
+                            seeded = portfolio.seed_from_ibkr(ib, account_id)
                             logger.info(
                                 "WATCHDOG: post-escalation reseed: %d position(s)",
                                 seeded,
