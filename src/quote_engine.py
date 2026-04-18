@@ -610,6 +610,21 @@ class QuoteManager:
         config = self.config
         tick = config.quoting.tick_size
 
+        # Back-month dampeners (crowsnest 2026-04-18 hotfix). Anything that
+        # isn't the front month has thin SVI support (7-10 strikes per side)
+        # so theo is extrapolated with wide uncertainty. Widen the quoted
+        # edge (via effective_min_edge) and shrink size to cap the dollar
+        # damage per fill. Defaults to no-op (mul = 1.0) when config knobs
+        # are absent.
+        _is_back = (expiry != self.market_data.state.front_month_expiry)
+        _width_mul = (float(getattr(config.quoting, "backmonth_width_mul", 1.0))
+                      if _is_back else 1.0)
+        _size_mul = (float(getattr(config.quoting, "backmonth_size_mul", 1.0))
+                     if _is_back else 1.0)
+        effective_min_edge = float(config.pricing.min_edge_points or 0.0) * _width_mul
+        effective_quote_size = max(
+            1, int(round(config.product.quote_size * _size_mul)))
+
         if theo is not None and option is not None:
             theo = delta_adjust_theo(theo, option.delta,
                                      cal_forward, current_underlying)
@@ -672,7 +687,7 @@ class QuoteManager:
         _retreated = False
         if _bypass_wide_market:
 
-            edge_floor = float(config.pricing.min_edge_points or 0.0)
+            edge_floor = effective_min_edge
             mkt_bid, mkt_ask = self.market_data.get_clean_bbo(
                 strike, right, expiry=expiry)
             if mkt_bid > 0 and mkt_ask > 0:
@@ -732,9 +747,9 @@ class QuoteManager:
         # want the highest tick at or below (theo − edge); for a SELL cap
         # we want the lowest tick at or above (theo + edge). round_to_tick
         # is nearest-tick and could land on the wrong side by one tick.
-        if theo is not None and config.pricing.min_edge_points > 0:
+        if theo is not None and effective_min_edge > 0:
 
-            edge_floor = config.pricing.min_edge_points
+            edge_floor = effective_min_edge
             if side == "BUY":
                 cap_raw = theo - edge_floor
                 capped = floor_to_tick(cap_raw, tick)
@@ -769,8 +784,8 @@ class QuoteManager:
         # (no hysteresis); set theo_edge_hysteresis_ticks: 2 in config to
         # smooth at the cost of slightly higher behind% on stale quotes.
         key = (strike, expiry, right, side)
-        if theo is not None and config.pricing.min_edge_points > 0:
-            edge = config.pricing.min_edge_points
+        if theo is not None and effective_min_edge > 0:
+            edge = effective_min_edge
             hyst = int(getattr(config.pricing, "theo_edge_hysteresis_ticks", 1))
             violates = (adj > theo - edge) if side == "BUY" else (adj < theo + edge)
             if violates:
@@ -798,7 +813,7 @@ class QuoteManager:
         )
         if can_quote:
             self._send_or_update(strike, expiry, right, side, adj,
-                                 config.product.quote_size, option, theo=theo)
+                                 effective_quote_size, option, theo=theo)
             self._log_quote_telemetry(strike, right, side, adj, inc_info, theo=theo)
         else:
             self._cancel_quote(strike, expiry, right, side)

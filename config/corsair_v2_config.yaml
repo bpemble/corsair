@@ -95,6 +95,14 @@ quoting:
   max_modifies_per_sec_per_oid: 5
   # Hard cap on total resting orders per side across all strikes.
   max_resting_per_side: 90
+  # Back-month dampeners (crowsnest 2026-04-18 hotfix). SVI fits only
+  # 7-10 strikes per side on back months, so ATM theo is extrapolated
+  # with wide uncertainty bands. Widen our quoted edge (× width_mul) and
+  # shrink size (× size_mul) on anything that isn't the front month,
+  # capping dollar damage while Change 3 (fallback surface + higher
+  # min-strikes gate) lands.
+  backmonth_width_mul: 2.0
+  backmonth_size_mul: 0.5
   refresh_interval_ms: 1000
   tick_batch_window_sec: 0.005
   snapshot_write_interval_sec: 0.25
@@ -196,7 +204,11 @@ products:
     # HG-specific overrides for shared config blocks. All dollar-denominated
     # thresholds are ~1/400th of ETH's (HG ~$6/lb vs ETH ~$2300).
     quoting:
-      enabled_expiries: ["front", "front+1"]
+      # Observe-only until strike density improves (crowsnest 2026-04-18
+      # Change 4). Market data keeps flowing so we can measure density
+      # over time; revisit monthly. Re-enable front-only when snapshot
+      # front-strike count per side stays ≥ 10 median for a week.
+      enabled_expiries: []
       tick_size: 0.0005        # HG option minimum tick ($0.0005/lb = $12.50/contract)
       max_bbo_width_dollars: 0.05
       delta_retreat_threshold: 0.02
