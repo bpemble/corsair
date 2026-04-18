@@ -447,12 +447,28 @@ class SABRSurface:
         self._front_month_expiry = expiry
 
     def get_vol(self, strike: float, put_call: str = "C") -> float:
-        """Return implied vol for a given strike using per-side params."""
+        """Return implied vol for a given strike using the OTM-side's fit.
+
+        Each side's parameters are fitted to that side's OTM wing data
+        (C-side against K >= F, P-side against K < F), so we consult the
+        fit whose native region actually covers the strike. Routing by
+        ``put_call`` instead produced a parity-violating vol gap (back-
+        month ATM: ~2 vol points, median ~$408/contract) because a call
+        at K=F was priced from the C extrapolation while a put at the
+        same K was priced from the P extrapolation — two different IVs
+        at one strike. The ``put_call`` argument is kept for call-site
+        compatibility but ignored by the routing.
+        """
         tte = self._get_tte()
         if tte <= 0:
             return 0.0
-        side = put_call.upper()
-        sp = self._side_params.get(side, self._side_params["C"])
+        # Before the first calibration establishes forward, fall back to
+        # the C-side defaults — matches prior behavior at boot.
+        if self.forward > 0:
+            side = "C" if strike >= self.forward else "P"
+        else:
+            side = "C"
+        sp = self._side_params[side]
         if self._vol_model == "svi" and sp.get("svi_params") is not None:
             p = sp["svi_params"]
             return svi_implied_vol(self.forward, strike, tte,
