@@ -134,6 +134,12 @@ pricing:
   sabr_beta: 0.5               # Only used when vol_model=sabr
   sabr_max_rmse: 0.03
   sabr_min_strikes: 8
+  # SVI-specific minimum. Used only when vol_model=svi. Raised to 10
+  # per crowsnest Change 3 so we stop accepting underdetermined 5-param
+  # fits on 5-8 strikes. Back-months that fail this gate fall back to the
+  # term-structure-interpolation surface in src/backmonth_surface.py
+  # (front-month shape + back-month level anchor).
+  svi_min_strikes: 10
   stale_iv_threshold: 0.10
   max_calibration_bbo_width: 10.0
 

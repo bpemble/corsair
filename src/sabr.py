@@ -20,6 +20,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 from scipy.optimize import least_squares
 
+from . import backmonth_surface as _tsi
 from .pricing import PricingEngine
 from .utils import time_to_expiry_years
 
@@ -604,6 +605,7 @@ def _async_fit_worker(forward_in: float, expiries_data: dict,
         parity_delta = (implied - forward_in) if implied is not None else None
         side_results = {}
         side_n = {}
+        side_obs = {}
         for side in ('C', 'P'):
             cal_data = []
             for o in opts:
@@ -616,6 +618,10 @@ def _async_fit_worker(forward_in: float, expiries_data: dict,
                         mid, forward, o['strike'], tte, right=side)
                     if iv is not None and iv > 0:
                         cal_data.append((o['strike'], iv, ask - bid))
+            # Carry the cleaned (strike, iv) pairs forward regardless of
+            # whether the native fit will accept the set — the TSI fallback
+            # needs these as anchors when the min-strike gate fails.
+            side_obs[side] = [(s, v) for s, v, _ in cal_data]
             min_pts = 5 if use_svi else 3
             if len(cal_data) < min_pts:
                 side_results[side] = None
@@ -640,6 +646,8 @@ def _async_fit_worker(forward_in: float, expiries_data: dict,
             'forward': forward, 'parity_delta': parity_delta,
             'C': side_results.get('C'), 'P': side_results.get('P'),
             'C_n': side_n.get('C', 0), 'P_n': side_n.get('P', 0),
+            'C_obs': side_obs.get('C', []),
+            'P_obs': side_obs.get('P', []),
         }
     return out
 
@@ -798,6 +806,62 @@ class MultiExpirySABR:
         self._cal_future.add_done_callback(self._apply_fit_results)
         return True
 
+    def _tsi_fallback(self, exp: str, side: str, forward: float,
+                       observations) -> Optional["_tsi.SVIParams"]:
+        """Build a term-structure-interpolation SVI for ``(exp, side)``.
+
+        Walks the existing surface set to find the earliest expiry (other
+        than ``exp``) whose same-side fit is valid — that becomes the donor
+        whose skew shape (b, ρ, m, σ) we reuse. Level ``a`` is solved from
+        the near-ATM anchors in ``observations``.
+
+        Returns None when no donor is available, no near-ATM anchors exist,
+        or the synthesized surface fails a basic no-arb check. Caller
+        treats that as "calibration skip" (same as the pre-fallback path).
+        """
+        donor = None
+        donor_exp: Optional[str] = None
+        for candidate in self._expiries:
+            if candidate == exp:
+                continue
+            other = self._surfaces.get(candidate)
+            if other is None:
+                continue
+            p = other._side_params.get(side, {}).get("svi_params")
+            if p is not None:
+                donor = p
+                donor_exp = candidate
+                break
+        if donor is None:
+            return None
+        tte = time_to_expiry_years(exp)
+        if tte <= 0 or forward <= 0:
+            return None
+        anchors = _tsi.extract_atm_anchors(observations, forward)
+        if not anchors:
+            return None
+        # Adapt the donor to backmonth_surface.SVIParams so the fallback
+        # sees the fields it expects (our native SVIParams lacks the
+        # provenance fields but duck-types fine for the shape inputs).
+        donor_view = _tsi.SVIParams(
+            a=donor.a, b=donor.b, rho=donor.rho, m=donor.m, sigma=donor.sigma,
+            rmse=getattr(donor, "rmse", 0.0),
+            n_points=getattr(donor, "n_points", 0),
+        )
+        fallback = _tsi.fit_backmonth_from_frontmonth(
+            donor_view, anchors, forward, tte, donor_expiry_tag=donor_exp,
+        )
+        if fallback is None:
+            return None
+        ok, reason = _tsi.no_arb_check(fallback)
+        if not ok:
+            logger.warning(
+                "TSI fallback [%s %s] rejected by no-arb check: %s",
+                exp, side, reason,
+            )
+            return None
+        return fallback
+
     def _apply_fit_to_surface(self, surf, exp: str, res: dict):
         """Apply a per-expiry fit result to one surface. Caller must hold
         ``self._params_lock``. Shared by the async ProcessPool callback and
@@ -811,17 +875,38 @@ class MultiExpirySABR:
             )
         use_svi = (surf._vol_model == "svi")
         model_name = "SVI" if use_svi else "SABR"
-        min_strikes = int(getattr(
-            self.config.pricing, "sabr_min_strikes", 8))
+        sabr_min = int(getattr(self.config.pricing, "sabr_min_strikes", 8))
+        svi_min = int(getattr(self.config.pricing, "svi_min_strikes", 10))
         any_updated = False
         for side in ("C", "P"):
             result = res.get(side)
             if result is None:
                 continue
             quality_ok, quality_reason = (
-                _svi_quality_ok(result, min_strikes // 2) if use_svi
-                else _sabr_quality_ok(result, min_strikes // 2)
+                _svi_quality_ok(result, svi_min) if use_svi
+                else _sabr_quality_ok(result, sabr_min // 2)
             )
+            tsi_used = False
+            if not quality_ok and use_svi:
+                # Native fit failed the gate — attempt the term-structure-
+                # interpolation fallback. Borrows skew shape from a donor
+                # expiry that DID fit well; anchors level to whatever
+                # near-ATM observations the calibrator had at this expiry.
+                fallback = self._tsi_fallback(
+                    exp, side, res['forward'],
+                    res.get(f'{side}_obs') or [],
+                )
+                if fallback is not None:
+                    result = fallback
+                    quality_ok = True
+                    tsi_used = True
+                    logger.info(
+                        "SVI %s [%s] TSI fallback: donor=%s anchors=%d "
+                        "a=%.4f (borrowed b=%.4f rho=%+.3f m=%.4f sigma=%.4f)",
+                        side, exp, result.tsi_donor_expiry,
+                        result.tsi_anchor_count, result.a, result.b,
+                        result.rho, result.m, result.sigma,
+                    )
             if not quality_ok:
                 logger.warning(
                     "%s %s [%s] fit rejected (%s): RMSE=%.4f n=%d",
@@ -831,7 +916,11 @@ class MultiExpirySABR:
                 continue
             sp = surf._side_params[side]
             prior = sp.get("svi_params") if use_svi else sp.get("params")
-            if prior is not None and result.rmse > max(prior.rmse * 1.5, 0.01):
+            # Skip RMSE regression check on TSI fallbacks — their `rmse`
+            # field is anchor-dispersion, not a real fit residual, so the
+            # 1.5× threshold comparison is meaningless.
+            if (not tsi_used and prior is not None
+                    and result.rmse > max(prior.rmse * 1.5, 0.01)):
                 logger.warning(
                     "%s %s [%s] fit rejected (rmse_regression %.4f > 1.5x prior %.4f)",
                     model_name, side, exp, result.rmse, prior.rmse,
