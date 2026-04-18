@@ -315,7 +315,11 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         "strikes": strikes_data,
     }
 
-    path = getattr(config.logging, "snapshot_path", DEFAULT_SNAPSHOT_PATH)
+    # Per-product snapshot path is attached to the product-view config by
+    # make_product_config(). Fall back to the legacy logging.snapshot_path
+    # or the project default for config paths where it's not set.
+    path = getattr(config, "snapshot_path",
+                   getattr(config.logging, "snapshot_path", DEFAULT_SNAPSHOT_PATH))
     _schedule_snapshot_write(snapshot, path)
 
 

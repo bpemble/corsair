@@ -11,7 +11,6 @@ import logging
 import os
 import signal
 import time as _time
-from types import SimpleNamespace
 from typing import Optional
 from datetime import datetime, date, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -19,7 +18,7 @@ from zoneinfo import ZoneInfo
 from . import ib_insync_patch as _ib_insync_patch
 _ib_insync_patch.apply()  # must run before any IB instance is created
 
-from .config import load_config, make_observe_config
+from .config import load_config, make_product_config
 from .utils import setup_logging
 from .connection import IBKRConnection
 from .market_data import MarketDataManager
@@ -59,18 +58,12 @@ def _validate_safety_config(cfg) -> None:
     of 50, or margin_kill_pct accidentally below margin_ceiling_pct) silently
     corrupts every margin/PnL calc downstream. Assert at startup so we crash
     loudly instead of trading on bad math.
+
+    Walks every entry in ``cfg.products`` so a bad multiplier/quote_size on
+    a secondary product is caught the same as on the primary.
     """
-    p = cfg.product
     c = cfg.constraints
     k = cfg.kill_switch
-    assert 1 <= int(p.multiplier) <= 1000, (
-        f"FATAL: product.multiplier out of safe range [1,1000], got {p.multiplier}. "
-        "Wrong multiplier silently corrupts margin and P&L proportionally. "
-        "CME ETH FOP = 50; common futures-option multipliers fall in this band."
-    )
-    assert 1 <= int(p.quote_size) <= 5, (
-        f"FATAL: product.quote_size out of safe range [1,5], got {p.quote_size}"
-    )
     assert 50_000 <= c.capital <= 2_000_000, (
         f"FATAL: constraints.capital out of safe range, got {c.capital}"
     )
@@ -93,10 +86,24 @@ def _validate_safety_config(cfg) -> None:
     assert float(k.delta_kill) > float(c.delta_ceiling), (
         f"FATAL: delta_kill ({k.delta_kill}) must be > delta_ceiling ({c.delta_ceiling})"
     )
+    assert getattr(cfg, "products", None), "FATAL: config.products is empty"
+    for entry in cfg.products:
+        p = entry.product
+        assert 1 <= int(p.multiplier) <= 100_000, (
+            f"FATAL: {entry.name}.product.multiplier out of safe range "
+            f"[1,100000], got {p.multiplier}. Wrong multiplier silently "
+            f"corrupts margin and P&L proportionally."
+        )
+        assert 1 <= int(p.quote_size) <= 5, (
+            f"FATAL: {entry.name}.product.quote_size out of safe range [1,5], "
+            f"got {p.quote_size}"
+        )
+    products_summary = ", ".join(
+        f"{e.name}(mult={e.product.multiplier})" for e in cfg.products)
     logger.info(
-        "✓ Safety config validated: mult=%d cap=$%d ceiling=%.0f%% kill=%.0f%% "
-        "delta_ceil=%.1f delta_kill=%.1f",
-        p.multiplier, c.capital, c.margin_ceiling_pct * 100,
+        "✓ Safety config validated: products=[%s] cap=$%d ceiling=%.0f%% "
+        "kill=%.0f%% delta_ceil=%.1f delta_kill=%.1f",
+        products_summary, c.capital, c.margin_ceiling_pct * 100,
         k.margin_kill_pct * 100, c.delta_ceiling, k.delta_kill,
     )
 
@@ -207,96 +214,28 @@ async def main():
 
     ib = conn.ib
 
-    # ── 3. Initialize components ──────────────────────────────────────
+    # ── 3. Shared infrastructure ──────────────────────────────────────
     csv_logger = CSVLogger(config)
-    market_data = MarketDataManager(ib, config, csv_logger=csv_logger)
     portfolio = PortfolioState(config)
-
-    sabr = MultiExpirySABR(config, csv_logger=csv_logger)
-    # Register the primary product so seed_from_ibkr knows to keep its
-    # positions. Each secondary (HG, etc.) engine registers its own
-    # product once its market_data is ready, then we re-seed across all
-    # products. seed_from_ibkr is idempotent (clears then refills).
-    portfolio.register_product(
-        config.product.underlying_symbol,
-        config.product.multiplier,
-        market_data, sabr,
-    )
-
-    # Initial primary-product seed. Re-run after observer setup so the
-    # full multi-product position book is in scope for ensure_position_*
-    # and the periodic reconcile.
-    seeded = portfolio.seed_from_ibkr(ib, config.account.account_id)
-    if seeded:
-        logger.info("Reconciled %d existing %s option position(s) from IBKR",
-                    seeded, config.product.underlying_symbol)
-
-    # SABR is passed to the margin checker so it can fall back to fitted vol
-    # when a position's strike has no fresh bid/ask tick (otherwise positions
-    # at quiet wing strikes get silently dropped from the SPAN calc).
-    margin = IBKRMarginChecker(ib, config, market_data, portfolio, sabr=sabr,
-                               csv_logger=csv_logger)
     # MarginCoordinator owns IBKR account-value comm and cross-product
     # synthetic→IBKR scale calibration. Per-product engines register here
     # so their public margin APIs return COMBINED across-product numbers.
     margin_coord = MarginCoordinator(ib, config.account.account_id,
                                      csv_logger=csv_logger)
-    margin_coord.register(margin)
-    constraint_checker = ConstraintChecker(margin, portfolio, config)
-    quotes = QuoteManager(ib, config, market_data, sabr, constraint_checker,
-                          csv_logger=csv_logger)
-    # Back-reference so the trade-tape capture in market_data can look up
-    # our resting state at print time.
-    market_data.quotes = quotes
-    risk = RiskMonitor(portfolio, margin_coord, quotes, csv_logger, config)
-    # product_filter must be the IBKR underlying symbol (what
-    # fill.contract.symbol returns), NOT the option_symbol. Until 2026-04-14
-    # this was set to option_symbol and silently dropped every fill — which
-    # is how the system accumulated 5 orphan HG short calls in the 2-minute
-    # window between boot and the next reconcile. Fail-loud now via
-    # PortfolioState's add_fill product-registry warning if a stray fill
-    # ever does slip through with the wrong product key.
-    fills = FillHandler(ib, portfolio, margin, quotes, market_data, csv_logger, config,
-                        product_filter=config.product.underlying_symbol)
 
-    # ── 4. Register disconnect callback ───────────────────────────────
-    def on_disconnect():
-        logger.critical("GATEWAY DISCONNECT — panic cancelling all quotes")
-        # Use panic_cancel (reqGlobalCancel) instead of the per-order
-        # walk: a single message is faster and more likely to reach
-        # IBKR before the socket fully tears down. Worst-case bad-fill
-        # exposure on disconnect is determined by how fast we can get
-        # the book empty here.
-        try:
-            quotes.panic_cancel()
-        except Exception as e:
-            logger.error("panic_cancel on disconnect failed: %s", e)
-        # Tag the kill as disconnect-induced so the watchdog can clear it
-        # after a successful reconnect.
-        risk.kill("Gateway disconnect", source="disconnect")
-
-    conn.set_disconnect_callback(on_disconnect)
-
-    # ── 5. Cancel any stale orders from previous runs ───────────────
+    # ── 4. Cancel stale orders from previous runs ─────────────────────
     # On clientId=0 the openTrades cache is populated asynchronously after
-    # reqAutoOpenOrders + reqOpenOrders complete during connect. Wait briefly
-    # so the cache reflects EVERY orphan that's still resting on IBKR's books
-    # — otherwise we miss most of them and the new session immediately hits
-    # IBKR's per-contract working-order limit (Error 201, "minimum of 15
-    # orders working on either the buy or sell side for this particular
-    # contract").
+    # reqAutoOpenOrders + reqOpenOrders complete during connect. Wait
+    # briefly so the cache reflects EVERY orphan still resting on IBKR's
+    # books — otherwise we miss most and the new session immediately hits
+    # the per-contract working-order limit.
     await asyncio.sleep(3)
-
     cancelled = 0
-    # Only cancel orders that are actually in a cancellable state. ib_insync's
-    # openTrades() can return trades whose terminal status (Filled, Cancelled,
-    # Inactive) hasn't been pruned yet from the local cache, and blindly
-    # cancelling those produces "Error 161: Cancel attempted when order is not
-    # in a cancellable state" noise in the logs.
     _CANCELLABLE = {"PendingSubmit", "PreSubmitted", "Submitted", "ApiPending"}
-    snapshot = list(ib.openTrades())
-    logger.info("Stale-order sweep: %d trades visible in openTrades cache", len(snapshot))
-    for trade in snapshot:
+    open_snapshot = list(ib.openTrades())
+    logger.info("Stale-order sweep: %d trades visible in openTrades cache",
+                len(open_snapshot))
+    for trade in open_snapshot:
         ref = getattr(trade.order, "orderRef", "") or ""
         if not ref.startswith("corsair"):
             continue
@@ -310,83 +249,185 @@ async def main():
             pass
     if cancelled:
         logger.info("Cancelled %d stale orders from previous run", cancelled)
-        # Give IBKR time to actually process the cancels and free up the
-        # per-contract working-order slots before we start placing new ones.
         await asyncio.sleep(5)
 
-    # ── 6. Subscribe to market data with hard timeout + retry ─────────
-    # IB Gateway can complete connect() but then hang inside the discovery
-    # path. Wrap in a timeout and retry with backoff. After N consecutive
-    # discovery failures, escalate to a gateway container recreate (volume
-    # wipe + fresh container) — the lighter container.restart() doesn't
-    # reliably clear the IBC session-state corruption we keep hitting.
-    logger.info("Discovering option chain and subscribing to market data...")
-    startup_attempt = 0
-    discovery_fails = 0
-    while not await safe_discover_and_subscribe(market_data):
-        discovery_fails += 1
-        if discovery_fails >= RECOVERY_FAILS_BEFORE_GATEWAY_RESTART:
-            logger.critical(
-                "Startup: %d consecutive discovery failures — escalating "
-                "to gateway recreate", discovery_fails,
-            )
-            try:
-                await conn.disconnect()
-            except Exception:
-                pass
-            if escalate_gateway_recreate():
-                await asyncio.sleep(GATEWAY_RESTART_SETTLE_SEC)
-                discovery_fails = 0
-                startup_attempt = 0
-            if not await conn.connect():
-                logger.error("Post-escalation reconnect failed; will retry")
-            continue
-
-        wait = STARTUP_RETRY_BACKOFF_SEC[
-            min(startup_attempt, len(STARTUP_RETRY_BACKOFF_SEC) - 1)
-        ]
-        startup_attempt += 1
-        logger.warning(
-            "Startup discovery failed (attempt %d) — bouncing connection and "
-            "retrying in %ds", startup_attempt, wait,
+    # ── 5. Per-product engines ────────────────────────────────────────
+    # Each entry in config.products gets its own MarketDataManager, SABR,
+    # IBKRMarginChecker, ConstraintChecker, QuoteManager, and FillHandler.
+    # They share the single PortfolioState and MarginCoordinator (margin/
+    # delta/theta budgets are portfolio-level). engines[0] is the
+    # "primary" — distinguished only in that the watchdog monitors its
+    # tick stream for freshness, its snapshot is the docker healthcheck
+    # target, and its discovery has the aggressive retry+escalate path
+    # (secondary failures just skip that product without blocking boot).
+    engines: list = []
+    for i, product_entry in enumerate(config.products):
+        is_primary = (i == 0)
+        pcfg = make_product_config(config, product_entry)
+        logger.info("Setting up product engine: %s (primary=%s)",
+                    pcfg.name, is_primary)
+        md = MarketDataManager(ib, pcfg, csv_logger=csv_logger)
+        sabr = MultiExpirySABR(pcfg, csv_logger=csv_logger)
+        portfolio.register_product(
+            pcfg.product.underlying_symbol,
+            pcfg.product.multiplier,
+            md, sabr,
         )
-        try:
-            await conn.disconnect()
-        except Exception:
-            pass
-        await asyncio.sleep(wait)
-        if not await conn.connect():
-            logger.error("Reconnect attempt failed; will retry next cycle")
-            continue
-    if startup_attempt > 0:
-        logger.info("Startup discovery succeeded after %d retries", startup_attempt)
 
-    # Wait for initial data to flow in (clean BBO without our orders)
-    logger.info("Waiting for initial market data (5s)...")
-    await asyncio.sleep(5)
+        # Discovery. Primary gets the full retry+escalate ladder — an
+        # IB Gateway that's up but wedged inside the discovery path has
+        # to be recreated. Secondaries just try once; a failure logs and
+        # skips the product without blocking the rest of the boot.
+        if is_primary:
+            startup_attempt = 0
+            discovery_fails = 0
+            while not await safe_discover_and_subscribe(md):
+                discovery_fails += 1
+                if discovery_fails >= RECOVERY_FAILS_BEFORE_GATEWAY_RESTART:
+                    logger.critical(
+                        "Startup: %d consecutive discovery failures — "
+                        "escalating to gateway recreate", discovery_fails,
+                    )
+                    try:
+                        await conn.disconnect()
+                    except Exception:
+                        pass
+                    if escalate_gateway_recreate():
+                        await asyncio.sleep(GATEWAY_RESTART_SETTLE_SEC)
+                        discovery_fails = 0
+                        startup_attempt = 0
+                    if not await conn.connect():
+                        logger.error("Post-escalation reconnect failed; will retry")
+                    continue
+                wait = STARTUP_RETRY_BACKOFF_SEC[
+                    min(startup_attempt, len(STARTUP_RETRY_BACKOFF_SEC) - 1)
+                ]
+                startup_attempt += 1
+                logger.warning(
+                    "Startup discovery failed (attempt %d) — bouncing "
+                    "connection and retrying in %ds", startup_attempt, wait,
+                )
+                try:
+                    await conn.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(wait)
+                if not await conn.connect():
+                    logger.error("Reconnect attempt failed; will retry next cycle")
+                    continue
+            if startup_attempt > 0:
+                logger.info("Startup discovery succeeded after %d retries",
+                            startup_attempt)
+        else:
+            if not await safe_discover_and_subscribe(md):
+                logger.warning("Product %s discovery failed, skipping", pcfg.name)
+                continue
 
-    logger.info(
-        "Market data ready: underlying=%.2f, ATM=%.0f, %d options, expiry=%s",
-        market_data.state.underlying_price,
-        market_data.state.atm_strike,
-        len(market_data.state.options),
-        market_data.state.front_month_expiry,
-    )
+        # Let initial ticks settle before building SABR / placing orders.
+        await asyncio.sleep(5 if is_primary else 3)
+        sabr.set_expiries(md.state.expiries)
 
-    # Set SABR expiry
-    sabr.set_expiries(market_data.state.expiries)
+        margin = IBKRMarginChecker(ib, pcfg, md, portfolio, sabr=sabr,
+                                   csv_logger=csv_logger)
+        margin_coord.register(margin)
+        cc = ConstraintChecker(margin, portfolio, pcfg)
+        quotes = QuoteManager(ib, pcfg, md, sabr, cc, csv_logger=csv_logger)
+        # Back-reference so the trade-tape capture in market_data can look
+        # up our resting state at print time.
+        md.quotes = quotes
+        # product_filter must be the IBKR underlying symbol (what
+        # fill.contract.symbol returns). Before 2026-04-14 this was set
+        # to option_symbol and silently dropped every fill.
+        fills_eng = FillHandler(ib, portfolio, margin, quotes, md,
+                                csv_logger, pcfg,
+                                product_filter=pcfg.product.underlying_symbol)
 
-    # Force-subscribe market data for any seeded position whose strike sits
-    # outside the initial ATM±N discovery window. Without this, off-window
-    # positions get delta=theta=0 in refresh_greeks() forever and silently
-    # understate header risk.
+        engines.append({
+            "name": pcfg.name,
+            "config": pcfg,
+            "md": md,
+            "sabr": sabr,
+            "margin": margin,
+            "quotes": quotes,
+            "fills": fills_eng,
+        })
+        logger.info(
+            "Product %s ready: underlying=%.4f, ATM=%.4f, %d options, expiry=%s",
+            pcfg.name, md.state.underlying_price, md.state.atm_strike,
+            len(md.state.options), md.state.front_month_expiry,
+        )
+
+    if not engines:
+        raise RuntimeError("No products successfully initialized — aborting")
+
+    # ── 6. Primary aliases (used by watchdog, disconnect cb, risk) ────
+    primary = engines[0]
+    market_data = primary["md"]
+    sabr = primary["sabr"]
+    quotes = primary["quotes"]
+    margin = primary["margin"]
+    fills = primary["fills"]
+    primary_config = primary["config"]
+
+    # ── 7. Risk monitor ───────────────────────────────────────────────
+    risk = RiskMonitor(portfolio, margin_coord, quotes, csv_logger, primary_config)
+
+    # ── 8. Disconnect callback ────────────────────────────────────────
+    def on_disconnect():
+        logger.critical("GATEWAY DISCONNECT — panic cancelling all quotes")
+        # panic_cancel (reqGlobalCancel) instead of per-order walks —
+        # one message is faster and more likely to reach IBKR before the
+        # socket fully tears down. Fan out across every engine's
+        # QuoteManager because reqGlobalCancel clears ALL clients' orders
+        # but we also want each engine to drop its local resting state
+        # so reconnect reseeding doesn't see ghosts.
+        for eng in engines:
+            try:
+                eng["quotes"].panic_cancel()
+            except Exception as e:
+                logger.error("panic_cancel on disconnect failed (%s): %s",
+                             eng["name"], e)
+        risk.kill("Gateway disconnect", source="disconnect")
+
+    conn.set_disconnect_callback(on_disconnect)
+
+    # ── 9. Seed portfolio + replay + ensure_position_subscribed ──────
+    # Reseed now that every product is registered (one walk of ib.positions
+    # for the whole account).
     try:
-        await market_data.ensure_position_subscribed(portfolio.positions)
+        seeded = portfolio.seed_from_ibkr(ib, config.account.account_id)
+        logger.info("Seeded %d position(s) across %d product(s)",
+                    seeded, len(engines))
     except Exception as e:
-        logger.warning("ensure_position_subscribed at startup failed: %s", e)
+        logger.warning("seed_from_ibkr failed: %s", e)
+
+    reset_hour_ct_early = int(getattr(getattr(config, "operations", object()),
+                                      "daily_reset_hour_ct", 17))
+    _session_start = _session_start_utc(datetime.now(tz=timezone.utc),
+                                        reset_hour_ct_early)
+
+    # Replay and force-subscribe per engine. Each engine's replay sees only
+    # its own product's fills (filtered in FillHandler via product_filter);
+    # off-window position subscriptions use each engine's own market_data.
+    for eng in engines:
+        try:
+            replayed = await eng["fills"].replay_missed_executions(_session_start)
+            if replayed:
+                logger.info("Product %s: backfilled %d missed fill(s)",
+                            eng["name"], replayed)
+        except Exception as e:
+            logger.warning("Product %s replay_missed_executions failed: %s",
+                           eng["name"], e)
+        try:
+            own_positions = portfolio.positions_for_product(
+                eng["config"].product.underlying_symbol)
+            await eng["md"].ensure_position_subscribed(own_positions)
+        except Exception as e:
+            logger.warning("Product %s ensure_position_subscribed failed: %s",
+                           eng["name"], e)
 
 
-    # ── 6. Handle graceful shutdown ───────────────────────────────────
+    # ── 10. Handle graceful shutdown ──────────────────────────────────
     shutdown_event = asyncio.Event()
 
     def handle_signal(sig):
@@ -443,126 +484,6 @@ async def main():
             portfolio.spread_capture_mid_today, portfolio.realized_pnl_persisted,
             len(fills._seen_exec_ids), _startup_session_day,
         )
-
-    # Replay any executions that happened during a downtime window in the
-    # current CME session. Without this, every fill that lands while
-    # corsair is restarting / reconnecting is silently invisible to
-    # fill_handler — the position appears (via seed_from_ibkr) but
-    # fills_today / spread_capture / daily_pnl never reflect it. This is
-    # what was happening before 2026-04-09 ~17:00: ~95k Error 104s and a
-    # session of fills with fills_today=0.
-    _session_start = _session_start_utc(datetime.now(tz=timezone.utc), reset_hour_ct)
-    try:
-        await fills.replay_missed_executions(_session_start)
-    except Exception as e:
-        logger.warning("replay_missed_executions at startup failed: %s", e)
-
-    # ── Secondary product engines ────────────────────────────────────
-    # Each entry in config.observe_products gets its own MarketDataManager,
-    # SABR, QuoteManager, ConstraintChecker, and FillHandler. They share
-    # the single PortfolioState and RiskMonitor (margin/delta/theta budgets
-    # are portfolio-level). Each writes a separate chain snapshot.
-    observers: list = []  # List of dicts with all per-product components
-    _raw_observe = getattr(config, "observe_products", None) or []
-    for obs_entry in _raw_observe:
-        obs_name = obs_entry.name
-        obs_config = make_observe_config(config, obs_entry)
-        obs_md = MarketDataManager(ib, obs_config)
-        logger.info("Setting up secondary product engine: %s", obs_name)
-        try:
-            if not await safe_discover_and_subscribe(obs_md):
-                logger.warning("Product %s: discovery failed, skipping", obs_name)
-                continue
-            await asyncio.sleep(3)  # let initial ticks arrive
-
-            obs_sabr = MultiExpirySABR(obs_config)
-            obs_sabr.set_expiries(obs_md.state.expiries)
-            # Register THIS product with the shared portfolio so subsequent
-            # seed_from_ibkr / refresh_greeks / reconcile pick up its
-            # positions (uses obs_md and obs_sabr for IV resolution and
-            # Greek calc). Skipping this is exactly the bug that let HG
-            # positions accumulate invisibly between 2026-04-13 evening
-            # and 2026-04-14 morning.
-            portfolio.register_product(
-                obs_config.product.underlying_symbol,
-                obs_config.product.multiplier,
-                obs_md, obs_sabr,
-            )
-            # Per-product synthetic SPAN engine (own scan ranges, own
-            # market_data, own multiplier). Registered with the shared
-            # MarginCoordinator so combined margin = sum across engines.
-            obs_margin = IBKRMarginChecker(ib, obs_config, obs_md, portfolio,
-                                           sabr=obs_sabr, csv_logger=csv_logger)
-            margin_coord.register(obs_margin)
-            obs_cc = ConstraintChecker(obs_margin, portfolio, obs_config)
-            obs_quotes = QuoteManager(ib, obs_config, obs_md, obs_sabr, obs_cc,
-                                      csv_logger=csv_logger)
-            obs_md.quotes = obs_quotes
-            obs_fills = FillHandler(ib, portfolio, obs_margin, obs_quotes,
-                                    obs_md, csv_logger, obs_config,
-                                    product_filter=obs_config.product.underlying_symbol)
-            logger.info(
-                "Product %s ready: underlying=%.4f, ATM=%.4f, "
-                "%d options, expiry=%s (quoting enabled)",
-                obs_name, obs_md.state.underlying_price,
-                obs_md.state.atm_strike, len(obs_md.state.options),
-                obs_md.state.front_month_expiry,
-            )
-            observers.append({
-                "name": obs_name,
-                "md": obs_md,
-                "config": obs_config,
-                "sabr": obs_sabr,
-                "quotes": obs_quotes,
-                "margin": obs_margin,
-                "fills": obs_fills,
-            })
-        except Exception as e:
-            logger.warning("Product %s setup failed: %s", obs_name, e)
-
-    # Multi-product reseed: now that every product has registered with the
-    # portfolio, re-run seed_from_ibkr to pick up positions for ALL products.
-    # The early seed above only saw the primary product. seed_from_ibkr is
-    # idempotent (clears + refills); refresh_greeks runs internally with
-    # each position dispatching to its registered market_data/sabr.
-    if observers:
-        try:
-            reseeded = portfolio.seed_from_ibkr(ib, config.account.account_id)
-            logger.info(
-                "Multi-product reseed across %d product(s): %d position(s) total",
-                len(portfolio.products()), reseeded,
-            )
-        except Exception as e:
-            logger.warning("Multi-product reseed failed: %s", e)
-
-        # Each observer gets its own missed-execution backfill — without
-        # this, HG fills landing during a disconnect window would be
-        # invisible to obs_fills (the live execDetailsEvent only fires
-        # while connected). The primary product's fills.replay above
-        # already handled ETH executions.
-        for obs in observers:
-            try:
-                replayed = await obs["fills"].replay_missed_executions(_session_start)
-                if replayed:
-                    logger.info(
-                        "Product %s: backfilled %d missed fill(s)",
-                        obs["name"], replayed,
-                    )
-            except Exception as e:
-                logger.warning("Product %s replay_missed_executions failed: %s",
-                               obs["name"], e)
-
-        # Off-window position subscriptions for each product's own
-        # market_data, so refresh_greeks gets fresh ticks for HG strikes
-        # held outside HG's initial discovery window.
-        for obs in observers:
-            try:
-                own_positions = portfolio.positions_for_product(
-                    obs["config"].product.underlying_symbol)
-                await obs["md"].ensure_position_subscribed(own_positions)
-            except Exception as e:
-                logger.warning("Product %s ensure_position_subscribed failed: %s",
-                               obs["name"], e)
 
     logger.info(
         "Entering event-driven quote loop (batch=%.0fms, fallback=%.1fs, snapshot=%.1fs)",
@@ -644,66 +565,51 @@ async def main():
                 logger.warning("Position reconciliation check failed: %s", e)
             last_reconcile = now
 
-        # Rotate depth subscriptions
+        # Rotate depth subscriptions (all engines)
         if (now - last_depth_rotation).total_seconds() >= depth_rotation_interval:
-            try:
-                market_data.rotate_depth_subscriptions()
-            except Exception as e:
-                logger.warning("depth rotation error: %s", e)
-            for obs in observers:
+            for eng in engines:
                 try:
-                    obs["md"].rotate_depth_subscriptions()
+                    eng["md"].rotate_depth_subscriptions()
                 except Exception as e:
-                    logger.warning("depth rotation %s error: %s", obs["name"], e)
+                    logger.warning("depth rotation %s error: %s", eng["name"], e)
             last_depth_rotation = now
 
-        # SABR recalibration (hoisted out of update_quotes so it doesn't
-        # land between the tick handler and placeOrder, which was inflating
-        # TTT by several ms per cycle). The method's own timer + forward-move
-        # gates decide whether to actually run.
-        try:
-            quotes.maybe_recal_sabr()
-        except Exception as e:
-            logger.warning("SABR recal error: %s", e)
-
-        # SABR recal + quote update for secondary products
-        for obs in observers:
+        # SABR recalibration for every engine (hoisted out of update_quotes
+        # so it doesn't land between the tick handler and placeOrder, which
+        # was inflating TTT by several ms per cycle). The method's own
+        # timer + forward-move gates decide whether to actually run.
+        for eng in engines:
             try:
-                obs["quotes"].maybe_recal_sabr()
+                eng["quotes"].maybe_recal_sabr()
             except Exception as e:
-                logger.warning("SABR recal %s error: %s", obs["name"], e)
-            if not (risk.killed or weekend_paused):
+                logger.warning("SABR recal %s error: %s", eng["name"], e)
+
+        # Full-refresh quote update for secondary engines. The primary's
+        # quote update runs below through the event-driven (dirty-set) path
+        # so it can ride tick bursts without waiting the full cycle.
+        if not (risk.killed or weekend_paused):
+            for eng in engines[1:]:
                 try:
-                    obs["quotes"].update_quotes(portfolio)
+                    eng["quotes"].update_quotes(portfolio)
                 except Exception as e:
-                    logger.warning("Quote update %s error: %s", obs["name"], e)
+                    logger.warning("Quote update %s error: %s", eng["name"], e)
 
         # ── Snapshot + daily-state persistence ────────────────────────
         # Runs even when killed/paused so Docker's healthcheck (which reads
         # chain_snapshot.json age) doesn't falsely declare the container
         # unhealthy and restart a process that's otherwise alive and
-        # recoverable. Previously these lived after the quote phase, so
-        # the `continue` below starved the snapshot writer for hours.
+        # recoverable.
         mono = _time.monotonic()
         if (mono - last_snapshot_write) >= snapshot_interval:
-            try:
-                write_chain_snapshot(market_data, quotes, portfolio, sabr,
-                                     margin, ib, config.account.account_id, config)
-            except Exception as e:
-                logger.warning("Snapshot write error: %s", e)
-            # Write secondary product snapshots at the same cadence
-            for obs in observers:
+            for eng in engines:
                 try:
-                    _obs_cfg = obs["config"]
-                    _obs_path = getattr(_obs_cfg, "_observe_snapshot_path",
-                                        f"data/{obs['name'].lower()}_chain_snapshot.json")
-                    _obs_cfg.logging = SimpleNamespace(
-                        **{**vars(config.logging), "snapshot_path": _obs_path})
-                    write_chain_snapshot(obs["md"], obs["quotes"], portfolio,
-                                        obs["sabr"], obs["margin"], ib,
-                                        config.account.account_id, _obs_cfg)
+                    write_chain_snapshot(
+                        eng["md"], eng["quotes"], portfolio, eng["sabr"],
+                        eng["margin"], ib, config.account.account_id,
+                        eng["config"],
+                    )
                 except Exception as e:
-                    logger.warning("Snapshot %s error: %s", obs["name"], e)
+                    logger.warning("Snapshot %s error: %s", eng["name"], e)
             last_snapshot_write = mono
 
         if (mono - last_daily_state_save) >= 1.0:
@@ -837,19 +743,17 @@ async def main():
                     risk.kill("Quote loop exception storm", source="exception_storm")
                     quotes.consecutive_quote_errors = 0
 
-    # ── 8. Shutdown ──────────────────────────────────────────────────
+    # ── Shutdown ──────────────────────────────────────────────────────
     logger.info("Shutting down...")
     watchdog_task.cancel()
     try:
         await watchdog_task
     except (asyncio.CancelledError, Exception):
         pass
-    quotes.cancel_all_quotes()
-    market_data.cancel_all_subscriptions()
-    for obs in observers:
+    for eng in engines:
         try:
-            obs["quotes"].cancel_all_quotes()
-            obs["md"].cancel_all_subscriptions()
+            eng["quotes"].cancel_all_quotes()
+            eng["md"].cancel_all_subscriptions()
         except Exception:
             pass
     await conn.disconnect()
@@ -858,14 +762,10 @@ async def main():
         csv_logger.shutdown(timeout=5.0)
     except Exception as e:
         logger.warning("csv_logger shutdown error: %s", e)
-    # Stop SABR calibration pools (primary + per-product).
-    try:
-        sabr.shutdown()
-    except Exception:
-        pass
-    for obs in observers:
+    # Stop SABR calibration pools (every engine).
+    for eng in engines:
         try:
-            obs["sabr"].shutdown()
+            eng["sabr"].shutdown()
         except Exception:
             pass
     logger.info("Corsair v2 shutdown complete.")

@@ -36,22 +36,23 @@ CFG_PATH = os.path.join(os.path.dirname(__file__), "..", "config",
 def _load_config_products():
     """Return (primary_symbol, {symbol: {tick_size}}) from the config file.
 
-    tick_size lives under each product's ``quoting:`` block — top-level for
-    the primary product, nested under each observe-products entry. Used for
-    marketable-limit slippage calculation.
+    Reads the unified ``products:`` list. ``tick_size`` comes from each
+    product's override ``quoting:`` block if present, else from the shared
+    top-level ``quoting:`` block.
     """
     with open(CFG_PATH) as f:
         cfg = yaml.safe_load(f)
-    primary = cfg["product"]["underlying_symbol"]
-    products: dict = {
-        primary: {"tick_size": float(cfg["quoting"].get("tick_size", 0.05))},
-    }
-    for entry in (cfg.get("observe_products") or []):
-        q = entry.get("quoting") or {}
-        products[entry["underlying_symbol"]] = {
-            "tick_size": float(q.get("tick_size", 0.0005)),
-        }
-    return primary, products
+    default_tick = float(cfg.get("quoting", {}).get("tick_size", 0.05))
+    products_list = cfg.get("products") or []
+    if not products_list:
+        raise RuntimeError("config has no products: list")
+    primary = products_list[0]["product"]["underlying_symbol"]
+    out: dict = {}
+    for entry in products_list:
+        sym = entry["product"]["underlying_symbol"]
+        tick = float((entry.get("quoting") or {}).get("tick_size", default_tick))
+        out[sym] = {"tick_size": tick}
+    return primary, out
 
 
 def parse_args():

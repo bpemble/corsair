@@ -4,55 +4,18 @@ account:
   client_id: 0  # MUST be 0 on FA accounts — see connection.py
   account_id: "UXXXXXXX"
 
-product:
-  symbol: "ETH"
-  exchange: "CME"
-  multiplier: 50
-  currency: "USD"
-  option_type: "both"         # "calls_only", "puts_only", "both"
-  # Subscription/display range — wider window we receive market data for.
-  # 5-strike buffer on each side of the quoting band so the dashboard shows
-  # wings we don't actively quote (useful for spotting mispriced strikes
-  # and for debugging "why aren't we quoting X"). Subscribes both rights
-  # at every strike in this range, so total streaming lines per expiry =
-  # 2 × (high - low + 1). With multi-expiry subscribe fan-out the final
-  # count is lower than the naive product because back-month expiries
-  # have narrower native strike grids (see _per_expiry_strikes intersect
-  # in market_data.py). Watch the "total market data lines" log at boot
-  # to confirm we're under the IBKR cap.
-  strike_range_low: -30       # Strikes below ATM to subscribe (negative = below)
-  strike_range_high: 30       # Strikes above ATM to subscribe
-  # CALL quoting range — actual window we submit call orders in.
-  quote_range_low: 0          # 0 = ATM
-  quote_range_high: 25        # Number of strikes above ATM to quote
-  min_dte: 3                  # Skip options with <= 3 DTE
-  expiry: "front_month"       # DEPRECATED — kept for one release; replaced by subscribed_expiries
-  # How many consecutive future expiries to subscribe to (market data +
-  # contract qualification + SABR calibration). 1 = front month only
-  # (legacy behavior). 3 = front / front+1 / front+2 chains all live in
-  # MarketState + dashboard snapshot. Separate from quoting.enabled_expiries
-  # so we can subscribe without submitting orders.
-  subscribed_expiries: 3
-  quote_size: 1               # Lot size per quote
-  underlying_symbol: "ETHUSDRR"
-  option_symbol: "ETH"
-  trading_class: "ETH"
-  security_type: "FOP"
-  strike_increment: 25        # ETH strike spacing
-
+# ── Portfolio-wide (shared across all products) ────────────────────────
 constraints:
-  # COMBINED portfolio bucket. Stage 1 of the deployment ramp: shared
-  # margin/delta/theta budgets across calls and puts (cross-margining
-  # benefit is the whole point of running both sides). $200K capital,
-  # 50% utilization → $100K SPAN cap. Note: synthetic SPAN runs ~+50%
-  # over IBKR's reported MaintMarginReq (documented in src/synthetic_span.py),
-  # so the effective real-IBKR ceiling is closer to $66K. Conservative bias
-  # is appropriate for first real-money deployment — leave the percentage
-  # at 50% and let the synthetic act as the binding constraint.
+  # Combined portfolio bucket: one margin/delta/theta budget across
+  # products and sides (cross-margining is the whole point of running
+  # both ETH and HG from one sub-account). $1M capital, 50% utilization
+  # → $500K synthetic cap. Synthetic SPAN runs ~+25-30% over IBKR's
+  # reported MaintMarginReq (synthetic_span.py), so the effective real-
+  # IBKR ceiling is closer to $385K. Conservative bias appropriate.
   capital: 1000000
-  margin_ceiling_pct: 0.50    # 50% of $1M = $500K synthetic
-  delta_ceiling: 3.0          # |portfolio net_delta| must be <= this
-  theta_floor: -200           # portfolio net_theta $/day, must be >= this
+  margin_ceiling_pct: 0.50     # 50% of $1M = $500K synthetic
+  delta_ceiling: 3.0           # |portfolio net_delta| must be <= this
+  theta_floor: -200            # portfolio net_theta $/day, must be >= this
   # Margin-priority escape: when margin is currently breached, allow
   # fills that strictly reduce post-fill margin even if they degrade
   # tier-2 constraints (delta, theta) into soft-breach territory — as
@@ -64,138 +27,28 @@ constraints:
   # and revert to strict per-constraint independence.
   margin_escape_enabled: true
 
-puts:
-  # Puts now share the constraints/kill_switch budget with calls (combined
-  # portfolio architecture per Stage 1 spec). This block only carries the
-  # on/off toggle and the put-side quoting range — there are no longer
-  # independent margin/delta/theta budgets for puts.
-  enabled: true
-  quote_range_low: -25        # 25 strikes below ATM
-  quote_range_high: 0         # up to ATM (inclusive)
-
 kill_switch:
-  margin_kill_pct: 0.70       # 70% of $1M = $700K
+  margin_kill_pct: 0.70        # 70% of $1M = $700K
   # TEMPORARY (2026-04-14): widened from -2500. Today's realized P&L sits
   # at ~-$50K from flattening the HG ghost positions (marks were stale, so
   # closing 200 contracts crystallized losses that don't reflect market-
   # making performance). Restore to -2500 after the next CME session reset
   # (5pm CT) wipes today's realized count.
-  max_daily_loss: -100000     # Dollars (Stage 1)
+  max_daily_loss: -100000
   # Per-product thresholds (RiskMonitor checks each product's worst-case;
   # mixing ETH mult=50 and HG mult=25000 contract-equivalent values in
   # one sum is meaningless).
-  delta_kill: 5.0             # Per-product |net_delta| kill threshold
-  vega_kill: 1000             # Per-product |net_vega| (per vol pt) kill threshold
+  delta_kill: 5.0              # Per-product |net_delta| kill threshold
+  vega_kill: 1000              # Per-product |net_vega| (per vol pt) kill threshold
   # Hard floor on portfolio theta ($/day). Only enforced in
   # margin-escape mode (see constraints.margin_escape_enabled) — the
   # normal path uses the softer constraints.theta_floor ceiling.
-  # Set to -$500/day: roughly $3.5K/week of decay bleed, aggressive
-  # enough to surface a bad position but still rescuable via unwind.
   theta_kill: -500
-
-quoting:
-  # Which subscribed expiries the quote engine should actually place orders
-  # on. Tokens: "front" | "front+1" | "front+2" (or "front+N") resolve at
-  # runtime against state.expiries. Default [front] reproduces legacy
-  # single-expiry behavior. Flip to [front, front+1, front+2] (or similar)
-  # to enable quoting on multiple expiries — requires active_orders key
-  # shape to include expiry (see quote_engine.py OrderKey).
-  enabled_expiries: ["front", "front+1", "front+2"]
-  tick_size: 0.50             # ETHUSDRR minimum tick ($0.50 per point = $25 per contract)
-  penny_jump_ticks: 1         # Number of ticks inside incumbent's spread
-  # Modify dead-band: skip a re-price unless the new target differs from
-  # the resting order by at least this many ticks. Set to 1 (default) for
-  # exact-tick equality only; set to 2+ to suppress 1-tick noise driven by
-  # a flickering BBO. Cuts API message rate at the cost of slightly slower
-  # follow-up to small incumbent moves. Ported from corsair v1's tick-level
-  # short-circuit (order_manager.py:188-205).
-  min_modify_ticks: 2
-  # Delta-retreat: when F moves more than this many dollars since the order
-  # was last placed/modified, shift the resting price by delta × ΔF instead
-  # of penny-jumping the incumbent. Protects against AS during fast moves.
-  # Set to 0 to disable. Calibrated to ~2× the ETH p99 tick-to-tick ($4.25).
-  delta_retreat_threshold: 5.0
-  # Outbound API token bucket (IBKR ~50 msg/sec hard throttle). 250 capacity
-  # absorbs short bursts; 250/sec refill caps sustained rate at the throttle.
-  # Modifies and cancels that exceed the bucket are silently dropped — the
-  # next quote cycle re-evaluates. Ported from corsair v1.
-  api_bucket_capacity: 250
-  api_bucket_refill_per_sec: 250
-  # Modify-storm guard (defense vector #14). Cancel-replace instead of
-  # amending if a single orderId exceeds this many modifies/sec.
-  max_modifies_per_sec_per_oid: 5
-  # Hard cap on total resting orders per side across all strikes
-  # (defense vector #11). With ~21 quotable strikes per side this is
-  # ~3x the expected steady-state and gives runaway-bug headroom.
-  max_resting_per_side: 90
-  refresh_interval_ms: 1000   # Periodic full-refresh fallback (event-driven path is real-time)
-  tick_batch_window_sec: 0.005       # Drain queue for 5ms after first tick (latency floor)
-  snapshot_write_interval_sec: 0.25  # Dashboard snapshot cadence (4Hz for near-real-time UI)
-  greek_refresh_seconds: 300  # Refresh Greeks every 5 minutes
-  # Depth-aware incumbent selection
-  depth_levels: 5                  # Subscribe to top N levels per strike per side
-  # IBKR caps concurrent depth subs (typically 3 for retail, up to 5 for
-  # higher-tier accounts). The ib_insync IndexError race in updateMktDepthL2
-  # is patched at startup via src/ib_insync_patch.py so depth cycling can
-  # run safely. If you see "reqMktDepth rotate failed" warnings, drop to 3.
-  max_active_depth_subs: 3         # ETH gets 3, HG gets 2 — total ≤ 5 (IBKR cap)
-  depth_rotation_interval_sec: 2   # Cycle the depth window every N seconds
-  min_incumbent_size: 2            # Min contracts at a level to be a "real" incumbent
-  max_bbo_width_dollars: 10.00     # Don't penny-jump if BBO is wider than this (ETH options typically $5-8)
-  max_quote_staleness_sec: 10      # Discard depth older than N seconds
-  filter_self_orders: true         # Exclude our own orders from incumbent search
 
 operations:
   weekend_flatten: true
-  daily_reset_hour_ct: 17     # 5pm CT — CME daily session end
-  reconcile_interval_sec: 60  # Periodic portfolio↔IBKR position diff (defense vector #9)
-
-pricing:
-  sabr_enabled: true
-  min_edge_points: 1.0        # Reject quote if our price is within $N of SABR theo.
-                              # Loosened from 1.0 to 0.5 (one tick) on 2026-04-08
-                              # to test capture rate. SABR's structural fit residual
-                              # is ~±$1, so the effective real-world edge floor is
-                              # still ~$1.5; we're trading some model-confidence
-                              # cushion for ~3x the quotable surface area.
-  theo_edge_hysteresis_ticks: 1  # Consecutive theo_edge violations required before
-                                 # cancelling a resting order. 1 = no hysteresis
-                                 # (cancel on first violation, original behavior).
-                                 # 2 = require two cycles (smoother, but observed
-                                 # to trade `idle` for `behind` in the 2026-04-08
-                                 # measurement). Default 1 until we have data
-                                 # justifying the trade-off.
-  sabr_recalibrate_seconds: 60
-  # Force a SABR recal when the futures forward moves > $N since the last
-  # fit. Lowered from 10.0 → 2.0 on 2026-04-09 after an adverse-selection
-  # burst caused by theo lag in a $20 underlying move: SABR's forward was
-  # reading the parity-implied (laggy option-market) value, and the
-  # theo-edge gate couldn't fire because theo tracked the stale option
-  # market instead of the true futures. $2 trigger means ~10 recals during
-  # a $20 move (each ~100-300ms), keeping theo fresh against futures.
-  # Cost is higher CPU during fast moves; we pay that willingly to avoid
-  # getting picked off. Paired with the theo-aware penny-jump cap in
-  # quote_engine._process_side for defense in depth.
-  sabr_fast_recal_dollars: 2.0
-  vol_model: "svi"            # "svi" (5-param, better skew fit) or "sabr" (3-param, original). Change to "sabr" to revert.
-  sabr_beta: 0.5              # Only used when vol_model=sabr. 0.5=sqrt-CEV, 1.0=lognormal.
-  sabr_max_rmse: 0.03         # Reject SABR fit if RMSE exceeds this
-  sabr_min_strikes: 8         # Reject fit if fewer than N strikes contributed (quality gate)
-  stale_iv_threshold: 0.10    # IV discrepancy threshold for stale detection
-  max_calibration_bbo_width: 10.0  # Drop strikes with wider BBOs from SABR calibration (synthetic mids on illiquid strikes)
-
-synthetic_span:
-  # Calibrated 2026-04-06 against IBKR short-side observations at F=$2,100, IV=66.6%:
-  #   short 2100C/2200C/2400C: $60,372 / $59,761 / $58,910
-  #   short 2100P/1850P:       $47,383 / $45,011
-  #   short 2400C/long 2500C vertical: $4,388 (model: $5,000)
-  # Fit is ±$3-5K per single short (<6% of notional); vertical fits within $600.
-  up_scan_pct: 0.56
-  down_scan_pct: 0.49
-  vol_scan_pct: 0.25
-  extreme_mult: 3.0
-  extreme_cover: 0.33
-  short_option_minimum: 500.0
+  daily_reset_hour_ct: 17      # 5pm CT — CME daily session end
+  reconcile_interval_sec: 60   # Periodic portfolio↔IBKR position diff (defense vector #9)
 
 logging:
   log_dir: "./logs"
@@ -205,74 +58,164 @@ logging:
   log_rejections: false
   log_quotes: true
 
-# ── Observe-only products ──────────────────────────────────────────────
-# Market data subscriptions without quoting. Each entry gets its own
-# MarketDataManager and writes a separate chain snapshot for dashboard
-# display. Useful for monitoring a product before enabling quoting.
-observe_products:
+# ── Shared defaults (each product's override block merges onto these) ──
+puts:
+  # Puts share the constraints/kill_switch budget with calls (combined
+  # portfolio architecture). This block only carries the on/off toggle
+  # and the default put-side quoting range.
+  enabled: true
+  quote_range_low: -25         # 25 strikes below ATM
+  quote_range_high: 0          # up to ATM (inclusive)
+
+quoting:
+  # Which subscribed expiries the quote engine should actually place orders
+  # on. Tokens: "front" | "front+1" | "front+2" (or "front+N") resolve at
+  # runtime against state.expiries. front+2 is subscribed (for SABR surface
+  # coverage) but NOT quoted — back-month SVI fits only 7-10 strikes per
+  # side, too thin to pin 5 parameters reliably. Dropped after the parity
+  # fix (c68f614) to remove remaining thin-fit exposure.
+  enabled_expiries: ["front", "front+1"]
+  tick_size: 0.50              # ETHUSDRR minimum tick ($0.50 per point = $25 per contract)
+  penny_jump_ticks: 1          # Number of ticks inside incumbent's spread
+  # Modify dead-band: skip a re-price unless the new target differs from
+  # the resting order by at least this many ticks. Cuts API message rate
+  # at the cost of slightly slower follow-up to small incumbent moves.
+  min_modify_ticks: 2
+  # Delta-retreat: when F moves more than this many dollars since the order
+  # was last placed/modified, shift the resting price by delta × ΔF instead
+  # of penny-jumping the incumbent. Protects against AS during fast moves.
+  # Calibrated to ~2× the ETH p99 tick-to-tick ($4.25).
+  delta_retreat_threshold: 5.0
+  # Outbound API token bucket (IBKR ~50 msg/sec hard throttle). 250 capacity
+  # absorbs short bursts; 250/sec refill caps sustained rate at the throttle.
+  api_bucket_capacity: 250
+  api_bucket_refill_per_sec: 250
+  # Modify-storm guard (defense vector #14). Cancel-replace instead of
+  # amending if a single orderId exceeds this many modifies/sec.
+  max_modifies_per_sec_per_oid: 5
+  # Hard cap on total resting orders per side across all strikes.
+  max_resting_per_side: 90
+  refresh_interval_ms: 1000
+  tick_batch_window_sec: 0.005
+  snapshot_write_interval_sec: 0.25
+  greek_refresh_seconds: 300
+  # Depth-aware incumbent selection
+  depth_levels: 5
+  # IBKR caps concurrent depth subs (typically 3 for retail, up to 5 for
+  # higher-tier accounts). ETH takes 3, HG takes 2 — total ≤ 5.
+  max_active_depth_subs: 3
+  depth_rotation_interval_sec: 2
+  min_incumbent_size: 2
+  max_bbo_width_dollars: 10.00
+  max_quote_staleness_sec: 10
+  filter_self_orders: true
+
+pricing:
+  sabr_enabled: true
+  # Minimum $ edge vs SABR theo before we'll quote. Loosened from 1.0 to
+  # 0.5 (one tick) on 2026-04-08 to test capture rate.
+  min_edge_points: 1.0
+  # Consecutive theo_edge violations required before cancelling a resting
+  # order. 1 = no hysteresis (cancel on first violation).
+  theo_edge_hysteresis_ticks: 1
+  sabr_recalibrate_seconds: 60
+  # Force a SABR recal when the futures forward moves > $N since the last
+  # fit. $2 trigger → ~10 recals during a $20 move, keeping theo fresh.
+  sabr_fast_recal_dollars: 2.0
+  vol_model: "svi"             # "svi" (5-param) or "sabr" (3-param, original)
+  sabr_beta: 0.5               # Only used when vol_model=sabr
+  sabr_max_rmse: 0.03
+  sabr_min_strikes: 8
+  stale_iv_threshold: 0.10
+  max_calibration_bbo_width: 10.0
+
+synthetic_span:
+  # ETH-calibrated 2026-04-06 at F=$2,100, IV=66.6% (fit ±$3-5K per leg).
+  up_scan_pct: 0.56
+  down_scan_pct: 0.49
+  vol_scan_pct: 0.25
+  extreme_mult: 3.0
+  extreme_cover: 0.33
+  short_option_minimum: 500.0
+
+# ── Products (primary first; index 0 is used for watchdog + healthcheck snapshot) ──
+products:
+  - name: "ETH"
+    # snapshot_path kept as data/chain_snapshot.json to preserve the
+    # docker healthcheck target without code churn.
+    snapshot_path: "data/chain_snapshot.json"
+    product:
+      symbol: "ETH"
+      exchange: "CME"
+      multiplier: 50
+      currency: "USD"
+      option_type: "both"      # "calls_only", "puts_only", "both"
+      # Subscription/display range — wider window we receive market data for.
+      # 5-strike buffer on each side of the quoting band so the dashboard
+      # shows wings we don't actively quote.
+      strike_range_low: -30
+      strike_range_high: 30
+      quote_range_low: 0       # 0 = ATM
+      quote_range_high: 25     # Number of strikes above ATM to quote
+      min_dte: 3
+      subscribed_expiries: 3   # front / front+1 / front+2
+      quote_size: 1
+      underlying_symbol: "ETHUSDRR"
+      option_symbol: "ETH"
+      trading_class: "ETH"
+      security_type: "FOP"
+      strike_increment: 25     # ETH strike spacing
+    # (no overrides — uses shared defaults above)
+
   - name: "HG"
+    snapshot_path: "data/hg_chain_snapshot.json"
     product:
       symbol: "HXE"
       exchange: "COMEX"
-      multiplier: 25000           # 25,000 lbs per contract
+      multiplier: 25000        # 25,000 lbs per contract
       currency: "USD"
       option_type: "both"
       # Subscribe on the $0.05 grid only — penny strikes between have
-      # near-zero OI and never trade. ±11 increments at $0.05 = ATM±$0.55,
-      # covering the full quoting band + 1 buffer strike on each end.
+      # near-zero OI and never trade. ±11 × $0.05 = ATM±$0.55.
       strike_range_low: -11
       strike_range_high: 11
-      # Call quoting geometry (in $0.05 increments)
-      quote_range_low: 3          # ATM + 3×$0.05 = ATM + $0.15
-      quote_range_high: 10        # ATM + 10×$0.05 = ATM + $0.50
+      quote_range_low: 3       # ATM + 3×$0.05 = ATM + $0.15
+      quote_range_high: 10     # ATM + 10×$0.05 = ATM + $0.50
       min_dte: 3
-      subscribed_expiries: 3      # Front / front+1 / front+2 (SABR needs back months)
+      subscribed_expiries: 3
       quote_size: 1
-      underlying_symbol: "HG"     # COMEX copper futures
-      option_symbol: "HXE"        # Copper options on futures
+      underlying_symbol: "HG"  # COMEX copper futures
+      option_symbol: "HXE"
       trading_class: "HXE"
       security_type: "FOP"
-      strike_increment: 0.05      # $0.05 grid (skips penny strikes)
+      strike_increment: 0.05   # $0.05 grid (skips penny strikes)
     puts:
       enabled: true
-      quote_range_low: -10        # ATM - 10×$0.05 = ATM - $0.50
-      quote_range_high: -3        # ATM - 3×$0.05 = ATM - $0.15
-    # HG-specific overrides for shared config blocks. These replace the
-    # ETH-tuned values when quoting goes live. All dollar-denominated
+      quote_range_low: -10     # ATM − 10×$0.05 = ATM − $0.50
+      quote_range_high: -3     # ATM − 3×$0.05 = ATM − $0.15
+    # HG-specific overrides for shared config blocks. All dollar-denominated
     # thresholds are ~1/400th of ETH's (HG ~$6/lb vs ETH ~$2300).
     quoting:
-      enabled_expiries: ["front", "front+1", "front+2"]  # 3 months, like ETH
-      tick_size: 0.0005           # HG option minimum tick ($0.0005/lb = $12.50/contract)
-      max_bbo_width_dollars: 0.05 # Skip quoting if BBO wider than 5¢
-      delta_retreat_threshold: 0.02  # Retreat on $0.02 underlying move (~2× HG p99 tick)
-      max_resting_per_side: 120   # 35 strikes × 3 expiries + headroom
-      max_active_depth_subs: 2    # IBKR caps at 5/connection; ETH takes 3, HG takes 2
-      # HG tick is 1/1000 of ETH's, so ETH's 2-tick dead-band ($1.00) becomes
-      # $0.001 here — ~0.5% of a $0.20 option, well inside SABR refit noise.
-      # Result was a continuous modify storm: engine wanted to re-price every
-      # SABR cycle, hit the 5/sec cap, silently dropped the modify, and
-      # resting prices went stale (2026-04-16). Widen the dead-band to $0.01
-      # (4% of a $0.25 option) and raise the per-oid cap so genuine moves
-      # still land.
-      min_modify_ticks: 20              # $0.01 dead-band
-      max_modifies_per_sec_per_oid: 20  # headroom for real moves
+      enabled_expiries: ["front", "front+1"]
+      tick_size: 0.0005        # HG option minimum tick ($0.0005/lb = $12.50/contract)
+      max_bbo_width_dollars: 0.05
+      delta_retreat_threshold: 0.02
+      max_resting_per_side: 120
+      max_active_depth_subs: 2
+      # HG tick is 1/1000 of ETH's. Widen dead-band + raise per-oid cap so
+      # genuine moves land without dropping SABR-driven modifies (2026-04-16).
+      min_modify_ticks: 20     # $0.01 dead-band
+      max_modifies_per_sec_per_oid: 20
     pricing:
-      min_edge_points: 0.001      # Minimum $0.001 edge vs theo ($25/contract)
-      max_calibration_bbo_width: 0.05  # Drop wide BBOs from SABR calibration
-      stale_iv_threshold: 0.25    # Accept wider IV divergence (HG back-month liquidity)
-      # Force SABR recal when HG forward moves > $0.005 (~0.08%, same
-      # fraction as ETH's $2/$2370). Without this, HG inherits ETH's $2
-      # threshold and never fast-recals — the delta-adjustment of stale
-      # theo in quote_engine then drifts theo far from market mid on
-      # back-month strikes, wrongly triggering behind_incumbent skips.
+      min_edge_points: 0.001   # $0.001 × 25000 = $25/contract
+      max_calibration_bbo_width: 0.05
+      stale_iv_threshold: 0.25
+      # Match ETH's fraction-of-F fast-recal: $0.005 on HG ~= $2 on ETH.
       sabr_fast_recal_dollars: 0.005
-    # HG SPAN scan parameters — copper is ~10× less volatile than ETH, so
-    # ETH's 56%/49% scans produce bogus $100K+ margins per contract. CME
-    # SPAN for copper uses ~6-8% price scans. Calibrated to target ~$15K
-    # per naked short, matching user's reference from IBKR's actual SPAN.
+    # Copper SPAN scan is ~1/7th of ETH's (CME uses 6-8% vs 56% for ETH).
+    # Calibrated 2026-04-14 to target ~$15K per naked short.
     synthetic_span:
       up_scan_pct: 0.08
       down_scan_pct: 0.08
       vol_scan_pct: 0.20
       short_option_minimum: 500.0
-    snapshot_path: "data/hg_chain_snapshot.json"

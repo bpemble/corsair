@@ -23,6 +23,16 @@ def _dict_to_namespace(d: Any) -> Any:
 def load_config(path: str = "config/corsair_v2_config.yaml") -> SimpleNamespace:
     """Load and return the configuration as a nested SimpleNamespace.
 
+    The YAML is a flat structure with:
+      - Portfolio-wide blocks (``account``, ``constraints``, ``kill_switch``,
+        ``operations``, ``logging``) applied once.
+      - Shared product-defaults (``puts``, ``quoting``, ``pricing``,
+        ``synthetic_span``) which each product's own override block merges
+        onto at runtime via :func:`make_product_config`.
+      - ``products:`` — ordered list of product configs. ``products[0]`` is
+        the primary (watchdog + healthcheck snapshot default); the rest are
+        secondaries with equal runtime status (full quoting engines).
+
     Environment variable overrides:
         CORSAIR_GATEWAY_HOST  -> account.gateway_host
         CORSAIR_GATEWAY_PORT  -> account.gateway_port
@@ -50,7 +60,7 @@ def _overlay_namespace(base, overrides):
     Only replaces keys present in overrides; base keys not in overrides are
     kept. This lets a per-product block like ``quoting: {tick_size: 0.0005}``
     override just that field while inheriting everything else from the
-    primary config's quoting block.
+    shared default block.
     """
     merged = SimpleNamespace(**vars(base))
     for k, v in vars(overrides).items():
@@ -58,30 +68,31 @@ def _overlay_namespace(base, overrides):
     return merged
 
 
-def make_observe_config(base_config, observe_entry) -> SimpleNamespace:
-    """Create a config view for an observe-only product.
+def make_product_config(base_config, product_entry) -> SimpleNamespace:
+    """Return a per-product config view rooted at *product_entry*.
 
-    Replaces ``product`` and ``puts`` with the observe entry's values.
-    If the observe entry also carries ``quoting`` or ``pricing`` blocks,
-    those are *overlaid* onto the base config's blocks (per-key merge, not
-    full replacement) so HG-specific tick_size / min_edge_points override
-    ETH defaults while inheriting every other setting.
+    Per-product classes (MarketDataManager, QuoteManager, IBKRMarginChecker,
+    etc.) read ``self.config.product`` / ``self.config.quoting`` / etc. The
+    view this function returns makes those accesses land on the product's
+    own ``product`` block and on merged (defaults + overrides) block for
+    every shared-default section.
+
+    Carries the product's ``name`` and ``snapshot_path`` onto the view so
+    downstream code doesn't have to look them up by index.
     """
-    # Shallow copy the top-level namespace so we can replace blocks
-    # without mutating the original.
     ns = SimpleNamespace(**vars(base_config))
-    ns.product = observe_entry.product
-    if hasattr(observe_entry, "puts"):
-        ns.puts = observe_entry.puts
-    # Overlay product-specific quoting/pricing/synthetic_span overrides
-    if hasattr(observe_entry, "quoting"):
-        ns.quoting = _overlay_namespace(base_config.quoting, observe_entry.quoting)
-    if hasattr(observe_entry, "pricing"):
-        ns.pricing = _overlay_namespace(base_config.pricing, observe_entry.pricing)
-    if hasattr(observe_entry, "synthetic_span"):
-        ns.synthetic_span = _overlay_namespace(base_config.synthetic_span, observe_entry.synthetic_span)
-    # Carry the snapshot_path through so main.py knows where to write.
-    ns._observe_snapshot_path = getattr(observe_entry, "snapshot_path",
-                                         f"data/{observe_entry.name.lower()}_chain_snapshot.json")
-    ns._observe_name = observe_entry.name
+    ns.product = product_entry.product
+    ns.name = product_entry.name
+    ns.snapshot_path = getattr(
+        product_entry, "snapshot_path",
+        f"data/{product_entry.name.lower()}_chain_snapshot.json",
+    )
+    for block in ("puts", "quoting", "pricing", "synthetic_span"):
+        if hasattr(product_entry, block):
+            setattr(ns, block, _overlay_namespace(
+                getattr(base_config, block), getattr(product_entry, block)))
+    # Drop the products list from the per-product view — each engine only
+    # cares about its own product.
+    if hasattr(ns, "products"):
+        delattr(ns, "products")
     return ns
