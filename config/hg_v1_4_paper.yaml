@@ -1,0 +1,276 @@
+# ═══════════════════════════════════════════════════════════════════════
+# HG v1.4 Paper Config — Stage 1 ($75K capital)
+# ═══════════════════════════════════════════════════════════════════════
+# Spec: docs/hg_spec_v1.4.md (APPROVED 2026-04-19).
+#
+# This file replaces corsair_v2_config.yaml at Stage 1 cutover. Selected
+# via CORSAIR_CONFIG env var — see docker-compose.yml. The v1.3 config is
+# preserved alongside for rollback.
+#
+# Key v1.4 changes from v1.3:
+#   - Strike scope asymmetric (NEAR-OTM+ATM) → SYMMETRIC ATM±5 nickels
+#     (both calls AND puts at every strike, 22 instruments → 44 orders)
+#   - Daily P&L halt at -5% capital (-$3,750) is the PRIMARY defense.
+#     Triggers FLATTEN of options + hedge (not just cancel). Session-level.
+#   - Capital: $200K → $75K. Kill switches rescaled:
+#       margin_kill = 70% × $75K  = $52,500
+#       daily_loss  = -5% × $75K  = -$3,750
+#       vega_kill   = $500 (was $1000)
+#       theta_kill  = -$200 (was -$500)
+#       delta_kill  = 5.0 (unchanged)
+#   - NEW operational kills: SABR RMSE sustained >0.05, quote latency
+#     median >2s for 60s, abnormal trade rate >10×.
+#   - NEW hedging subsystem: delta-hedge via HG futures front-month,
+#     ±0.5 tolerance. Default mode: "observe" (log intent only, no orders).
+#     Flip to "execute" once Gate 0 induced tests are validated.
+#   - ETH tabled — only HG in products list.
+
+account:
+  gateway_host: "127.0.0.1"
+  gateway_port: 4002
+  client_id: 0  # MUST be 0 on FA accounts — see connection.py
+  account_id: "UXXXXXXX"
+
+# ── Portfolio-wide (shared across all products) ────────────────────────
+constraints:
+  # Stage 1 paper ($75K capital). Soft ceiling at 60% ($45K) gates new
+  # margin-increasing opens — expected working range per v1.4 §8.3 is
+  # 60-70%, so typical steady state sits AT the ceiling and the constraint
+  # checker's margin-escape path (still enabled below) handles reducing
+  # fills cleanly. Hard kill at 70% ($52.5K) per v1.4 §6.2.
+  capital: 75000
+  margin_ceiling_pct: 0.60     # 60% of $75K = $45K soft ceiling
+  delta_ceiling: 3.0           # |portfolio net_delta| must be <= this
+  theta_floor: -150            # soft theta floor ($/day)
+  margin_escape_enabled: true  # fills that reduce margin ok above ceiling
+
+kill_switch:
+  # SPAN margin kill (v1.4 §6.2). 70% × $75K = $52.5K.
+  margin_kill_pct: 0.70
+  # Daily P&L halt (v1.4 §6.1, PRIMARY defense). Triggers FLATTEN of
+  # options + hedge, not just quote cancel. Session-level halt.
+  # Either max_daily_loss (absolute) or daily_pnl_halt_pct (fraction of
+  # capital) can be set; code prefers _pct when present and derives the
+  # absolute threshold. Both here for explicitness.
+  max_daily_loss: -3750        # absolute $; = -5% × 75000
+  daily_pnl_halt_pct: 0.05     # fraction of capital
+  # Per-product thresholds.
+  delta_kill: 5.0              # |net_delta| kill (v1.4 §6.2 unchanged)
+  vega_kill: 500               # |net_vega| halt ($500 Stage 1 per §6.2)
+  theta_kill: -200             # theta halt (-$200 Stage 1 per §6.2)
+
+# Operational kill switches (v1.4 §7). These are infrastructure-level
+# protections, not strategy levers. Implemented in src/operational_kills.py
+# (watchdog layer) and wired into RiskMonitor + the main loop.
+operational_kills:
+  enabled: true
+  # SABR calibration failure: RMSE > threshold sustained for window_sec
+  # on the front-month. Halts quoting on affected strikes.
+  sabr_rmse_threshold: 0.05
+  sabr_rmse_window_sec: 300    # 5 min sustained
+  # Quote latency breach: median place-RTT > threshold sustained.
+  # Halts ALL quoting, pages operator. Latency is measured by
+  # quote_engine._place_rtt_us ring.
+  quote_latency_max_ms: 2000
+  quote_latency_window_sec: 60
+  # Realized-vol alert (5-day rolling rvol on HG front). p90 historical
+  # is 31%; 50% means regime change. Page-only, no auto-halt.
+  rvol_alert_5d_threshold: 0.50
+  # Abnormal trade rate: fills/minute > multiplier × rolling-hour
+  # baseline. Halts, pages.
+  abnormal_fill_rate_mul: 10.0
+  abnormal_fill_baseline_window_sec: 3600
+
+# ── Hedging (v1.4 §5) ──────────────────────────────────────────────────
+# NEW in v1.4. Delta-hedge the options book via HG futures front-month.
+# Mode flag governs whether the manager actually places orders or just
+# logs intent. Start in "observe" so Gate 0 induced tests can verify the
+# force-hedge path fires without futures-order execution risk. Flip to
+# "execute" when induced tests pass.
+hedging:
+  enabled: true
+  mode: "observe"              # "observe" = log-only; "execute" = place orders
+  instrument: "HG_futures_front"  # Front-month HG futures contract
+  tolerance_deltas: 0.5        # ±0.5 contract-deltas no-trade band
+  rebalance_on_fill: true
+  rebalance_cadence_sec: 30
+  # Mark-to-market tracking: when true, hedge P&L is included in the
+  # daily_pnl_halt calculation per v1.4 §6.1. Keep on even in observe
+  # mode — "would-be" hedge P&L is still real exposure.
+  include_in_daily_pnl: true
+  # Emergency-flatten behavior: on daily P&L halt / SPAN margin kill,
+  # flatten hedge along with options. No-op in observe mode.
+  flatten_on_halt: true
+
+operations:
+  weekend_flatten: true
+  daily_reset_hour_ct: 17      # 5pm CT — CME daily session end
+  reconcile_interval_sec: 60
+  # v1.4 §6.1: daily P&L halt auto-clears at next session start. Source-
+  # tagged "daily_halt" kills are cleared by the session-rollover path;
+  # Tier-1 kills (margin/delta/vega/theta) remain sticky.
+  auto_clear_daily_halt_on_session_rollover: true
+
+logging:
+  log_dir: "./logs"
+  log_rejections: false
+  log_quotes: true
+  # v1.4 §9.5: 8 required JSONL streams written to logs-paper/.
+  # The CSVLogger picks the dir up from config.logging.log_dir; the
+  # paper-JSONL dir is derived as a sibling (logs/ → logs-paper/).
+  paper_streams:
+    fills: true
+    skips: true
+    kill_switch: true
+    reconnects: true
+    sabr_fits: true
+    margin_snapshots: true
+    pnl_snapshots: true
+    hedge_trades: true
+  margin_snapshots_cadence_sec: 60   # 1 min per spec §9.5
+  pnl_snapshots_cadence_sec: 30      # 30s per spec §9.5
+
+# ── Shared defaults ────────────────────────────────────────────────────
+# Each product's override block merges onto these.
+puts:
+  enabled: true
+  # v1.4 symmetric scope: puts quote ATM-5 to ATM+5 nickels (same as
+  # calls). Replaces v1.3's asymmetric ATM-5 to ATM.
+  quote_range_low: -5
+  quote_range_high: 5
+
+quoting:
+  enabled_expiries: ["front"]  # Front-month ONLY per v1.4 §3.1
+  tick_size: 0.50
+  penny_jump_ticks: 1
+  min_modify_ticks: 2
+  delta_retreat_threshold: 5.0
+  api_bucket_capacity: 250
+  api_bucket_refill_per_sec: 250
+  max_modifies_per_sec_per_oid: 5
+  max_resting_per_side: 60     # sym_5 expects 22 × 2 = 44 max; 60 w/ headroom
+  backmonth_width_mul: 2.0
+  backmonth_size_mul: 0.5
+  refresh_interval_ms: 1000
+  tick_batch_window_sec: 0.005
+  snapshot_write_interval_sec: 0.25
+  greek_refresh_seconds: 300
+  depth_levels: 5
+  max_active_depth_subs: 3
+  depth_rotation_interval_sec: 2
+  min_incumbent_size: 2
+  max_bbo_width_dollars: 10.00
+  max_quote_staleness_sec: 10
+  filter_self_orders: true
+  # v1.4 §3.4: "skip wide market" — if half-spread > 4× min_edge the
+  # market is too wide to quote into. Expressed as a multiplier of
+  # pricing.min_edge_points; enforced per-side in quote_engine.
+  skip_if_spread_over_edge_mul: 4.0
+
+pricing:
+  sabr_enabled: true
+  min_edge_points: 1.0         # (HG override below reduces to 0.001)
+  theo_edge_hysteresis_ticks: 1
+  sabr_recalibrate_seconds: 60
+  sabr_fast_recal_dollars: 2.0
+  vol_model: "svi"
+  sabr_beta: 0.5
+  # NOTE: sabr_max_rmse (0.03) is the STRIKE-LEVEL calibration-quality
+  # gate for quoting (per-strike is_strike_calibrated). The operational
+  # kill at 0.05 (operational_kills.sabr_rmse_threshold) is a LOOSER,
+  # sustained-breach threshold that halts the whole product. Two levels:
+  #   strike-level: 0.03, immediate, per-strike cancel
+  #   product-level: 0.05, sustained 5 min, halt all
+  sabr_max_rmse: 0.03
+  sabr_min_strikes: 8
+  svi_min_strikes: 10
+  stale_iv_threshold: 0.10
+  max_calibration_bbo_width: 10.0
+
+synthetic_span:
+  # ETH-calibrated placeholders; HG overrides in the product block.
+  up_scan_pct: 0.56
+  down_scan_pct: 0.49
+  vol_scan_pct: 0.25
+  extreme_mult: 3.0
+  extreme_cover: 0.33
+  short_option_minimum: 500.0
+
+# ── Products (HG only — ETH tabled per user 2026-04-19) ────────────────
+products:
+  - name: "HG"
+    snapshot_path: "data/hg_chain_snapshot.json"
+    product:
+      symbol: "HXE"
+      exchange: "COMEX"
+      multiplier: 25000        # 25,000 lbs per contract
+      currency: "USD"
+      option_type: "both"
+      # Subscribe ATM ± 7 strikes ($0.35 window): sym_5 quote range + 2
+      # anchors per wing for SVI stability. Tightened from ±11 on 2026-04-19
+      # to reduce event-loop contention under tick load (amend RTT p50 was
+      # 351ms with 138 subscriptions vs 39ms on an idle Gateway — the gap
+      # was mostly our own tick-processing overhead).
+      strike_range_low: -7
+      strike_range_high: 7
+      # v1.4 §3.2 symmetric sym_5: ATM ± 5 nickels. Calls AND puts quote
+      # at every strike — handled by making the CALL range symmetric
+      # here and the PUT range symmetric in puts.quote_range_* below.
+      # Result: 11 unique nickel strikes × 2 rights = 22 instruments,
+      # 44 max resting orders.
+      quote_range_low: -5      # ATM − $0.25
+      quote_range_high: 5      # ATM + $0.25
+      min_dte: 3
+      max_dte: 35              # v1.4 §3.1: DTE ≤ 35
+      subscribed_expiries: 2  # front + front+1 only. front+2 dropped
+                              # 2026-04-19: pure surface coverage, TSI
+                              # fallback uses front+1 as donor for front.
+      quote_size: 1            # v1.4 §3.4
+      underlying_symbol: "HG"  # COMEX copper futures
+      option_symbol: "HXE"
+      trading_class: "HXE"
+      security_type: "FOP"
+      strike_increment: 0.05   # $0.05 grid (nickel_only)
+      # v1.4 §3.2 nickel filter: only strikes at exact $0.05 multiples.
+      # strike_increment=0.05 already enforces this at subscribe time;
+      # this flag is belt-and-braces for the quoter to re-verify on
+      # every quote cycle.
+      nickel_only: true
+    puts:
+      enabled: true
+      # v1.4 symmetric scope — puts same window as calls.
+      quote_range_low: -5      # ATM − $0.25
+      quote_range_high: 5      # ATM + $0.25
+    quoting:
+      enabled_expiries: ["front"]
+      tick_size: 0.0005        # $0.0005/lb = $12.50/contract
+      max_bbo_width_dollars: 0.05
+      delta_retreat_threshold: 0.02
+      max_resting_per_side: 60 # sym_5 needs 22 max; 60 w/ headroom
+      # ETH tabled 2026-04-19 → HG can claim all 5 depth slots (IBKR
+      # retail cap). At sym_5 (22 instruments), 5 concurrent subs with
+      # 2s rotation gives ~9s full-coverage cycle (down from ~22s at
+      # 2 subs), so most strikes have fresh L2 when find_incumbent
+      # queries them (max_quote_staleness_sec=10s). Improves incumbent
+      # quality via the multi-level size-filter path.
+      max_active_depth_subs: 5
+      min_modify_ticks: 20     # $0.01 dead-band
+      max_modifies_per_sec_per_oid: 20
+    pricing:
+      # v1.4 §3.4: min_edge = 0.001 ($25/contract at mult=25000)
+      min_edge_points: 0.001
+      max_calibration_bbo_width: 0.05
+      stale_iv_threshold: 0.25
+      sabr_fast_recal_dollars: 0.005
+    synthetic_span:
+      up_scan_pct: 0.08
+      down_scan_pct: 0.08
+      vol_scan_pct: 0.20
+      short_option_minimum: 500.0
+    hedging:
+      # Per-product hedge instrument override. HG options delta-hedged
+      # via HG futures (COMEX, mult=25000 — same underlying).
+      instrument_symbol: "HG"
+      instrument_exchange: "COMEX"
+      instrument_security_type: "FUT"
+      instrument_multiplier: 25000

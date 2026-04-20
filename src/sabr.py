@@ -419,6 +419,10 @@ class SABRSurface:
         self.csv_logger = csv_logger
         self.beta = config.pricing.sabr_beta
         self.forward = 0.0
+        # Spot (state.underlying_price) at the time of the fit. Used by
+        # delta_adjust_theo to bridge forward by spot-drift rather than
+        # spot-vs-forward-gap, which preserves the parity basis between fits.
+        self.spot_at_fit = 0.0
         self.last_calibration: Optional[datetime] = None
         # vol_model: "sabr" (default, 3-param per side) or "svi" (5-param per side)
         self._vol_model = str(getattr(config.pricing, "vol_model", "sabr")).lower()
@@ -541,17 +545,20 @@ class SABRSurface:
 
 
 def delta_adjust_theo(theo: float, delta: float,
-                      cal_forward: float, current_underlying: float) -> float:
-    """First-order Taylor reprice: adjust SABR theo by delta × (F − F_cal).
+                      spot_at_fit: float, current_underlying: float) -> float:
+    """First-order Taylor reprice: adjust SABR theo by delta × (S − S_fit).
 
     Bridges the gap between SABR refit cadence (~seconds) and quoting cadence
-    (~ms) so the cap logic enforces against the latest underlying rather than
-    the one at last fit. Floored at 0 — a negative result means the
-    extrapolation has overreached and the strike is effectively worthless.
+    (~ms) so theo tracks spot drift between fits. Uses *spot drift* rather
+    than the *spot-vs-forward gap* — the latter mis-adjusted theo by the
+    carry basis (forward − spot), pushing calls below mid and puts above
+    mid by the full basis amount. Tracking spot drift preserves the parity
+    basis locked in at fit time. Floored at 0 — a negative result means
+    the extrapolation has overreached and the strike is effectively worthless.
     """
-    if delta == 0 or cal_forward <= 0 or current_underlying <= 0:
+    if delta == 0 or spot_at_fit <= 0 or current_underlying <= 0:
         return theo
-    return max(theo + delta * (current_underlying - cal_forward), 0.0)
+    return max(theo + delta * (current_underlying - spot_at_fit), 0.0)
 
 
 def _parity_implied_forward_dict(opts_list, ref_forward, max_spread, max_dev=50.0):
@@ -597,11 +604,16 @@ def _async_fit_worker(forward_in: float, expiries_data: dict,
         tte = data['tte']
         opts = data['options']
         if tte <= 0:
-            out[exp] = {'forward': forward_in, 'parity_delta': None,
+            out[exp] = {'forward': forward_in, 'spot_at_fit': forward_in,
+                        'parity_delta': None,
                         'C': None, 'P': None, 'C_n': 0, 'P_n': 0}
             continue
         implied = _parity_implied_forward_dict(opts, forward_in, max_cal_width)
-        forward = (forward_in + implied) / 2.0 if implied is not None else forward_in
+        # Trust the parity-implied forward directly rather than blending
+        # 50/50 with spot. Prior blend muted the basis (forward − spot) by
+        # half, biasing calls below mid and puts above mid (2026-04-20
+        # measurement: ~$0.005 systematic bias, 5× our $0.001 edge target).
+        forward = implied if implied is not None else forward_in
         parity_delta = (implied - forward_in) if implied is not None else None
         side_results = {}
         side_n = {}
@@ -643,7 +655,8 @@ def _async_fit_worker(forward_in: float, expiries_data: dict,
             side_results[side] = r
             side_n[side] = len(cal_data)
         out[exp] = {
-            'forward': forward, 'parity_delta': parity_delta,
+            'forward': forward, 'spot_at_fit': forward_in,
+            'parity_delta': parity_delta,
             'C': side_results.get('C'), 'P': side_results.get('P'),
             'C_n': side_n.get('C', 0), 'P_n': side_n.get('P', 0),
             'C_obs': side_obs.get('C', []),
@@ -867,6 +880,7 @@ class MultiExpirySABR:
         ``self._params_lock``. Shared by the async ProcessPool callback and
         the synchronous startup/watchdog calibrate path."""
         surf.forward = res['forward']
+        surf.spot_at_fit = res.get('spot_at_fit', res['forward'])
         pd = res.get('parity_delta')
         if pd is not None and abs(pd) > 1.0:
             logger.info(
@@ -1036,6 +1050,33 @@ class MultiExpirySABR:
             return 0.0
         return surf.get_vol(strike, put_call)
 
+    def is_strike_calibrated(self, strike: float, expiry: str) -> Tuple[bool, str]:
+        """Check whether SABR/SVI is calibrated well enough to quote this
+        strike at this expiry. Per hg_spec_v1.3.md §3.3 (fourth/fifth
+        bullets): skip strikes where fit quality (RMSE) exceeds threshold
+        or the fit hasn't run.
+
+        Returns ``(ok, reason)``. When ``ok`` is False, ``reason`` is one of
+        the spec §17.3 skip_reason codes:
+          ``"strike_not_calibrated"`` — no surface or no calibration for
+              the expiry, or no params on the fit-domain side
+          ``"sabr_rmse_too_high"`` — fit RMSE exceeds config threshold
+        """
+        surf = self._surfaces.get(expiry)
+        if surf is None or surf.last_calibration is None:
+            return False, "strike_not_calibrated"
+        # Route to the fit-domain side (same logic as get_vol at line 468:
+        # C-side fit covers K≥F, P-side covers K<F).
+        fit_side = "C" if (surf.forward > 0 and strike >= surf.forward) else "P"
+        sp = surf._side_params.get(fit_side, {})
+        params = sp.get("svi_params") if surf._vol_model == "svi" else sp.get("params")
+        if params is None:
+            return False, "strike_not_calibrated"
+        max_rmse = float(getattr(self.config.pricing, "sabr_max_rmse", 0.03))
+        if getattr(params, "rmse", 0.0) > max_rmse:
+            return False, "sabr_rmse_too_high"
+        return True, ""
+
     def is_quote_stale(self, option, threshold_iv_diff: float = None, expiry: str = None) -> bool:
         exp = expiry if expiry is not None else getattr(option, "expiry", None) or self.front_month
         surf = self._surfaces.get(exp) if exp else None
@@ -1071,3 +1112,12 @@ class MultiExpirySABR:
             return 0.0
         surf = self._surfaces.get(exp)
         return surf.forward if surf else 0.0
+
+    def get_spot_at_fit(self, expiry: str = None) -> float:
+        """Return the spot (underlying) price captured at the last fit.
+        Used by delta_adjust_theo to bridge theo by spot-drift between fits."""
+        exp = expiry if expiry is not None else self.front_month
+        if exp is None:
+            return 0.0
+        surf = self._surfaces.get(exp)
+        return surf.spot_at_fit if surf else 0.0

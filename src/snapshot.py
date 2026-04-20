@@ -90,7 +90,7 @@ def _build_side(state, market_data, sabr, portfolio, active_quotes,
         try:
             theo = delta_adjust_theo(
                 sabr.get_theo(strike, right, expiry=expiry),
-                opt.delta, sabr.get_forward(expiry), state.underlying_price,
+                opt.delta, sabr.get_spot_at_fit(expiry), state.underlying_price,
             )
             theo = round(theo, 4)
         except Exception:

@@ -326,10 +326,34 @@ class PortfolioState:
 
     def compute_mtm_pnl(self) -> float:
         """Unrealized P&L across all positions, summed per-position with
-        each position's own multiplier (multi-product safe)."""
+        each position's own multiplier (multi-product safe).
+
+        Reads LIVE market_data bid/ask via the _products registry on every
+        call, falling back to the per-position cached ``current_price``
+        (set by refresh_greeks) when the option isn't subscribed or the
+        BBO is unavailable. v1.4 §6.1 requires the daily P&L halt to
+        reflect intraday MTM between fills without waiting for the 5-min
+        greek refresh — using the cached price here would leave the halt
+        blind to adverse moves in quiet windows.
+        """
         total = 0.0
         for pos in self.positions:
-            total += (pos.current_price - pos.avg_fill_price) * pos.quantity * pos.multiplier
+            live_price = pos.current_price
+            prod_entry = self._products.get(pos.product)
+            if prod_entry is not None:
+                md = prod_entry.get("market_data")
+                if md is not None:
+                    opt = md.state.get_option(
+                        pos.strike, pos.expiry, pos.put_call)
+                    if opt is not None:
+                        bid = getattr(opt, "bid", 0) or 0
+                        ask = getattr(opt, "ask", 0) or 0
+                        last = getattr(opt, "last", 0) or 0
+                        if bid > 0 and ask > 0:
+                            live_price = (bid + ask) / 2.0
+                        elif last > 0:
+                            live_price = last
+            total += (live_price - pos.avg_fill_price) * pos.quantity * pos.multiplier
         return total
 
     def handle_expiry(self, expiry_date: str, settlement_price: float) -> Tuple[float, int]:
@@ -381,5 +405,4 @@ class PortfolioState:
         self.daily_pnl = 0.0
         self.realized_pnl_persisted = 0.0
         logger.info("Daily counters reset")
-
 

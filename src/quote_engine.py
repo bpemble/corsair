@@ -19,7 +19,10 @@ from .sabr import delta_adjust_theo
 from ib_insync.order import OrderStatus
 from ib_insync.util import UNSET_DOUBLE, UNSET_INTEGER
 
-from .utils import ceil_to_tick, floor_to_tick, round_to_tick
+from .utils import (
+    ceil_to_tick, days_to_expiry, floor_to_tick,
+    format_hxe_symbol, iso8601ms_utc, round_to_tick,
+)
 
 LATENCY_RING_SIZE = 500   # rolling window for TTT/RTT/AMEND percentiles
 # Soft cap on the in-flight tracking dicts (_pending_rtt, _placed_at_ns,
@@ -307,6 +310,10 @@ class QuoteManager:
         # cycle. Cleared on any fill (margin conditions may have changed).
         self._margin_rejected: set = set()
         self._margin_rejected_last_clear: float = time.monotonic()
+        # v1.4 §9.5 skip-stream throttle: last-emitted reason per
+        # (strike, expiry, right, side) so skips.jsonl only captures
+        # transitions. Cleared on successful placement.
+        self._last_skip_reason: Dict[OrderKey, str] = {}
         self.ib.errorEvent += self._on_ib_error
 
     def _canonical_trade(self, order_id: int):
@@ -488,6 +495,16 @@ class QuoteManager:
         self._enabled_expiries_resolved = resolve_enabled_expiries(
             enabled_tokens, state.expiries or []
         )
+        # max_dte filter (hg_spec_v1.3 §2.3): skip contracts with DTE above
+        # the configured cap. Front-month HG cycles bi-monthly (H/K/N/U/Z),
+        # so a newly-rolled front can have DTE ~60; the spec quotes only
+        # during the final ≤35 days.
+        max_dte = getattr(config.product, "max_dte", None)
+        if max_dte is not None:
+            self._enabled_expiries_resolved = [
+                exp for exp in self._enabled_expiries_resolved
+                if days_to_expiry(exp) <= max_dte
+            ]
         if not self._enabled_expiries_resolved:
             return  # nothing to quote (config misconfigured or pre-discovery)
 
@@ -548,7 +565,10 @@ class QuoteManager:
             # Per-expiry constants (avoid re-fetching per-strike)
             _exp_cal_ready = (config.pricing.sabr_enabled
                               and self.sabr.get_last_calibration(exp) is not None)
-            _exp_cal_forward = self.sabr.get_forward(exp) if _exp_cal_ready else 0.0
+            # spot_at_fit (not cal_forward) — bridges theo by spot drift,
+            # not spot-vs-forward gap. See sabr.delta_adjust_theo docstring.
+            _exp_spot_at_fit = (self.sabr.get_spot_at_fit(exp)
+                                if _exp_cal_ready else 0.0)
             _exp_underlying = state.underlying_price
 
             for strike, right in iter_pairs:
@@ -575,26 +595,99 @@ class QuoteManager:
 
                 self._process_side(portfolio, option, strike, exp, right, "BUY",
                                    inc_bid_info, theo,
-                                   _exp_cal_forward, _exp_underlying)
+                                   _exp_spot_at_fit, _exp_underlying)
                 self._process_side(portfolio, option, strike, exp, right, "SELL",
                                    inc_ask_info, theo,
-                                   _exp_cal_forward, _exp_underlying)
+                                   _exp_spot_at_fit, _exp_underlying)
 
-        # On full refresh, sweep stale orders for any (strike, expiry, right, side)
-        # whose (strike, expiry, right) is no longer in the full quotable set.
-        # This also cancels orders from expiries that are no longer enabled.
+        # ── v1.4 OOR inventory close pass ─────────────────────────────
+        # For positions outside the sym_5 quote window or on back-month
+        # expiries (which aren't opened but ARE subscribed), post a
+        # CLOSING-only order using the same penny-jump-the-incumbent
+        # logic as in-window quotes. Reduces margin drag and cleans up
+        # inventory as ATM re-centers or DTE decays. Runs only on full-
+        # refresh cycles; the tick-driven dirty path skips this loop
+        # because OOR positions rarely need sub-second repricing.
+        # `allowed_order_keys` tracks (strike, exp, right, side) tuples
+        # permitted to rest after this cycle — union of in-window both
+        # sides + OOR close single sides. The stale sweep below cancels
+        # anything outside this set (side-aware, so a stale SELL on a
+        # strike where we now only post BUY-to-close gets cancelled).
+        allowed_order_keys: set = set()
+        for (sk, ex, rt) in full_quotable:
+            allowed_order_keys.add((sk, ex, rt, "BUY"))
+            allowed_order_keys.add((sk, ex, rt, "SELL"))
+
+        if dirty is None:
+            product_key = config.product.underlying_symbol
+            all_subscribed_expiries = set(state.expiries or [])
+            in_window_by_exp: Dict[str, set] = {
+                ex: set(pairs) for ex, pairs in per_expiry_quotable.items()
+            }
+            for pos in portfolio.positions:
+                if pos.product != product_key or pos.quantity == 0:
+                    continue
+                if pos.expiry not in all_subscribed_expiries:
+                    continue  # no market data subscription; skip
+                key_sr = (pos.strike, pos.put_call)
+                if key_sr in in_window_by_exp.get(pos.expiry, set()):
+                    continue  # in-window loop already handled both sides
+                # Closing side: BUY to close short, SELL to close long.
+                close_side = "BUY" if pos.quantity < 0 else "SELL"
+                pos_option = state.get_option(
+                    pos.strike, expiry=pos.expiry, right=pos.put_call)
+                if pos_option is None:
+                    continue
+                # Theo for this expiry (back-month uses its own fit).
+                oor_theo = None
+                if (config.pricing.sabr_enabled
+                        and self.sabr.get_last_calibration(pos.expiry) is not None):
+                    try:
+                        oor_theo = self.sabr.get_theo(
+                            pos.strike, pos.put_call, expiry=pos.expiry)
+                    except Exception:
+                        oor_theo = None
+                oor_spot_at_fit = (self.sabr.get_spot_at_fit(pos.expiry)
+                                   if oor_theo is not None else 0.0)
+                # Incumbent on closing side only.
+                our_side_prices = our_prices_idx.get(
+                    (pos.strike, pos.expiry, pos.put_call, close_side),
+                    _empty_set)
+                oor_inc = self.market_data.find_incumbent(
+                    pos.strike, close_side, our_side_prices,
+                    right=pos.put_call, expiry=pos.expiry)
+                self._process_side(
+                    portfolio, pos_option, pos.strike, pos.expiry,
+                    pos.put_call, close_side, oor_inc, oor_theo,
+                    oor_spot_at_fit, state.underlying_price,
+                    override_qty=abs(pos.quantity),
+                )
+                allowed_order_keys.add(
+                    (pos.strike, pos.expiry, pos.put_call, close_side))
+
+        # Side-aware stale sweep (full-refresh only). Cancels any
+        # resting order not in allowed_order_keys: strikes that fell
+        # outside the quote window AND aren't backed by an OOR
+        # closing-side entry get cleared. Preserves OOR close orders.
         if dirty is None:
             for (strike, exp, right, side) in list(self.active_orders.keys()):
-                if (strike, exp, right) not in full_quotable:
+                if (strike, exp, right, side) not in allowed_order_keys:
                     self._cancel_quote(strike, exp, right, side)
 
     def _process_side(self, portfolio, option, strike: float, expiry: str,
                       right: str, side: str, inc_info: dict,
                       theo: Optional[float],
-                      cal_forward: float = 0.0,
-                      current_underlying: float = 0.0) -> None:
+                      spot_at_fit: float = 0.0,
+                      current_underlying: float = 0.0,
+                      override_qty: Optional[int] = None) -> None:
         """Apply skip-reason gate, theo-edge gate, constraint check, and
-        order placement for a single (strike, expiry, right, side)."""
+        order placement for a single (strike, expiry, right, side).
+
+        ``override_qty`` (v1.4 OOR close pass): when set, uses this qty
+        instead of config.product.quote_size × backmonth_size_mul. Lets
+        the OOR inventory loop post closing orders sized to the exact
+        position quantity rather than the standard quote size.
+        """
         # Skip if IBKR previously rejected this key for margin — but
         # never suppress closing orders (they reduce margin, not increase it).
         if (strike, expiry, right, side) in self._margin_rejected:
@@ -610,6 +703,21 @@ class QuoteManager:
         config = self.config
         tick = config.quoting.tick_size
 
+        # SABR calibration gate per hg_spec_v1.3.md §3.3 (fourth/fifth
+        # bullets): skip strikes where fit quality is unacceptable or the
+        # fit hasn't run for this expiry. Cancels any existing resting
+        # order on this side to avoid quoting against stale theo.
+        if config.pricing.sabr_enabled:
+            cal_ok, cal_reason = self.sabr.is_strike_calibrated(strike, expiry)
+            if not cal_ok:
+                self._cancel_quote(strike, expiry, right, side)
+                self._log_quote_telemetry(
+                    strike, right, side, None,
+                    {**(inc_info or {}), "skip_reason": cal_reason},
+                    theo=theo, expiry=expiry,
+                )
+                return
+
         # Back-month dampeners (crowsnest 2026-04-18 hotfix). Anything that
         # isn't the front month has thin SVI support (7-10 strikes per side)
         # so theo is extrapolated with wide uncertainty. Widen the quoted
@@ -622,12 +730,15 @@ class QuoteManager:
         _size_mul = (float(getattr(config.quoting, "backmonth_size_mul", 1.0))
                      if _is_back else 1.0)
         effective_min_edge = float(config.pricing.min_edge_points or 0.0) * _width_mul
-        effective_quote_size = max(
-            1, int(round(config.product.quote_size * _size_mul)))
+        if override_qty is not None:
+            effective_quote_size = max(1, int(override_qty))
+        else:
+            effective_quote_size = max(
+                1, int(round(config.product.quote_size * _size_mul)))
 
         if theo is not None and option is not None:
             theo = delta_adjust_theo(theo, option.delta,
-                                     cal_forward, current_underlying)
+                                     spot_at_fit, current_underlying)
 
         # Skip-reason gate from market_data
         #
@@ -669,7 +780,8 @@ class QuoteManager:
             # in place rather than cancelling and losing queue priority.
             if inc_info["skip_reason"] != "self_only":
                 self._cancel_quote(strike, expiry, right, side)
-            self._log_quote_telemetry(strike, right, side, None, inc_info, theo=theo)
+            self._log_quote_telemetry(strike, right, side, None, inc_info,
+                                      theo=theo, expiry=expiry)
             return
 
         # Penny-jump the incumbent — or, in the wide_market bypass
@@ -773,7 +885,7 @@ class QuoteManager:
                 self._log_quote_telemetry(
                     strike, right, side, None,
                     {**inc_info, "skip_reason": "behind_incumbent"},
-                    theo=theo,
+                    theo=theo, expiry=expiry,
                 )
                 return
 
@@ -795,7 +907,7 @@ class QuoteManager:
                     self._cancel_quote(strike, expiry, right, side)
                 self._log_quote_telemetry(strike, right, side, None,
                                           {**inc_info, "skip_reason": "theo_edge"},
-                                          theo=theo)
+                                          theo=theo, expiry=expiry)
                 return
             else:
                 self._theo_edge_streak.pop(key, None)
@@ -804,7 +916,7 @@ class QuoteManager:
             self._cancel_quote(strike, expiry, right, side)
             self._log_quote_telemetry(strike, right, side, None,
                                       {**inc_info, "skip_reason": "invalid_price"},
-                                      theo=theo)
+                                      theo=theo, expiry=expiry)
             return
 
         can_quote, reason = should_quote_side(
@@ -814,13 +926,14 @@ class QuoteManager:
         if can_quote:
             self._send_or_update(strike, expiry, right, side, adj,
                                  effective_quote_size, option, theo=theo)
-            self._log_quote_telemetry(strike, right, side, adj, inc_info, theo=theo)
+            self._log_quote_telemetry(strike, right, side, adj, inc_info,
+                                      theo=theo, expiry=expiry)
         else:
             self._cancel_quote(strike, expiry, right, side)
             self._log_rejection(strike, right, side, reason)
             self._log_quote_telemetry(strike, right, side, None,
                                       {**inc_info, "skip_reason": reason},
-                                      theo=theo)
+                                      theo=theo, expiry=expiry)
 
     def _try_place_order(self, contract, order):
         """Token-bucketed wrapper around `ib.placeOrder`.
@@ -1431,26 +1544,199 @@ class QuoteManager:
         self._order_underlying.clear()
         logger.critical("PANIC CANCEL: reqGlobalCancel sent, cleared %d local order refs", n)
 
+    def flatten_all_positions(self, portfolio, reason: str = "flatten") -> int:
+        """Emergency flatten: cancel every resting order and send
+        aggressive IOC limit orders to close every open option position
+        in this product.
+
+        v1.4 §6.1 (daily P&L halt) and §6.2 (SPAN margin kill) require
+        this behavior — not just quote cancel. Book should be empty of
+        both resting orders AND positions when this returns from IBKR's
+        perspective within 1-2 seconds.
+
+        Aggressive-limit approach per spec: IOC limit at market ± 1 tick
+        (buy-to-close above the ask, sell-to-close below the bid).
+        Bounded slippage vs. a MKT order; IOC tif so residuals don't
+        rest if the counterparty-side depth moves.
+
+        Returns the number of close orders submitted. Does NOT wait for
+        fills — caller is responsible for sequencing (e.g. kill() should
+        log the flatten intent before the fills arrive asynchronously).
+        """
+        # Step 1: clear any resting orders first.
+        self.panic_cancel()
+
+        # Step 2: filter portfolio positions to this product only.
+        product_key = self.config.product.underlying_symbol
+        to_flatten = [
+            p for p in portfolio.positions
+            if p.product == product_key and p.quantity != 0
+        ]
+        if not to_flatten:
+            logger.info("flatten_all_positions: no open positions for %s",
+                        product_key)
+            return 0
+
+        state = self.market_data.state
+        tick = self.config.quoting.tick_size
+        sent = 0
+
+        for pos in to_flatten:
+            # Close = opposite side of current qty.
+            close_qty = abs(pos.quantity)
+            close_side = "BUY" if pos.quantity < 0 else "SELL"
+
+            # Resolve the option contract. Prefer the cached market_data
+            # contract (already qualified); fall back to the discovered
+            # chain.
+            option = state.get_option(pos.strike, pos.expiry, pos.put_call)
+            if option is None or option.contract is None:
+                logger.warning(
+                    "flatten: no contract for %s %s %s%s %s — skipping",
+                    product_key, pos.expiry, f"{pos.strike:g}",
+                    pos.put_call, close_side,
+                )
+                continue
+
+            # Aggressive price: ± 1 tick past the opposite-side BBO so
+            # the order crosses immediately. If BBO is missing/stale,
+            # use SABR theo with a 20% crossing cushion (theo tracks
+            # current F/IV, whereas avg_fill_price can be days old on
+            # a position held across underlying moves). Fall back to
+            # avg_fill_price only if theo is also unavailable — this
+            # is a tail-event-only path where the flatten must fire
+            # somehow on a degraded feed.
+            bbo_bid = getattr(option, "bid", 0.0) or 0.0
+            bbo_ask = getattr(option, "ask", 0.0) or 0.0
+            if close_side == "BUY" and bbo_ask > 0:
+                price = ceil_to_tick(bbo_ask + tick, tick)
+            elif close_side == "SELL" and bbo_bid > 0:
+                price = floor_to_tick(max(bbo_bid - tick, tick), tick)
+            else:
+                # BBO missing — try SABR theo first (fresh vs. avg_fill_price).
+                theo = None
+                try:
+                    theo = self.sabr.get_theo(pos.strike, pos.put_call,
+                                               expiry=pos.expiry)
+                except Exception:
+                    theo = None
+                if theo and theo > 0:
+                    # Cross with a 20% buffer. Bounded slippage vs a MKT
+                    # order, reliably crosses any reasonable resting
+                    # counterparty.
+                    if close_side == "BUY":
+                        price = ceil_to_tick(theo * 1.20, tick)
+                    else:
+                        price = floor_to_tick(
+                            max(theo * 0.80, tick), tick)
+                    logger.warning(
+                        "flatten %s%s %s: BBO missing, using SABR theo "
+                        "%.4f × %s crossing buffer → %g",
+                        pos.put_call, f"{pos.strike:g}", close_side,
+                        theo, "1.20" if close_side == "BUY" else "0.80",
+                        price,
+                    )
+                else:
+                    # Final fallback — avg_fill_price with tick cushion.
+                    # Strictly worse than theo-based, but the flatten
+                    # must fire somehow.
+                    fallback = max(pos.avg_fill_price, tick)
+                    if close_side == "BUY":
+                        price = ceil_to_tick(fallback + 2 * tick, tick)
+                    else:
+                        price = floor_to_tick(max(fallback - 2 * tick, tick), tick)
+                    logger.warning(
+                        "flatten %s%s %s: BBO AND theo missing, falling "
+                        "back to avg_fill_price %.4f → %g (may not cross)",
+                        pos.put_call, f"{pos.strike:g}", close_side,
+                        pos.avg_fill_price, price,
+                    )
+
+            # orderRef includes "flatten" and the reason so post-mortem
+            # log grep-ability is clean (distinguishes halt flattens from
+            # normal closes).
+            order = LimitOrder(
+                action=close_side,
+                totalQuantity=close_qty,
+                lmtPrice=price,
+                tif="IOC",
+                account=self._account,
+                orderRef=f"{ORDER_REF_PREFIX}_flatten_{reason}_"
+                         f"{pos.expiry[-4:]}_{pos.strike:g}{pos.put_call}",
+            )
+            try:
+                trade = self.ib.placeOrder(option.contract, order)
+                sent += 1
+                logger.critical(
+                    "FLATTEN: %s %d %s%s@%g (reason=%s, qty_before=%d)",
+                    close_side, close_qty, pos.put_call,
+                    f"{pos.strike:g}", price, reason, pos.quantity,
+                )
+            except Exception as e:
+                logger.error("flatten: placeOrder failed for %s %s %s%s: %s",
+                             product_key, pos.expiry, pos.strike, pos.put_call, e)
+
+        logger.critical(
+            "FLATTEN submitted: %d/%d IOC close orders (reason=%s)",
+            sent, len(to_flatten), reason,
+        )
+        return sent
+
     def _log_quote_telemetry(self, strike: float, right: str, side: str,
                              our_price: Optional[float], info: dict,
-                             theo: Optional[float] = None):
+                             theo: Optional[float] = None,
+                             expiry: Optional[str] = None):
         """Emit per-quote telemetry row."""
-        if self.csv_logger is None or not self.config.logging.log_quotes:
+        if self.csv_logger is None:
             return
-        try:
-            self.csv_logger.log_quote(
-                strike=strike, side=side, our_price=our_price,
-                incumbent_price=info.get("price"),
-                incumbent_level=info.get("level"),
-                incumbent_size=info.get("size"),
-                incumbent_age_ms=info.get("age_ms"),
-                bbo_width=info.get("bbo_width"),
-                skip_reason=info.get("skip_reason", ""),
-                theo=theo,
-                put_call=right,
-            )
-        except Exception as e:
-            logger.debug("quote telemetry log failed: %s", e)
+        skip_reason = info.get("skip_reason", "")
+        if self.config.logging.log_quotes:
+            try:
+                self.csv_logger.log_quote(
+                    strike=strike, side=side, our_price=our_price,
+                    incumbent_price=info.get("price"),
+                    incumbent_level=info.get("level"),
+                    incumbent_size=info.get("size"),
+                    incumbent_age_ms=info.get("age_ms"),
+                    bbo_width=info.get("bbo_width"),
+                    skip_reason=skip_reason,
+                    theo=theo,
+                    put_call=right,
+                )
+            except Exception as e:
+                logger.debug("quote telemetry log failed: %s", e)
+
+        # v1.4 §9.5 skips.jsonl — emit to the dedicated paper skip stream,
+        # but only on REASON-CHANGE per (strike, expiry, right, side) to
+        # avoid drowning the JSONL in 4Hz × 44-orders-worth of rows that
+        # repeat the same reason. The CSV quotes.csv still carries every
+        # tick for fine-grained analysis; skips.jsonl is the summary
+        # stream reconciliation ingests.
+        if skip_reason and expiry is not None:
+            key = (strike, expiry, right, side)
+            prev = self._last_skip_reason.get(key)
+            if prev != skip_reason:
+                self._last_skip_reason[key] = skip_reason
+                try:
+                    self.csv_logger.log_paper_skip(
+                        symbol=format_hxe_symbol(expiry, right, strike),
+                        side="BUY" if side == "BUY" else "SELL",
+                        skip_reason=skip_reason,
+                        strike=float(strike),
+                        cp=right,
+                        expiry=expiry,
+                        theo=theo,
+                        bbo_bid=info.get("bid"),
+                        bbo_ask=info.get("ask"),
+                        forward=self.market_data.state.underlying_price,
+                    )
+                except Exception as e:
+                    logger.debug("paper skip event emit failed: %s", e)
+        elif not skip_reason and expiry is not None:
+            # Placed successfully — clear the "last skip" so a future skip
+            # on this key re-emits the transition.
+            self._last_skip_reason.pop(
+                (strike, expiry, right, side), None)
 
     def _log_rejection(self, strike: float, right: str, side: str, reason: str):
         """Log a quote rejection."""
