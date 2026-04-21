@@ -15,7 +15,6 @@ from collections import deque
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -86,10 +85,10 @@ def sabr_implied_vol(
 
 def calibrate_sabr(
     F: float, T: float,
-    strikes: List[float], market_ivs: List[float],
+    strikes: list[float], market_ivs: list[float],
     beta: float = 0.5, max_rmse: float = 0.03,
-    weights: Optional[List[float]] = None,
-) -> Optional[SABRParams]:
+    weights: list[float] | None = None,
+) -> SABRParams | None:
     """Calibrate SABR parameters (alpha, rho, nu) to market implied vols."""
     n = len(strikes)
     if n < 3 or len(market_ivs) != n:
@@ -167,7 +166,7 @@ def calibrate_sabr(
 def implied_forward_from_parity(
     options: dict, ref_forward: float,
     max_spread: float = 10.0, max_deviation: float = 50.0,
-) -> Optional[float]:
+) -> float | None:
     """Derive the futures forward implied by put-call parity.
 
     For each strike where BOTH a call and a put have valid bid/ask with
@@ -210,8 +209,8 @@ def implied_forward_from_parity(
 
 
 def _worst_strike_residual(
-    result, forward: float, strikes: List[float], market_ivs: List[float], tte: float,
-) -> Tuple[Optional[float], float]:
+    result, forward: float, strikes: list[float], market_ivs: list[float], tte: float,
+) -> tuple[float | None, float]:
     """Find the strike with the largest model-vs-market IV residual.
 
     Used in the rejection log path to surface which strike is poisoning
@@ -237,7 +236,7 @@ def _worst_strike_residual(
         return None, 0.0
 
 
-def _sabr_quality_ok(result, min_strikes: int) -> Tuple[bool, str]:
+def _sabr_quality_ok(result, min_strikes: int) -> tuple[bool, str]:
     """Structural sanity check on a SABR fit result. Returns (ok, reason).
 
     Catches degenerate fits that the optimizer accepts numerically but
@@ -301,10 +300,10 @@ def svi_implied_vol(F: float, K: float, T: float,
 
 def calibrate_svi(
     F: float, T: float,
-    strikes: List[float], market_ivs: List[float],
+    strikes: list[float], market_ivs: list[float],
     max_rmse: float = 0.03,
-    weights: Optional[List[float]] = None,
-) -> Optional[SVIParams]:
+    weights: list[float] | None = None,
+) -> SVIParams | None:
     """Calibrate SVI parameters to market implied vols."""
     n = len(strikes)
     if n < 5 or len(market_ivs) != n:
@@ -392,7 +391,7 @@ def calibrate_svi(
     )
 
 
-def _svi_quality_ok(result: SVIParams, min_strikes: int) -> Tuple[bool, str]:
+def _svi_quality_ok(result: SVIParams, min_strikes: int) -> tuple[bool, str]:
     """Sanity-check a fitted SVI result."""
     if result.n_points < min_strikes:
         return False, f"only {result.n_points} strikes (need ≥{min_strikes})"
@@ -423,7 +422,7 @@ class SABRSurface:
         # delta_adjust_theo to bridge forward by spot-drift rather than
         # spot-vs-forward-gap, which preserves the parity basis between fits.
         self.spot_at_fit = 0.0
-        self.last_calibration: Optional[datetime] = None
+        self.last_calibration: datetime | None = None
         # vol_model: "sabr" (default, 3-param per side) or "svi" (5-param per side)
         self._vol_model = str(getattr(config.pricing, "vol_model", "sabr")).lower()
         # Per-side parameters. Separate fits let each side match its own skew.
@@ -433,8 +432,8 @@ class SABRSurface:
             "P": {"alpha": 0.6, "rho": -0.2, "nu": 0.4, "params": None,
                    "svi_params": None, "rmse_history": deque(maxlen=20)},
         }
-        self.params: Optional[SABRParams] = None
-        self._front_month_expiry: Optional[str] = None
+        self.params: SABRParams | None = None
+        self._front_month_expiry: str | None = None
         self._theo_cache: dict = {}
         # fit() clears this cache on every surface update, so real
         # invalidation is event-driven; the TTL is just a ceiling. 100ms was
@@ -451,7 +450,7 @@ class SABRSurface:
         """Set the front month expiry for TTE calculations."""
         self._front_month_expiry = expiry
 
-    def latest_rmse(self) -> Optional[float]:
+    def latest_rmse(self) -> float | None:
         """Return the latest accepted RMSE across C/P sides (max). Returns
         None if no fit has landed. Public accessor for the operational
         kill monitor — don't reach into ``_side_params`` from outside."""
@@ -693,7 +692,7 @@ class MultiExpirySABR:
         self.config = config
         self.csv_logger = csv_logger
         self._surfaces: dict = {}
-        self._expiries: List[str] = []
+        self._expiries: list[str] = []
         # Async calibration runs in a subprocess (ProcessPool, not Thread)
         # because scipy.optimize Python orchestration code holds the GIL —
         # measured: a thread-pool fit blocked the main asyncio loop and
@@ -703,7 +702,7 @@ class MultiExpirySABR:
         self._cal_pool = ProcessPoolExecutor(
             max_workers=1, mp_context=multiprocessing.get_context("spawn"),
         )
-        self._cal_future: Optional[Future] = None
+        self._cal_future: Future | None = None
         # Lock serializes parameter updates so readers of get_theo/get_vol
         # never observe a half-updated surface. Fit computation runs
         # outside the lock; only the final assignment is guarded.
@@ -716,7 +715,7 @@ class MultiExpirySABR:
 
     # ------------- expiry management -------------
 
-    def set_expiries(self, expiries: List[str]):
+    def set_expiries(self, expiries: list[str]):
         expiries = list(expiries or [])
         self._expiries = expiries
         # Add new
@@ -737,10 +736,10 @@ class MultiExpirySABR:
         self.set_expiries([expiry])
 
     @property
-    def front_month(self) -> Optional[str]:
+    def front_month(self) -> str | None:
         return self._expiries[0] if self._expiries else None
 
-    def _front_surface(self) -> Optional[SABRSurface]:
+    def _front_surface(self) -> SABRSurface | None:
         fm = self.front_month
         if fm is None:
             return None
@@ -834,7 +833,7 @@ class MultiExpirySABR:
         return True
 
     def _tsi_fallback(self, exp: str, side: str, forward: float,
-                       observations) -> Optional["_tsi.SVIParams"]:
+                       observations) -> "_tsi.SVIParams | None":
         """Build a term-structure-interpolation SVI for ``(exp, side)``.
 
         Walks the existing surface set to find the earliest expiry (other
@@ -847,7 +846,7 @@ class MultiExpirySABR:
         treats that as "calibration skip" (same as the pre-fallback path).
         """
         donor = None
-        donor_exp: Optional[str] = None
+        donor_exp: str | None = None
         for candidate in self._expiries:
             if candidate == exp:
                 continue
@@ -1064,7 +1063,7 @@ class MultiExpirySABR:
             return 0.0
         return surf.get_vol(strike, put_call)
 
-    def is_strike_calibrated(self, strike: float, expiry: str) -> Tuple[bool, str]:
+    def is_strike_calibrated(self, strike: float, expiry: str) -> tuple[bool, str]:
         """Check whether SABR/SVI is calibrated well enough to quote this
         strike at this expiry. Per hg_spec_v1.3.md §3.3 (fourth/fifth
         bullets): skip strikes where fit quality (RMSE) exceeds threshold
@@ -1109,7 +1108,7 @@ class MultiExpirySABR:
         surf = self._surfaces.get(expiry)
         return surf.last_calibration if surf else None
 
-    def latest_rmse(self, expiry: str) -> Optional[float]:
+    def latest_rmse(self, expiry: str) -> float | None:
         """Return the latest accepted RMSE for ``expiry``. Returns None if
         the expiry isn't subscribed or no fit has landed yet. Takes the
         max across C/P sides so a bad fit on either surfaces the breach.

@@ -14,7 +14,6 @@ import json
 import logging
 import os
 from datetime import date
-from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,7 @@ def _moneyness_bucket(strike_usd: float, forward_usd: float, put_call: str) -> s
     return "near_otm_call" if 0 < diff <= 0.15 else "deep_otm_call"
 
 
-def _parse_hxe_symbol(symbol: str) -> Tuple[str, float]:
+def _parse_hxe_symbol(symbol: str) -> tuple[str, float]:
     """Parse 'HXEK6 C490' → ('C', 4.90). Returns ('?', 0.0) on parse error."""
     if not symbol or " " not in symbol:
         return "?", 0.0
@@ -54,7 +53,7 @@ def _parse_hxe_symbol(symbol: str) -> Tuple[str, float]:
     return pc, strike_usd
 
 
-def _aggregate_jsonl(path: str, multiplier: int) -> Dict:
+def _aggregate_jsonl(path: str, multiplier: int) -> dict:
     """Read a paper JSONL file and aggregate fills + skips into counters.
 
     ``multiplier`` is the contract multiplier ($ per point) used to
@@ -111,10 +110,10 @@ def write_daily_summary(
     portfolio,
     margin_checker,
     multiplier: int,
-    margin_extremes: Tuple[float, float] = (0.0, 0.0),
+    margin_extremes: tuple[float, float] = (0.0, 0.0),
     kill_switch_trips: int = 0,
     margin_escape_events: int = 0,
-) -> Optional[str]:
+) -> str | None:
     """Write the EOD summary JSON for ``session_date`` per spec §17.4.
 
     Returns the output path on success, None on failure.

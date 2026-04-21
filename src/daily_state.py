@@ -12,7 +12,6 @@ import json
 import logging
 import os
 from datetime import date
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +43,7 @@ def save(session_day: date, *, fills_today: int,
         logger.warning("daily_state save failed: %s", e)
 
 
-def load(session_day: date) -> Optional[dict]:
+def load(session_day: date) -> dict | None:
     """Return persisted state iff it matches `session_day`, else None."""
     if not os.path.exists(PATH):
         return None

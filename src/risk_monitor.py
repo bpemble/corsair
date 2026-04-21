@@ -25,7 +25,6 @@ Kill source (governs auto-clear rules):
 
 import logging
 import os
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +107,7 @@ class RiskMonitor:
         # check() and check_daily_pnl_only() both bail on None rather
         # than re-resolving per-call (avoids silent drift if config is
         # hot-reloaded).
-        self.daily_halt_threshold: Optional[float] = (
+        self.daily_halt_threshold: float | None = (
             _resolve_daily_halt_threshold(config)
         )
         if self.daily_halt_threshold is None:
@@ -310,23 +309,20 @@ class RiskMonitor:
         exc_info so a silent under-reading doesn't go unnoticed.
         """
         hm = self.hedge_manager
-        if hm is None:
+        if hm is None or not hasattr(hm, "mtm_usd"):
             return 0.0
-        for attr in ("mtm_usd", "hedge_mtm_usd"):
-            if hasattr(hm, attr):
-                try:
-                    return float(getattr(hm, attr)())
-                except Exception:
-                    if not getattr(self, "_hedge_mtm_err_logged", False):
-                        logger.warning(
-                            "hedge_mtm_usd() raised; daily P&L halt "
-                            "will use 0 for hedge MTM until recovered. "
-                            "Under-reports true exposure.",
-                            exc_info=True,
-                        )
-                        self._hedge_mtm_err_logged = True
-                    return 0.0
-        return 0.0
+        try:
+            return float(hm.mtm_usd())
+        except Exception:
+            if not getattr(self, "_hedge_mtm_err_logged", False):
+                logger.warning(
+                    "hedge mtm_usd() raised; daily P&L halt will use 0 "
+                    "for hedge MTM until recovered. Under-reports true "
+                    "exposure.",
+                    exc_info=True,
+                )
+                self._hedge_mtm_err_logged = True
+            return 0.0
 
     def kill(self, reason: str, source: str = "risk",
              kill_type: str = "halt"):

@@ -11,8 +11,6 @@ Black-76 formulas:
     d2 = d1 - sigma * sqrt(T)
 """
 
-from typing import Optional
-
 import numpy as np
 from scipy.optimize import brentq
 from scipy.stats import norm
@@ -82,7 +80,7 @@ class PricingEngine:
     def implied_vol(
         market_price: float, F: float, K: float, T: float,
         r: float = 0.0, right: str = "C",
-    ) -> Optional[float]:
+    ) -> float | None:
         """Solve for implied volatility via Brent's method."""
         right = right.upper()
         if T <= 0 or market_price <= 0:

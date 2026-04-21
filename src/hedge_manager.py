@@ -31,7 +31,6 @@ side (deferred to v1.5 or when flipping to execute).
 
 import logging
 import time
-from typing import List, Optional
 
 from ib_insync import LimitOrder
 
@@ -52,7 +51,7 @@ class HedgeFanout:
     the others).
     """
 
-    def __init__(self, managers: List["HedgeManager"]):
+    def __init__(self, managers: list["HedgeManager"]):
         self._managers = list(managers)
 
     def force_flat(self, reason: str) -> None:
@@ -235,9 +234,9 @@ class HedgeManager:
         self._rebalance(tolerance_override=None, reason=reason,
                         effective_delta=effective_delta)
 
-    def _rebalance(self, tolerance_override: Optional[float],
+    def _rebalance(self, tolerance_override: float | None,
                    reason: str,
-                   effective_delta: Optional[float] = None) -> None:
+                   effective_delta: float | None = None) -> None:
         """Compute and issue the hedge trade. ``tolerance_override=0.0``
         means bypass the tolerance check (used by force_flat)."""
         if effective_delta is None:

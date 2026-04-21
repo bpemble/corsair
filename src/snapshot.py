@@ -12,7 +12,6 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
 
 from .sabr import delta_adjust_theo
 
@@ -58,7 +57,7 @@ def _read_account_state(ib, account_id: str) -> dict:
 
 def _build_side(state, market_data, sabr, portfolio, active_quotes,
                 strike: float, right: str, expiry: str = None,
-                product: Optional[str] = None) -> Optional[dict]:
+                product: str | None = None) -> dict | None:
     """Build the per-right block for one strike, or None if no contract.
 
     ``product`` (multi-product): when set, only positions tagged with this

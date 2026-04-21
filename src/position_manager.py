@@ -7,7 +7,6 @@ expiry settlement, and daily accounting.
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Tuple
 
 from .utils import time_to_expiry_years
 
@@ -55,7 +54,7 @@ class PortfolioState:
 
     def __init__(self, config):
         self.config = config
-        self.positions: List[Position] = []
+        self.positions: list[Position] = []
         self.fills_today: int = 0
         self.spread_capture_today: float = 0.0       # theo-based, headline
         self.spread_capture_mid_today: float = 0.0   # mid-based, reality check
@@ -87,7 +86,7 @@ class PortfolioState:
         logger.info("PortfolioState registered product: %s (multiplier=%g)",
                     product, multiplier)
 
-    def products(self) -> List[str]:
+    def products(self) -> list[str]:
         """Return the list of registered product keys."""
         return list(self._products.keys())
 
@@ -148,7 +147,7 @@ class PortfolioState:
     # contract-equivalent values across products with different multipliers
     # (ETH 50 vs HG 25000), which is meaningless. Each product's constraint
     # checker should evaluate its own product's risk against its own caps.
-    def positions_for_product(self, product: str) -> List[Position]:
+    def positions_for_product(self, product: str) -> list[Position]:
         return [p for p in self.positions if p.product == product]
 
     def delta_for_product(self, product: str) -> float:
@@ -356,7 +355,7 @@ class PortfolioState:
             total += (live_price - pos.avg_fill_price) * pos.quantity * pos.multiplier
         return total
 
-    def handle_expiry(self, expiry_date: str, settlement_price: float) -> Tuple[float, int]:
+    def handle_expiry(self, expiry_date: str, settlement_price: float) -> tuple[float, int]:
         """Process expiring positions.
 
         Returns (settlement_pnl, futures_assigned).

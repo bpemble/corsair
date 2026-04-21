@@ -10,7 +10,6 @@ import logging
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Deque, Dict, Optional, Tuple
 
 from ib_insync import IB, LimitOrder
 
@@ -84,7 +83,7 @@ class TokenBucket:
     def tokens(self) -> float:
         return self._tokens
 
-OrderKey = Tuple[float, str, str, str]  # (strike, expiry, right, side)
+OrderKey = tuple[float, str, str, str]  # (strike, expiry, right, side)
 ORDER_REF_PREFIX = "corsair"
 
 
@@ -159,7 +158,7 @@ def _gtd_string(seconds_from_now: int = GTD_EXPIRY_SECONDS) -> str:
 def should_quote_side(
     option, side: str,
     constraint_checker, sabr, config,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """Check all constraints and filters for a potential quote.
 
     Returns (should_quote, rejection_reason).
@@ -188,7 +187,7 @@ class QuoteManager:
         self.sabr = sabr
         self.constraint_checker = constraint_checker
         self.csv_logger = csv_logger
-        self.active_orders: Dict[OrderKey, int] = {}  # {(strike, expiry, right, side): order_id}
+        self.active_orders: dict[OrderKey, int] = {}  # {(strike, expiry, right, side): order_id}
         # Consecutive update_quotes() exception counter — incremented by
         # main.py's catch block, reset on a successful cycle. The
         # watchdog reads this to detect quote-loop exception storms
@@ -204,10 +203,10 @@ class QuoteManager:
         bucket_refill = float(getattr(config.quoting, "api_bucket_refill_per_sec", 250))
         self._tb = TokenBucket(bucket_cap, bucket_refill)
         self._account = config.account.account_id
-        self._last_sabr_attempt: Optional[datetime] = None
+        self._last_sabr_attempt: datetime | None = None
         self._last_sabr_forward: float = 0.0  # underlying at last calibration
         # Latency rings (microseconds). TTT = tick→placeOrder. RTT = placeOrder→Submitted ack.
-        self._ttt_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
+        self._ttt_us: deque[int] = deque(maxlen=LATENCY_RING_SIZE)
         # Place RTT: time from placeOrder() send to the first openOrder
         # echo from IBKR. Measured against openOrderEvent. We verified
         # 2026-04-09 that openOrder and orderStatus(Submitted/PreSubmitted)
@@ -216,12 +215,12 @@ class QuoteManager:
         # measurement. (Diagnostic ran a parallel rtt_status_us ring for
         # several minutes; both rings produced identical numbers and the
         # parallel ring was removed.)
-        self._place_rtt_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
+        self._place_rtt_us: deque[int] = deque(maxlen=LATENCY_RING_SIZE)
         # Amend RTT — separate from _place_rtt_us because modifies dominate steady
         # state and they have a different latency profile than fresh places
         # (no order-id allocation, no permission validation, just price update).
-        self._amend_us: Deque[int] = deque(maxlen=LATENCY_RING_SIZE)
-        self._pending_rtt: Dict[int, int] = {}  # order_id -> placeOrder ns
+        self._amend_us: deque[int] = deque(maxlen=LATENCY_RING_SIZE)
+        self._pending_rtt: dict[int, int] = {}  # order_id -> placeOrder ns
         # Pending amend tracking: orderId -> most-recent sent_ns.
         # Keyed by orderId only. We tried (oid, price) to make rapid
         # back-to-back modifies independent, but openOrder ack messages
@@ -234,17 +233,17 @@ class QuoteManager:
         # flight. Slightly overcounts on contiguous bursts (multiple
         # modifies before any ack collapse to one sample) but that's
         # honest — the user-visible ack-to-send delay IS the latest one.
-        self._pending_amend: Dict[int, int] = {}
+        self._pending_amend: dict[int, int] = {}
         # Order placement time per order_id, for fill latency (place→fill).
         # Cleared on fill_handler when the fill arrives. Distinct from
         # _pending_rtt which clears on Submitted ack.
-        self._placed_at_ns: Dict[int, int] = {}
+        self._placed_at_ns: dict[int, int] = {}
         # Underlying price at last place/modify per order_id. Used by
         # delta-retreat to detect when F has moved enough that the resting
         # order should be shifted by delta × ΔF instead of penny-jumping.
-        self._order_underlying: Dict[int, float] = {}
+        self._order_underlying: dict[int, float] = {}
         # Most recent tick_received_ns per (strike, expiry, right) at decision time.
-        self._decision_tick_ns: Dict[Tuple[float, str, str], int] = {}
+        self._decision_tick_ns: dict[tuple[float, str, str], int] = {}
         # Resolved enabled_expiries cache. Refreshed each cycle in update_quotes
         # from the live state.expiries list. Tokens from config.quoting.enabled_expiries
         # are resolved via resolve_enabled_expiries().
@@ -253,7 +252,7 @@ class QuoteManager:
         # single tick of theo_edge violation doesn't drop a resting order
         # that would re-qualify on the next tick. Reset on any non-theo path
         # through _process_side (place or other gate).
-        self._theo_edge_streak: Dict[OrderKey, int] = {}
+        self._theo_edge_streak: dict[OrderKey, int] = {}
         # orderIds we've already extracted RTT for (so we don't double-count
         # on subsequent snapshot passes).
         self._rtt_captured_oids: set = set()
@@ -263,7 +262,7 @@ class QuoteManager:
         # and let us churn out orderIds at the same effective message rate.
         # Old single-order behavior is preserved by virtue of being a strict
         # subset (one orderId per side at a time).
-        self._modify_times_per_side: Dict[OrderKey, Deque[int]] = {}
+        self._modify_times_per_side: dict[OrderKey, deque[int]] = {}
         self._max_modifies_per_sec_per_oid = int(getattr(
             config.quoting, "max_modifies_per_sec_per_oid", 5))
         # Global per-side resting-order cap (defense vector #11). Hard
@@ -280,7 +279,7 @@ class QuoteManager:
         # from this dict is O(1) vs an O(N) walk of openTrades, which matters
         # at 4Hz × ~50 active orders. Cleared opportunistically; readers fall
         # back to walking openTrades when the cache is empty (cold path).
-        self._canonical_idx: Dict[int, object] = {}
+        self._canonical_idx: dict[int, object] = {}
 
         # Event-driven RTT/AMEND measurement: subscribe once to the IB-level
         # openOrderEvent, which fires whenever IBKR sends an openOrder message
@@ -313,13 +312,13 @@ class QuoteManager:
         # v1.4 §9.5 skip-stream throttle: last-emitted reason per
         # (strike, expiry, right, side) so skips.jsonl only captures
         # transitions. Cleared on successful placement.
-        self._last_skip_reason: Dict[OrderKey, str] = {}
+        self._last_skip_reason: dict[OrderKey, str] = {}
         # priority_v1 refresh policy state. Last send time per key drives
         # the max-age override that prevents far strikes from going stale
         # indefinitely under the per-tick amend cap. Per-cycle counters
         # reset at the top of update_quotes; the cap is the binding
         # constraint on how many modify messages leave per tick.
-        self._last_amend_ns: Dict[OrderKey, int] = {}
+        self._last_amend_ns: dict[OrderKey, int] = {}
         self._tick_amend_count: int = 0
         self._tick_amend_deferred: int = 0
         self.ib.errorEvent += self._on_ib_error
@@ -359,7 +358,7 @@ class QuoteManager:
                 latest = t
         return latest
 
-    def _build_our_prices_index(self) -> Dict[Tuple[float, str, str, str], set]:
+    def _build_our_prices_index(self) -> dict[tuple[float, str, str, str], set]:
         """One-pass build of {(strike, expiry, right, side): set(prices)} for
         self-filter use across an entire update_quotes cycle. Walks
         openTrades exactly once per cycle instead of N times.
@@ -387,13 +386,13 @@ class QuoteManager:
         # clientId tiebreak: on FA logins the canonical entry can carry
         # clientId=-1 (master adoption), so a "prefer my clientId"
         # tiebreak would pick exactly the orphan we want to avoid.
-        canonical: Dict[int, object] = {}
+        canonical: dict[int, object] = {}
         for t in self.ib.openTrades():
             ref = getattr(t.order, "orderRef", "") or ""
             if ref.startswith(ORDER_REF_PREFIX):
                 canonical[t.order.orderId] = t
         self._canonical_idx = canonical  # cache for _canonical_trade reads
-        out: Dict[Tuple[float, str, str, str], set] = {}
+        out: dict[tuple[float, str, str, str], set] = {}
         for t in canonical.values():
             if not self._is_order_live(t):
                 continue
@@ -441,7 +440,7 @@ class QuoteManager:
                 self._last_sabr_attempt = now
                 self._last_sabr_forward = state.underlying_price
 
-    def update_quotes(self, portfolio, dirty: Optional[set] = None):
+    def update_quotes(self, portfolio, dirty: set | None = None):
         """Reprice and re-issue quotes.
 
         Iterates every enabled expiry × (strike, right) in the subscribed
@@ -527,7 +526,7 @@ class QuoteManager:
         # end-of-cycle stale sweep.
         full_quotable: set = set()
         # Per-expiry quotable lists for iteration
-        per_expiry_quotable: Dict[str, list] = {}
+        per_expiry_quotable: dict[str, list] = {}
         for exp in self._enabled_expiries_resolved:
             pairs = self.market_data.get_quotable_strikes(expiry=exp)
             per_expiry_quotable[exp] = pairs
@@ -635,7 +634,7 @@ class QuoteManager:
         if dirty is None:
             product_key = config.product.underlying_symbol
             all_subscribed_expiries = set(state.expiries or [])
-            in_window_by_exp: Dict[str, set] = {
+            in_window_by_exp: dict[str, set] = {
                 ex: set(pairs) for ex, pairs in per_expiry_quotable.items()
             }
             for pos in portfolio.positions:
@@ -722,10 +721,10 @@ class QuoteManager:
 
     def _process_side(self, portfolio, option, strike: float, expiry: str,
                       right: str, side: str, inc_info: dict,
-                      theo: Optional[float],
+                      theo: float | None,
                       spot_at_fit: float = 0.0,
                       current_underlying: float = 0.0,
-                      override_qty: Optional[int] = None) -> None:
+                      override_qty: int | None = None) -> None:
         """Apply skip-reason gate, theo-edge gate, constraint check, and
         order placement for a single (strike, expiry, right, side).
 
@@ -1390,7 +1389,7 @@ class QuoteManager:
             if len(self._placed_at_ns) > TRACKING_DICT_MAX:
                 self._evict_oldest_half(self._placed_at_ns)
 
-    def fill_latency_ms(self, order_id: int) -> Optional[float]:
+    def fill_latency_ms(self, order_id: int) -> float | None:
         """Return milliseconds from first placement to now for an order, or
         None if we don't have a record. Caller is responsible for invoking
         this in the fill handler at the moment a fill arrives."""
@@ -1779,9 +1778,9 @@ class QuoteManager:
         return sent
 
     def _log_quote_telemetry(self, strike: float, right: str, side: str,
-                             our_price: Optional[float], info: dict,
-                             theo: Optional[float] = None,
-                             expiry: Optional[str] = None):
+                             our_price: float | None, info: dict,
+                             theo: float | None = None,
+                             expiry: str | None = None):
         """Emit per-quote telemetry row."""
         if self.csv_logger is None:
             return
@@ -1843,7 +1842,7 @@ class QuoteManager:
     def active_quote_count(self) -> int:
         return len(self.active_orders)
 
-    def get_active_quotes(self) -> Dict:
+    def get_active_quotes(self) -> dict:
         """Return dict keyed by (strike, expiry, right, side) -> live quote info.
 
         Refreshes the canonical-trade index up front so the per-order lookups

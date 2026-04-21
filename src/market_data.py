@@ -13,7 +13,6 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -24,7 +23,7 @@ from .utils import days_to_expiry
 
 logger = logging.getLogger(__name__)
 
-OptionKey = Tuple[float, str, str]  # (strike, expiry, right)
+OptionKey = tuple[float, str, str]  # (strike, expiry, right)
 
 
 @dataclass
@@ -48,10 +47,10 @@ class OptionQuote:
     last_update: datetime = field(default_factory=datetime.now)
     tick_received_ns: int = 0   # monotonic_ns at most recent IB callback (for TTT)
     prev_volume: int = 0        # for trade-tape detection (volume delta = prints)
-    contract: Optional[FuturesOption] = field(default=None, repr=False)
+    contract: FuturesOption | None = field(default=None, repr=False)
     # Depth book: list of (price, size) tuples, level 0 = best
-    dom_bids: List[Tuple[float, int]] = field(default_factory=list)
-    dom_asks: List[Tuple[float, int]] = field(default_factory=list)
+    dom_bids: list[tuple[float, int]] = field(default_factory=list)
+    dom_asks: list[tuple[float, int]] = field(default_factory=list)
     dom_last_update: datetime = field(default_factory=datetime.now)
     # IV inversion cache: brentq is ~200-500us per call and fires every
     # time bid/ask changes. Bids/asks frequently flicker back to a value
@@ -70,7 +69,7 @@ class MarketState:
     underlying_ask: float = 0.0
     underlying_last_update: datetime = field(default_factory=datetime.now)
 
-    options: Dict[OptionKey, OptionQuote] = field(default_factory=dict)
+    options: dict[OptionKey, OptionQuote] = field(default_factory=dict)
 
     atm_strike: float = 0.0
     front_month_expiry: str = ""
@@ -78,7 +77,7 @@ class MarketState:
     # front_month_expiry == expiries[0] whenever the list is populated.
     # Kept as a separate scalar for backward compat with callers that
     # haven't been updated for multi-expiry awareness.
-    expiries: List[str] = field(default_factory=list)
+    expiries: list[str] = field(default_factory=list)
     strike_increment: float = 25.0  # Will be set from discovered chain
     # Timestamp of the most recent successful discover_and_subscribe().
     # The watchdog uses this to apply a short grace period on the
@@ -87,7 +86,7 @@ class MarketState:
     # volume wipe, the data feed can take 20-30s to start delivering
     # ticks even though the subscriptions succeeded. None until the
     # first discovery completes.
-    discovery_completed_at: Optional[datetime] = None
+    discovery_completed_at: datetime | None = None
     # Flips to True on the first tick (underlying or option) since the
     # most recent discover_and_subscribe(). Reset to False whenever a
     # new discovery starts. The watchdog uses this as a hard gate on
@@ -98,13 +97,13 @@ class MarketState:
     # quiet market windows.
     first_tick_seen: bool = False
 
-    def get_option(self, strike: float, expiry: str = None, right: str = "C") -> Optional[OptionQuote]:
+    def get_option(self, strike: float, expiry: str = None, right: str = "C") -> OptionQuote | None:
         """Get option quote by strike. Uses front_month_expiry if expiry not specified."""
         if expiry is None:
             expiry = self.front_month_expiry
         return self.options.get((strike, expiry, right))
 
-    def get_all_strikes(self, expiry: str = None) -> List[float]:
+    def get_all_strikes(self, expiry: str = None) -> list[float]:
         """Return sorted list of all available strikes.
 
         If expiry is given, restrict to that expiry; otherwise return the
@@ -134,12 +133,12 @@ class MarketDataManager:
         # by main.py. Used by the trade-tape capture to look up our resting
         # bid/ask at the moment a print arrives.
         self.quotes = None
-        self._option_tickers: Dict[OptionKey, Ticker] = {}
-        self._underlying_ticker: Optional[Ticker] = None
-        self._underlying_contract: Optional[Future] = None
-        self._option_contracts: Dict[OptionKey, FuturesOption] = {}
+        self._option_tickers: dict[OptionKey, Ticker] = {}
+        self._underlying_ticker: Ticker | None = None
+        self._underlying_contract: Future | None = None
+        self._option_contracts: dict[OptionKey, FuturesOption] = {}
         # Rotating depth subscriptions (IBKR caps at ~5 concurrent).
-        self._depth_tickers: Dict[OptionKey, Ticker] = {}
+        self._depth_tickers: dict[OptionKey, Ticker] = {}
         self._depth_rotation_idx: int = 0
         # Last-known clean (non-self) BBO per (strike, right). Used by
         # find_incumbent as a fallback when the live top-of-book is just our
@@ -147,14 +146,14 @@ class MarketDataManager:
         # right because calls and puts at the same strike are different books.
         # Keyed by (strike, expiry, right) so multi-expiry subscriptions
         # don't cross-contaminate clean-BBO caches.
-        self._last_clean_bid: Dict[Tuple[float, str, str], float] = {}
-        self._last_clean_ask: Dict[Tuple[float, str, str], float] = {}
+        self._last_clean_bid: dict[tuple[float, str, str], float] = {}
+        self._last_clean_ask: dict[tuple[float, str, str], float] = {}
         # Event-driven tick queue. Created lazily in discover_and_subscribe()
         # so it binds to the running asyncio loop. Items are tuples of
         #   ("option", OptionKey)  or  ("underlying", None)
         # The quoter loop awaits this queue and reprices only the strikes
         # whose ticks have been pushed since the last cycle.
-        self.tick_queue: Optional[asyncio.Queue] = None
+        self.tick_queue: asyncio.Queue | None = None
 
     async def discover_and_subscribe(self):
         """Discover option chain and subscribe to all relevant market data."""
@@ -319,7 +318,7 @@ class MarketDataManager:
             # gets Error 200 "no security definition" for phantom strikes.
             expirations = set()
             strikes_set = set()
-            per_expiry_strikes: Dict[str, set] = {}
+            per_expiry_strikes: dict[str, set] = {}
             for d in all_details:
                 c = d.contract
                 exp_val = c.lastTradeDateOrContractMonth
@@ -368,7 +367,7 @@ class MarketDataManager:
         # Quoting is gated separately via quoting.enabled_expiries.
         sorted_expiries = sorted(params.expirations)
         n_subscribe = n_subscribe_probe  # Already computed above
-        chosen: List[str] = []
+        chosen: list[str] = []
         for exp in sorted_expiries:
             if days_to_expiry(exp) <= self.config.product.min_dte:
                 continue
@@ -530,8 +529,8 @@ class MarketDataManager:
         if not positions:
             return 0
         p = self.config.product
-        new_keys: List[OptionKey] = []
-        new_contracts: List[FuturesOption] = []
+        new_keys: list[OptionKey] = []
+        new_contracts: list[FuturesOption] = []
         for pos in positions:
             key: OptionKey = (float(pos.strike), pos.expiry, pos.put_call)
             if key in self._option_contracts:
@@ -817,9 +816,9 @@ class MarketDataManager:
             pass
 
     def find_incumbent(self, strike: float, side: str,
-                       our_prices: Optional[set] = None,
+                       our_prices: set | None = None,
                        right: str = "C",
-                       expiry: Optional[str] = None):
+                       expiry: str | None = None):
         """Scan the depth book for the first 'meaningful' incumbent level.
 
         Returns dict with keys:
@@ -964,7 +963,7 @@ class MarketDataManager:
                 "age_ms": age_ms, "bbo_width": bbo_width, "skip_reason": "self_only"}
 
     def get_clean_bbo(self, strike: float, right: str,
-                      expiry: Optional[str] = None) -> Tuple[float, float]:
+                      expiry: str | None = None) -> tuple[float, float]:
         """Return the L1 BBO with our own resting orders subtracted out.
         Used by the snapshot writer so the dashboard's 'market' columns
         show the book we're competing against, not our own quotes.
@@ -990,7 +989,7 @@ class MarketDataManager:
         ask = self._last_clean_ask.get(key, 0.0)
         return (bid, ask)
 
-    def get_quotable_strikes(self, expiry: str = None) -> List[Tuple[float, str]]:
+    def get_quotable_strikes(self, expiry: str = None) -> list[tuple[float, str]]:
         """Return list of (strike, right) pairs eligible for quoting.
 
         Each option type (calls, puts) has its own quoting range and on/off
@@ -1005,7 +1004,7 @@ class MarketDataManager:
         """
         config = self.config
         state = self.state
-        quotable: List[Tuple[float, str]] = []
+        quotable: list[tuple[float, str]] = []
 
         inc = state.strike_increment
         if inc <= 0 or state.atm_strike <= 0:
@@ -1018,7 +1017,7 @@ class MarketDataManager:
         all_strikes = state.get_all_strikes(expiry=expiry)
 
         # Build list of (right, low, high) windows to evaluate.
-        windows: List[Tuple[str, float, float]] = []
+        windows: list[tuple[str, float, float]] = []
         opt_type = config.product.option_type
         if opt_type in ("calls_only", "both"):
             c_low = state.atm_strike + (config.product.quote_range_low * inc)

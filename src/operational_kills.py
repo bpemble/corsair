@@ -29,7 +29,6 @@ silently failed at moderately-slow check cadences.
 
 import logging
 import time
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +78,7 @@ class OperationalKillMonitor:
         # RMSE keyed by (engine_name, expiry) — different expiries
         # calibrate independently.
         self._rmse_first_breach_ts: dict = {}
-        self._latency_first_breach_ts: Optional[float] = None
+        self._latency_first_breach_ts: float | None = None
 
         # Fill-count snapshots: (ts, fills_today). The short-term rate
         # vs rolling-hour baseline comparison uses a sliding window here

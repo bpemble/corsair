@@ -15,7 +15,6 @@ import os
 import queue
 import threading
 from datetime import date, datetime, timezone
-from typing import Tuple, List
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +122,7 @@ class CSVLogger:
         # runaway memory if the writer thread stalls. On overflow we drop
         # the oldest row and log — losing noisy quote telemetry is fine;
         # blocking the event loop is not.
-        self._write_queue: "queue.Queue[Tuple[str, list]]" = queue.Queue(maxsize=100_000)
+        self._write_queue: queue.Queue[tuple[str, list]] = queue.Queue(maxsize=100_000)
         self._dropped_rows = 0
         self._writer_thread = threading.Thread(
             target=self._writer_loop, name="csv-writer", daemon=True,
@@ -251,7 +250,7 @@ class CSVLogger:
         """Drain the write queue in batches, coalescing rows per-file so
         we open/close each target file at most once per batch."""
         while True:
-            batch: List[Tuple[str, list]] = []
+            batch: list[tuple[str, list]] = []
             # Block on the first row so we don't busy-spin when idle.
             try:
                 first = self._write_queue.get(timeout=1.0)
@@ -281,7 +280,7 @@ class CSVLogger:
 
             self._flush_batch(batch)
 
-    def _flush_batch(self, batch: List[Tuple[str, list]]):
+    def _flush_batch(self, batch: list[tuple[str, list]]):
         """Group rows by target file and write each group with a single
         open/close. Errors are logged but don't halt the writer.
 

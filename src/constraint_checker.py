@@ -14,7 +14,6 @@ check_fill_margin call only reprices the candidate (not the whole book).
 
 import logging
 import time
-from typing import Dict, Optional, Tuple
 
 import numpy as np
 from ib_insync import IB
@@ -88,12 +87,12 @@ class IBKRMarginChecker:
 
         # Per-product portfolio state cache. Filtered to positions whose
         # ``product`` matches self._product.
-        self._port_state: Optional[dict] = None
+        self._port_state: dict | None = None
         self._port_F: float = 0.0
         self._port_time: float = 0.0
 
         # Per-strike (strike, right) → {risk_array, base, F, iv, time}
-        self._strike_cache: Dict[Tuple[float, str], dict] = {}
+        self._strike_cache: dict[tuple[float, str], dict] = {}
 
     # ── Cache invalidation ─────────────────────────────────────────
     def invalidate_portfolio(self):
@@ -216,7 +215,7 @@ class IBKRMarginChecker:
         return max(risk_margin, short_min, long_premium)
 
     # ── Public API ─────────────────────────────────────────────────
-    def get_current_margin(self, right: Optional[str] = None) -> float:
+    def get_current_margin(self, right: str | None = None) -> float:
         """SPAN margin over current positions, scaled to IBKR-equivalent.
 
         Multi-product: when registered with a MarginCoordinator,
@@ -271,7 +270,7 @@ class IBKRMarginChecker:
             st["long_premium"], st["short_count"],
         )
 
-    def _raw_check_fill_margin(self, option_quote, quantity: int) -> Dict:
+    def _raw_check_fill_margin(self, option_quote, quantity: int) -> dict:
         """Internal: per-product RAW (unscaled) current + post-fill margin
         for use by MarginCoordinator. Returns a dict with 'current_raw',
         'post_raw', 'current_long_premium', 'post_long_premium'."""
@@ -314,7 +313,7 @@ class IBKRMarginChecker:
             "post_long_premium": post_long,
         }
 
-    def check_fill_margin(self, option_quote, quantity: int) -> Dict:
+    def check_fill_margin(self, option_quote, quantity: int) -> dict:
         """Pre-trade margin check: returns combined-across-products current
         and post-fill margin (IBKR-equivalent), plus this product's long-
         premium accounting.
@@ -388,7 +387,7 @@ class MarginCoordinator:
     def get_current_margin(self, right=None) -> float:
         return self.combined_margin()
 
-    def check_fill_margin(self, asking_engine, option_quote, quantity: int) -> Dict:
+    def check_fill_margin(self, asking_engine, option_quote, quantity: int) -> dict:
         """Combined current + post-fill margin for a candidate trade.
 
         Other engines contribute their cached per-product current margin
@@ -501,7 +500,7 @@ class ConstraintChecker:
         # Combined-across-products margin still goes through the coordinator.
         self._product = config.product.underlying_symbol
 
-    def _ceilings(self) -> Tuple[float, float, float]:
+    def _ceilings(self) -> tuple[float, float, float]:
         """Return (margin_ceiling, delta_ceiling, theta_floor) — the single
         combined budget."""
         c = self.config.constraints
@@ -509,7 +508,7 @@ class ConstraintChecker:
                 float(c.delta_ceiling), float(c.theta_floor))
 
     def check_constraints(self, option_quote, side: str,
-                          quantity: int = 1) -> Tuple[bool, str]:
+                          quantity: int = 1) -> tuple[bool, str]:
         """Check if a hypothetical fill passes all constraints.
 
         Two operating modes:

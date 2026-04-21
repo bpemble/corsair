@@ -113,35 +113,19 @@ async def main():
     prev_und_mid = None
     prev_opt = {k: (None, None) for k in contracts}
 
-    # Diagnostic counters — figure out why we've been seeing only 1 event
-    und_raw_ticks = [0]
-    und_nan_ticks = [0]
-    und_last_ba = [None, None]
-    und_bid_changes = [0]
-    und_ask_changes = [0]
-    und_unique_pairs = set()
-    und_unique_mids = set()
-
     import math as _math
 
     def on_underlying(t):
         nonlocal prev_und_mid
-        und_raw_ticks[0] += 1
+        # IBKR sentinel values (bid/ask <= 0 or NaN) leak through the
+        # updateEvent — 2026-04-19 investigation traced "only 1 event"
+        # to NaN bid/ask poisoning prev_und_mid. Python's NaN<=0 returns
+        # False, so the explicit isnan check is load-bearing.
         if t.bid is None or t.ask is None or t.bid <= 0 or t.ask <= 0:
-            und_nan_ticks[0] += 1
             return
         if _math.isnan(t.bid) or _math.isnan(t.ask):
-            und_nan_ticks[0] += 1
             return
-        if und_last_ba[0] is not None and t.bid != und_last_ba[0]:
-            und_bid_changes[0] += 1
-        if und_last_ba[1] is not None and t.ask != und_last_ba[1]:
-            und_ask_changes[0] += 1
-        und_last_ba[0] = t.bid
-        und_last_ba[1] = t.ask
         mid = (t.bid + t.ask) / 2
-        und_unique_pairs.add((round(t.bid, 6), round(t.ask, 6)))
-        und_unique_mids.add(round(mid, 6))
         threshold = UNDERLYING_TICK * args.min_ticks - 1e-9
         if args.min_ticks <= 0:
             threshold = 1e-9
@@ -170,15 +154,6 @@ async def main():
 
     # ── Post-process ────────────────────────────────────────────────────
     print()
-    print(f"Underlying raw updateEvent fires: {und_raw_ticks[0]}")
-    print(f"Underlying nan/invalid-filtered: {und_nan_ticks[0]}")
-    print(f"Underlying bid changes: {und_bid_changes[0]}  "
-          f"ask changes: {und_ask_changes[0]}")
-    print(f"Underlying last bid/ask: {und_last_ba[0]}/{und_last_ba[1]}")
-    print(f"Unique (bid,ask) pairs seen: {len(und_unique_pairs)}")
-    print(f"Unique mids seen: {len(und_unique_mids)}")
-    if len(und_unique_mids) <= 20:
-        print(f"  Mid values: {sorted(und_unique_mids)}")
     print(f"Underlying mid-change events recorded: {len(und_events)}")
     print(f"Option BBO-change events per key:")
     for key in sorted(contracts):

@@ -11,7 +11,6 @@ import logging
 import os
 import signal
 import time as _time
-from typing import Optional
 from datetime import datetime, date, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -538,9 +537,9 @@ async def main():
     last_full_refresh = _time.monotonic()
     last_snapshot_write = _time.monotonic()
     depth_rotation_interval = float(getattr(config.quoting, "depth_rotation_interval_sec", 2.0))
-    last_session_day: Optional[date] = None
+    last_session_day: date | None = None
     last_daily_state_save = 0.0
-    last_friday_shutdown_date: Optional[date] = None
+    last_friday_shutdown_date: date | None = None
     weekend_paused = False
     reset_hour_ct = int(getattr(getattr(config, "operations", object()),
                                 "daily_reset_hour_ct", 17))
