@@ -9,8 +9,12 @@ __pycache__/
 
 # Runtime data
 logs/
+logs-paper/
 data/
 span_data/
+
+# Ad-hoc scratch scripts (underscore prefix convention)
+scripts/_*.py
 
 # IDE
 .vscode/
