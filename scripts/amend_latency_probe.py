@@ -32,21 +32,40 @@ if not ACCOUNT:
     print("ERROR: CORSAIR_ACCOUNT_ID not set")
     sys.exit(1)
 
-# Read product config so the probe targets the same product as the engine.
-_cfg_path = os.path.join(os.path.dirname(__file__), "..", "config", "corsair_v2_config.yaml")
+# Read product config. Supports legacy `product:` block (pre-consolidation)
+# and `products:` list (v1.4+). Config file picked via $CORSAIR_CONFIG
+# (same as docker-compose), defaulting to the active v1.4 paper config.
+_cfg_name = os.environ.get("CORSAIR_CONFIG", "config/hg_v1_4_paper.yaml")
+_cfg_path = os.path.join(os.path.dirname(__file__), "..", _cfg_name)
 with open(_cfg_path) as _f:
-    _product = yaml.safe_load(_f)["product"]
+    _cfg = yaml.safe_load(_f)
+    _product = _cfg["products"][0]["product"] if "products" in _cfg else _cfg["product"]
     SYMBOL = _product["underlying_symbol"]
     MULTIPLIER = str(_product["multiplier"])
+    EXCHANGE = _product.get("exchange", "CME")
+    CURRENCY = _product.get("currency", "USD")
+    TRADING_CLASS = _product.get("trading_class", "")
 
-# Probe parameters
-EXPIRY = "20260424"      # ETHJ6
-STRIKE = 1500.0          # deeply OTM put — won't fill, easy to cancel
-RIGHT = "P"
+# Probe parameters (SELL ask stepping DOWN by one tick so no fill risk:
+# our ask stays well above any realistic bid across all N_AMENDS steps).
+if SYMBOL == "HG":
+    EXPIRY = "20260427"      # HGJ6 front
+    STRIKE = 7.00            # far OTM call — market bid ~$0
+    RIGHT = "C"
+    START_PRICE = 5.00       # ridiculously high ask, never crosses market bid
+    PRICE_STEP = -0.0005     # one HG tick, step DOWN
+    PRICE_DECIMALS = 4
+else:  # legacy ETHUSDRR probe
+    EXPIRY = "20260424"
+    STRIKE = 1500.0
+    RIGHT = "P"
+    START_PRICE = 1.50
+    PRICE_STEP = 0.50
+    PRICE_DECIMALS = 2
+
+ACTION = "SELL" if PRICE_STEP < 0 else "BUY"
 N_AMENDS = 30            # number of modify cycles
 AMEND_DELAY_S = 0.5      # gap between modifies
-START_PRICE = 1.50       # arbitrary, far below any realistic bid
-PRICE_STEP = 0.50        # one tick
 
 print(f"Probe: {RIGHT}{int(STRIKE)} {EXPIRY}, {N_AMENDS} amends @ {AMEND_DELAY_S}s gap")
 print(f"Connecting to {HOST}:{PORT} as clientId=0, account={ACCOUNT}")
@@ -73,7 +92,16 @@ async def probe():
     print(f"Connected. Server version {ib.client.serverVersion()}")
 
     # Qualify the contract
-    contract = FuturesOption(SYMBOL, EXPIRY, STRIKE, RIGHT, "CME", MULTIPLIER)
+    contract = FuturesOption(
+        symbol=SYMBOL,
+        lastTradeDateOrContractMonth=EXPIRY,
+        strike=STRIKE,
+        right=RIGHT,
+        exchange=EXCHANGE,
+        multiplier=MULTIPLIER,
+        currency=CURRENCY,
+        tradingClass=TRADING_CLASS,
+    )
     await ib.qualifyContractsAsync(contract)
     if not contract.conId:
         print(f"ERROR: failed to qualify {RIGHT}{int(STRIKE)} {EXPIRY}")
@@ -83,7 +111,7 @@ async def probe():
 
     # ── Place ────────────────────────────────────────────────────────
     order = LimitOrder(
-        action="BUY",
+        action=ACTION,
         totalQuantity=1,
         lmtPrice=START_PRICE,
         tif="DAY",
@@ -144,7 +172,7 @@ async def probe():
     amend_us_samples = []
     for i in range(N_AMENDS):
         await asyncio.sleep(AMEND_DELAY_S)
-        new_price = round(START_PRICE + (i + 1) * PRICE_STEP, 2)
+        new_price = round(START_PRICE + (i + 1) * PRICE_STEP, PRICE_DECIMALS)
         c = canonical()
         if c is None:
             print(f"  amend {i}: lost canonical trade, abort")
