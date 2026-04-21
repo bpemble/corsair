@@ -70,6 +70,15 @@ class OperationalKillMonitor:
             getattr(op, "abnormal_fill_rate_mul", 10.0))
         self.fill_rate_baseline_window_sec: float = float(
             getattr(op, "abnormal_fill_baseline_window_sec", 3600.0))
+        # Minimum actual coverage of the baseline window before the ratio
+        # check runs. Fresh-boot scenarios otherwise trip at market open
+        # when a tiny baseline (built over ~49 min of pre-market quiet)
+        # gets compared against a legitimate open-auction fill burst —
+        # observed 2026-04-21 at 08:37 CT with 4 fills in 110ms ratio'd
+        # 29× against a 0.1/min baseline. 30min coverage makes the
+        # denominator meaningful.
+        self.fill_rate_min_baseline_sec: float = float(
+            getattr(op, "abnormal_fill_baseline_min_coverage_sec", 1800.0))
         self.rvol_alert_threshold: float = float(
             getattr(op, "rvol_alert_5d_threshold", 0.50))
 
@@ -222,8 +231,10 @@ class OperationalKillMonitor:
             return
         long_fills = max(0, long_samples[-1][1] - long_samples[0][1])
         if long_fills < 5:
-            return  # not enough history to trust the ratio
+            return  # not enough fills to trust the ratio
         long_span = max(1.0, long_samples[-1][0] - long_samples[0][0])
+        if long_span < self.fill_rate_min_baseline_sec:
+            return  # baseline window not yet populated enough to trust
         long_rate_per_min = (long_fills / long_span) * 60.0
         if long_rate_per_min <= 0:
             return

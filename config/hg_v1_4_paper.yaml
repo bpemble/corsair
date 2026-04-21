@@ -77,9 +77,12 @@ operational_kills:
   # is 31%; 50% means regime change. Page-only, no auto-halt.
   rvol_alert_5d_threshold: 0.50
   # Abnormal trade rate: fills/minute > multiplier × rolling-hour
-  # baseline. Halts, pages.
+  # baseline. Halts, pages. Minimum-coverage gate prevents a freshly-
+  # booted process from false-positiving at market open against a
+  # thin pre-market baseline (observed 2026-04-21).
   abnormal_fill_rate_mul: 10.0
   abnormal_fill_baseline_window_sec: 3600
+  abnormal_fill_baseline_min_coverage_sec: 1800   # require ≥30min of baseline
 
 # ── Hedging (v1.4 §5) ──────────────────────────────────────────────────
 # NEW in v1.4. Delta-hedge the options book via HG futures front-month.

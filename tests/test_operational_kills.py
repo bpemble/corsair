@@ -40,7 +40,10 @@ class _StubQuotes:
 
 def _make_monitor(rmse=None, p50_us=None, enabled=True,
                   rmse_threshold=0.05, rmse_window_sec=300.0,
-                  latency_ms_max=2000.0, latency_window_sec=60.0):
+                  latency_ms_max=2000.0, latency_window_sec=60.0,
+                  fill_rate_mul=10.0,
+                  fill_rate_baseline_window_sec=3600.0,
+                  fill_rate_min_baseline_sec=1800.0):
     """Build an OperationalKillMonitor with a single synthetic engine."""
     config = SimpleNamespace(
         operational_kills=SimpleNamespace(
@@ -49,6 +52,9 @@ def _make_monitor(rmse=None, p50_us=None, enabled=True,
             sabr_rmse_window_sec=rmse_window_sec,
             quote_latency_max_ms=latency_ms_max,
             quote_latency_window_sec=latency_window_sec,
+            abnormal_fill_rate_mul=fill_rate_mul,
+            abnormal_fill_baseline_window_sec=fill_rate_baseline_window_sec,
+            abnormal_fill_baseline_min_coverage_sec=fill_rate_min_baseline_sec,
         )
     )
     engines = [{
@@ -141,6 +147,50 @@ def test_latency_skips_when_no_samples_yet():
     mon, _ = _make_monitor(p50_us=None)
     mon._check_quote_latency(now=500.0)
     assert mon._latency_first_breach_ts is None
+
+
+# ── Abnormal fill rate — baseline-coverage gate ────────────────────────
+
+def test_fill_rate_skips_when_baseline_span_too_short():
+    """Observed 2026-04-21 08:37 CT: 4 fills in 110ms at market open
+    tripped the kill against a 49-min-old baseline. The
+    min-coverage gate must suppress the ratio check until enough time
+    has elapsed."""
+    mon, risk = _make_monitor(
+        fill_rate_min_baseline_sec=1800.0,  # 30 min
+    )
+    # Simulate fresh boot: 5 quiet fills over ~15 min, then a burst.
+    mon.portfolio.fills_today = 0
+    mon._fill_hist = []
+    # Populate baseline samples covering only 900s (15 min).
+    for ts, fc in [(0, 0), (300, 1), (600, 2), (900, 3)]:
+        mon._fill_hist.append((ts, fc))
+    # Burst at t=960s: 4 fills in ~60s
+    mon.portfolio.fills_today = 7
+    mon._check_fill_rate(now=960.0)
+    assert not risk.killed, (
+        "fill_rate kill must not fire when baseline span < min_coverage"
+    )
+
+
+def test_fill_rate_fires_once_baseline_span_sufficient():
+    """After the baseline window is populated, a genuine burst still
+    fires the kill. Needs ≥2 samples in the last 60s so the short-
+    window rate has a denominator."""
+    mon, risk = _make_monitor(
+        fill_rate_min_baseline_sec=1800.0,
+        fill_rate_mul=10.0,
+    )
+    # ~35 min of slow-fill baseline + a pre-burst anchor at t=2040.
+    mon._fill_hist = [
+        (0, 0), (400, 1), (800, 2), (1200, 3), (1600, 4),
+        (2000, 5), (2040, 5),
+    ]
+    # Burst: 4 fills between t=2040 and t=2100
+    mon.portfolio.fills_today = 9
+    mon._check_fill_rate(now=2100.0)
+    assert risk.killed
+    assert "ABNORMAL FILL RATE" in risk.kill_calls[0][0]
 
 
 # ── Disabled / safety ─────────────────────────────────────────────────
