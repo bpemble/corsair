@@ -30,22 +30,32 @@ import yaml
 from ib_insync import IB, Future, FuturesOption
 
 # ── Config ─────────────────────────────────────────────────────────────
+# Config loading is optional — fully overridable via CLI args so the
+# probe can run against any product (HG / SI / ETH / …) without needing
+# a corsair config for that product. Loads hg_v1_4_paper.yaml as a
+# default source for the HG product spec.
 _cfg_name = os.environ.get("CORSAIR_CONFIG", "config/hg_v1_4_paper.yaml")
 _cfg_path = os.path.join(os.path.dirname(__file__), "..", _cfg_name)
-with open(_cfg_path) as f:
-    _cfg = yaml.safe_load(f)
-    _prod = _cfg["products"][0]["product"] if "products" in _cfg else _cfg["product"]
-    SYMBOL = _prod["underlying_symbol"]
-    OPT_SYMBOL = _prod.get("option_symbol", SYMBOL)
-    TRADING_CLASS = _prod.get("trading_class", "")
-    EXCHANGE = _prod.get("exchange", "CME")
-    CURRENCY = _prod.get("currency", "USD")
-    MULTIPLIER = str(_prod["multiplier"])
+try:
+    with open(_cfg_path) as f:
+        _cfg = yaml.safe_load(f)
+        _prod = _cfg["products"][0]["product"] if "products" in _cfg else _cfg["product"]
+        DEFAULT_SYMBOL = _prod["underlying_symbol"]
+        DEFAULT_OPT_SYMBOL = _prod.get("option_symbol", DEFAULT_SYMBOL)
+        DEFAULT_TRADING_CLASS = _prod.get("trading_class", "")
+        DEFAULT_EXCHANGE = _prod.get("exchange", "CME")
+        DEFAULT_CURRENCY = _prod.get("currency", "USD")
+        DEFAULT_MULTIPLIER = str(_prod["multiplier"])
+except Exception:
+    DEFAULT_SYMBOL = "HG"
+    DEFAULT_OPT_SYMBOL = "HXE"
+    DEFAULT_TRADING_CLASS = "HXE"
+    DEFAULT_EXCHANGE = "COMEX"
+    DEFAULT_CURRENCY = "USD"
+    DEFAULT_MULTIPLIER = "25000"
 
 HOST = os.environ.get("CORSAIR_GATEWAY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CORSAIR_GATEWAY_PORT", "4002"))
-CLIENT_ID = 77
-UNDERLYING_TICK = 0.0005        # HG futures tick
 MATCH_WINDOW_MS = 2000          # ignore pairings longer than this
 
 
@@ -54,19 +64,44 @@ async def main():
     ap.add_argument("--duration", type=int, default=300, help="observation seconds")
     ap.add_argument("--expiry", default="20260427", help="option expiry YYYYMMDD")
     ap.add_argument("--atm", type=float, required=True,
-                    help="ATM strike (round nickel, e.g. 6.00)")
+                    help="ATM strike (e.g. 6.10 for HG, 32 for SI, 1800 for ETH)")
     ap.add_argument("--n-strikes", type=int, default=2,
                     help="strikes on each side of ATM (total = 2*N+1 strikes × 2 rights)")
     ap.add_argument("--min-ticks", type=int, default=1,
                     help="ignore underlying moves smaller than this many ticks")
+    # Product overrides (defaults come from CORSAIR_CONFIG which is HG)
+    ap.add_argument("--symbol", default=DEFAULT_SYMBOL)
+    ap.add_argument("--opt-symbol", default=DEFAULT_OPT_SYMBOL)
+    ap.add_argument("--trading-class", default=DEFAULT_TRADING_CLASS)
+    ap.add_argument("--exchange", default=DEFAULT_EXCHANGE)
+    ap.add_argument("--currency", default=DEFAULT_CURRENCY)
+    ap.add_argument("--multiplier", default=DEFAULT_MULTIPLIER)
+    ap.add_argument("--strike-step", type=float, default=0.05,
+                    help="nickel step for HG; set larger for SI (e.g. 0.25) or ETH (e.g. 25)")
+    ap.add_argument("--underlying-tick", type=float, default=0.0005,
+                    help="futures underlying tick (for min-ticks threshold)")
+    ap.add_argument("--client-id", type=int, default=77,
+                    help="IBKR clientId (use distinct ids for parallel probes)")
+    ap.add_argument("--underlying-trading-class", default="",
+                    help="filter futures by tradingClass (e.g. SI for standard silver "
+                         "to exclude micro SIL when searching symbol=SI)")
     args = ap.parse_args()
+
+    SYMBOL = args.symbol
+    OPT_SYMBOL = args.opt_symbol
+    TRADING_CLASS = args.trading_class
+    EXCHANGE = args.exchange
+    CURRENCY = args.currency
+    MULTIPLIER = args.multiplier
+    UNDERLYING_TICK = args.underlying_tick
+    CLIENT_ID = args.client_id
 
     ib = IB()
     # Lean connect per CLAUDE.md §5 — stock connectAsync times out on FA
-    # paper (multi-sub-account bootstrap). Observer clientId=77 doesn't
+    # paper (multi-sub-account bootstrap). Observer clientIds don't
     # need positions/orders/accounts; market data only.
     await ib.client.connectAsync(HOST, PORT, CLIENT_ID, 30)
-    print(f"Connected. Server version {ib.client.serverVersion()}  clientId={CLIENT_ID}")
+    print(f"Connected. Server version {ib.client.serverVersion()}  clientId={CLIENT_ID}  symbol={SYMBOL}")
 
     # Qualify underlying futures — options-expiry != futures-expiry, so
     # let IB pick the front-month contract via reqContractDetails instead
@@ -81,6 +116,8 @@ async def main():
     future_expiries = [
         d.contract for d in det
         if d.contract.lastTradeDateOrContractMonth >= today
+        and (not args.underlying_trading_class
+             or d.contract.tradingClass == args.underlying_trading_class)
     ]
     if not future_expiries:
         print(f"No future-dated {SYMBOL} contracts found", file=sys.stderr)
@@ -94,7 +131,7 @@ async def main():
     # Qualify N strikes × 2 rights
     contracts = {}
     for k_off in range(-args.n_strikes, args.n_strikes + 1):
-        strike = round(args.atm + k_off * 0.05, 2)
+        strike = round(args.atm + k_off * args.strike_step, 4)
         for right in ("C", "P"):
             opt = FuturesOption(
                 symbol=OPT_SYMBOL, lastTradeDateOrContractMonth=args.expiry,
