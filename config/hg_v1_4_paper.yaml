@@ -130,6 +130,13 @@ hedging:
   tolerance_deltas: 0.5        # ±0.5 contract-deltas no-trade band
   rebalance_on_fill: true
   rebalance_cadence_sec: 30
+  # Skip the front-month futures contract for hedging if it expires
+  # within this many calendar days. Works around IBKR's near-expiration
+  # physical-delivery lockout (Error 201 on retail orders), which blocked
+  # HGJ6 ~6 days from expiry on 2026-04-22 and forced execute → observe
+  # rollback (commit 470d09f). hedge_manager picks the FIRST contract
+  # whose expiry is >= today + this window. Set to 0 to disable.
+  near_expiry_lockout_days: 7
   # Mark-to-market tracking: when true, hedge P&L is included in the
   # daily_pnl_halt calculation per v1.4 §6.1. Keep on even in observe
   # mode — "would-be" hedge P&L is still real exposure.

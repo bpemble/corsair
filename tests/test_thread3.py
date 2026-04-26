@@ -278,3 +278,132 @@ def test_burst_events_uses_K1_K2_field_names():
     assert "K2_count" in e
     assert "same_side_count" not in e
     assert "any_side_count" not in e
+
+
+# ── HedgeManager near-expiry contract resolution (Phase 0) ─────────
+
+
+import asyncio
+from datetime import date, timedelta
+
+
+class _StubContract:
+    def __init__(self, expiry, local_symbol="HG", con_id=12345):
+        self.lastTradeDateOrContractMonth = expiry
+        self.localSymbol = local_symbol
+        self.symbol = "HG"
+        self.exchange = "COMEX"
+        self.currency = "USD"
+        self.conId = con_id
+
+
+class _StubContractDetails:
+    def __init__(self, contract):
+        self.contract = contract
+
+
+class _StubIB:
+    """Async-stubbed IB client used to test resolve_hedge_contract."""
+    def __init__(self, available_expiries):
+        self.available_expiries = available_expiries
+
+    async def reqContractDetailsAsync(self, contract):
+        return [_StubContractDetails(_StubContract(exp))
+                for exp in self.available_expiries]
+
+    async def qualifyContractsAsync(self, contract):
+        # Stamp on a non-zero conId so the qualify check passes.
+        contract.conId = 99999
+        return [contract]
+
+
+def _make_resolve_test_hedge_manager(front_expiry: str,
+                                     available_expiries: list[str],
+                                     lockout_days: int = 7):
+    """HedgeManager with a stubbed market_data + ib for resolve testing."""
+    cfg = type("Cfg", (), {})()
+    cfg.hedging = type("H", (), {
+        "enabled": True, "mode": "observe",
+        "tolerance_deltas": 0.5, "rebalance_on_fill": True,
+        "rebalance_cadence_sec": 30.0,
+        "include_in_daily_pnl": True, "flatten_on_halt": True,
+        "near_expiry_lockout_days": lockout_days,
+    })()
+    cfg.account = type("A", (), {"account_id": "DUTEST"})()
+    cfg.product = type("P", (), {
+        "underlying_symbol": "HG", "multiplier": 25000,
+    })()
+    cfg.quoting = type("Q", (), {"tick_size": 0.0005})()
+    md = type("MD", (), {})()
+    md.state = type("S", (), {"underlying_price": 6.10})()
+    md._underlying_contract = _StubContract(front_expiry, "HGJ6", 70001)
+    portfolio = type("P", (), {})()
+    portfolio.delta_for_product = lambda product: 0.0
+    h = HedgeManager(ib=_StubIB(available_expiries), config=cfg,
+                     market_data=md, portfolio=portfolio)
+    return h
+
+
+def test_resolve_skips_near_expiry_front_month():
+    """When the front month is inside the lockout window, resolve should
+    pick the next expiry past cutoff."""
+    today = date.today()
+    near_expiry = (today + timedelta(days=3)).strftime("%Y%m%d")  # locked
+    next_expiry = (today + timedelta(days=35)).strftime("%Y%m%d")  # ok
+    far_expiry = (today + timedelta(days=70)).strftime("%Y%m%d")
+    h = _make_resolve_test_hedge_manager(
+        front_expiry=near_expiry,
+        available_expiries=[near_expiry, next_expiry, far_expiry],
+        lockout_days=7,
+    )
+    moved = asyncio.run(h.resolve_hedge_contract())
+    assert moved is True
+    assert h._resolved_hedge_contract is not None
+    assert (h._resolved_hedge_contract.lastTradeDateOrContractMonth
+            == next_expiry)
+
+
+def test_resolve_keeps_front_month_when_outside_lockout():
+    """When the front month is past the lockout cutoff, no skip — keep
+    the options engine's contract, returning False (no behavior change)."""
+    today = date.today()
+    healthy_expiry = (today + timedelta(days=20)).strftime("%Y%m%d")
+    next_expiry = (today + timedelta(days=50)).strftime("%Y%m%d")
+    h = _make_resolve_test_hedge_manager(
+        front_expiry=healthy_expiry,
+        available_expiries=[healthy_expiry, next_expiry],
+        lockout_days=7,
+    )
+    moved = asyncio.run(h.resolve_hedge_contract())
+    assert moved is False
+    # Resolved contract is the front-month underlying (no skip).
+    assert (h._resolved_hedge_contract.lastTradeDateOrContractMonth
+            == healthy_expiry)
+
+
+def test_resolve_disabled_when_lockout_days_zero():
+    """lockout_days=0 disables the skip. Returns False; no resolution."""
+    today = date.today()
+    near_expiry = (today + timedelta(days=3)).strftime("%Y%m%d")
+    h = _make_resolve_test_hedge_manager(
+        front_expiry=near_expiry,
+        available_expiries=[near_expiry],
+        lockout_days=0,
+    )
+    moved = asyncio.run(h.resolve_hedge_contract())
+    assert moved is False
+    assert h._resolved_hedge_contract is None  # Not populated
+
+
+def test_resolve_falls_back_when_no_contract_past_cutoff():
+    """If reqContractDetailsAsync returns nothing past the cutoff, we
+    fall back to the legacy front-month contract (return False)."""
+    today = date.today()
+    near_expiry = (today + timedelta(days=3)).strftime("%Y%m%d")
+    h = _make_resolve_test_hedge_manager(
+        front_expiry=near_expiry,
+        available_expiries=[near_expiry],  # only the locked-out front
+        lockout_days=7,
+    )
+    moved = asyncio.run(h.resolve_hedge_contract())
+    assert moved is False  # no resolution — fallback in effect

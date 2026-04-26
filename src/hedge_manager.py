@@ -31,8 +31,9 @@ side (deferred to v1.5 or when flipping to execute).
 
 import logging
 import time
+from datetime import date, datetime, timedelta
 
-from ib_insync import LimitOrder
+from ib_insync import Future, LimitOrder
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,19 @@ class HedgeManager:
         # request_priority_drain; cleared the first periodic tick after
         # the deadline passes.
         self._priority_drain_until_ns: int = 0
+        # Phase 0 of the Thread 3 deployment runbook: skip front-month
+        # futures contracts whose expiry is within this window — IBKR's
+        # near-expiration physical-delivery lockout rejects retail
+        # orders on contracts ~1-2 weeks from expiry (forced execute →
+        # observe rollback 2026-04-22 on HGJ6, 6 days from expiry). When
+        # set to 0, the lockout skip is disabled and we reuse the
+        # options engine's underlying contract (legacy behavior).
+        self._lockout_days: int = int(getattr(
+            h, "near_expiry_lockout_days", 7))
+        # Resolved hedge contract (post-lockout-skip). Populated by
+        # ``resolve_hedge_contract`` at startup; falls back to
+        # ``market_data._underlying_contract`` if resolution fails.
+        self._resolved_hedge_contract = None
         self._account = config.account.account_id
         # One-time contract-resolution log flag. On first _place_or_log
         # call we dump the futures contract attributes (symbol, secType,
@@ -285,6 +299,122 @@ class HedgeManager:
                            net_delta_pre=pre_options + self.hedge_qty,
                            target_qty=0)
 
+    async def resolve_hedge_contract(self) -> bool:
+        """Pick the first tradeable futures contract for hedging — i.e.,
+        skip front months currently inside IBKR's near-expiration
+        physical-delivery lockout window. Awaited from main.py at
+        startup; result is cached on ``self._resolved_hedge_contract``.
+
+        Returns True iff a contract was successfully resolved AND
+        differs from the options engine's front-month contract (i.e.,
+        the lockout skip actually moved us to a back month). Returns
+        False on resolution failure or when the front month was already
+        outside the lockout window (in which case we keep using the
+        options engine's contract — no behavior change).
+
+        No-op when ``_lockout_days <= 0`` (disable knob) or when the
+        underlying isn't a HG/HXE futures product. ETH options use a
+        different hedge instrument; that path is unchanged.
+        """
+        if not self.enabled or self._lockout_days <= 0:
+            return False
+        # Only run for products where the hedge instrument is a future
+        # the same as the options engine's underlying. If a future
+        # operator wires a non-future hedge (e.g. spot), skip.
+        underlying = getattr(self.market_data, "_underlying_contract", None)
+        if underlying is None:
+            logger.warning(
+                "hedge contract resolve [%s]: no options underlying yet — "
+                "deferring; legacy fallback will be used until resolved",
+                self._product,
+            )
+            return False
+        # Trigger resolution if the front-month underlying expires
+        # inside the lockout window. Otherwise no need to walk the chain.
+        front_expiry = getattr(
+            underlying, "lastTradeDateOrContractMonth", "") or ""
+        cutoff = (date.today() + timedelta(days=self._lockout_days)
+                  ).strftime("%Y%m%d")
+        if front_expiry and front_expiry >= cutoff:
+            logger.info(
+                "hedge contract resolve [%s]: front-month %s expiry=%s "
+                "is outside %d-day lockout window — using as-is",
+                self._product, getattr(underlying, "localSymbol", "?"),
+                front_expiry, self._lockout_days,
+            )
+            self._resolved_hedge_contract = underlying
+            return False
+        # Front-month is locked out — enumerate the chain and pick the
+        # first contract past the cutoff.
+        symbol = getattr(underlying, "symbol", None)
+        exchange = getattr(underlying, "exchange", None)
+        currency = getattr(underlying, "currency", None)
+        if not symbol or not exchange:
+            logger.warning(
+                "hedge contract resolve [%s]: missing symbol/exchange "
+                "on underlying — keeping legacy front-month",
+                self._product,
+            )
+            return False
+        try:
+            details = await self.ib.reqContractDetailsAsync(Future(
+                symbol=symbol, exchange=exchange, currency=currency))
+        except Exception as e:
+            logger.warning(
+                "hedge contract resolve [%s]: reqContractDetailsAsync "
+                "failed (%s); keeping legacy front-month", self._product, e,
+            )
+            return False
+        if not details:
+            logger.warning(
+                "hedge contract resolve [%s]: no contracts returned for "
+                "%s — keeping legacy front-month", self._product, symbol,
+            )
+            return False
+        # Sort ascending and pick the first whose expiry passes cutoff.
+        candidates = sorted(
+            (d.contract for d in details
+             if (getattr(d.contract, "lastTradeDateOrContractMonth", "")
+                 or "") >= cutoff),
+            key=lambda c: c.lastTradeDateOrContractMonth,
+        )
+        if not candidates:
+            logger.warning(
+                "hedge contract resolve [%s]: no contract past lockout "
+                "cutoff %s — keeping legacy front-month",
+                self._product, cutoff,
+            )
+            return False
+        target = candidates[0]
+        try:
+            qualified = await self.ib.qualifyContractsAsync(target)
+        except Exception as e:
+            logger.warning(
+                "hedge contract resolve [%s]: qualifyContractsAsync "
+                "failed (%s) — keeping legacy front-month", self._product, e,
+            )
+            return False
+        if not qualified or qualified[0].conId == 0:
+            logger.warning(
+                "hedge contract resolve [%s]: failed to qualify %s — "
+                "keeping legacy front-month",
+                self._product, getattr(target, "localSymbol", "?"),
+            )
+            return False
+        self._resolved_hedge_contract = qualified[0]
+        logger.warning(
+            "HEDGE CONTRACT RESOLVED [%s]: lockout-skip selected %s "
+            "(expiry=%s conId=%d) — front-month %s (expiry=%s) is "
+            "inside the %d-day near-expiry window",
+            self._product,
+            getattr(qualified[0], "localSymbol", "?"),
+            getattr(qualified[0], "lastTradeDateOrContractMonth", "?"),
+            getattr(qualified[0], "conId", 0),
+            getattr(underlying, "localSymbol", "?"),
+            front_expiry, self._lockout_days,
+        )
+        return True
+
     # ── Internal ──────────────────────────────────────────────────────
     def _maybe_rebalance(self, reason: str) -> None:
         """Check tolerance and rebalance if breached."""
@@ -348,7 +478,13 @@ class HedgeManager:
                            "(reason=%s)", reason)
             return
 
-        fut_contract = getattr(self.market_data, "_underlying_contract", None)
+        # Prefer the post-lockout-skip contract resolved at startup. Fall
+        # back to the options engine's underlying if resolution wasn't
+        # run or failed (back-compat for existing call sites + observe
+        # mode where contract liveness doesn't matter).
+        fut_contract = (self._resolved_hedge_contract
+                        or getattr(self.market_data,
+                                   "_underlying_contract", None))
 
         # v1.4 Gate 0 §9.1 verification: log the resolved hedge contract
         # once per session so operator can confirm we're trading the

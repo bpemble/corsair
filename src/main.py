@@ -356,6 +356,19 @@ async def main():
         except Exception:
             logger.exception("failed to wire hedge_manager into quotes")
 
+        # Thread 3 deployment runbook Phase 0: resolve a tradeable
+        # hedge contract that skips IBKR's near-expiration lockout
+        # window. Awaited at startup so the resolved contract is
+        # available before any rebalance fires. Failure here logs and
+        # falls back to the options engine's underlying — observe-mode
+        # behavior is unaffected; execute-mode would re-encounter the
+        # lockout if fallback runs and front-month is locked.
+        try:
+            await hedge.resolve_hedge_contract()
+        except Exception:
+            logger.exception("hedge.resolve_hedge_contract failed [%s]",
+                             pcfg.name)
+
         engines.append({
             "name": pcfg.name,
             "config": pcfg,
