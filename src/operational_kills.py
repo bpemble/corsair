@@ -79,8 +79,31 @@ class OperationalKillMonitor:
         # denominator meaningful.
         self.fill_rate_min_baseline_sec: float = float(
             getattr(op, "abnormal_fill_baseline_min_coverage_sec", 1800.0))
+        # Floor on the effective baseline rate (fills/min). Without a
+        # floor, a quiet baseline (e.g. 0.08/min from overnight) × 10×
+        # multiplier gives an effective threshold (0.8/min) that a
+        # perfectly normal legitimate fill cluster can breach. Observed
+        # 2026-04-23 07:47 CDT: 4 fills in 20s = 12/min short rate,
+        # vs 0.08/min hour baseline → 150× ratio, kill fired. Floor
+        # sets the minimum effective baseline so the kill only fires
+        # on genuinely abnormal burst rates, not regime transitions.
+        self.fill_rate_baseline_floor_per_min: float = float(
+            getattr(op, "abnormal_fill_baseline_floor_per_min", 0.5))
         self.rvol_alert_threshold: float = float(
             getattr(op, "rvol_alert_5d_threshold", 0.50))
+
+        # Hardburst-skip overlay kill (spec Change 3.6). Trips when the
+        # daily suppression rate exceeds this fraction — indicating the
+        # detector is firing constantly (regime shift or mis-calibrated
+        # threshold). On trip: disables the gate for the rest of the day
+        # and emits a Discord alert. Read from top-level quoting: block
+        # with a floor on minimum attempts so a fresh-boot can't trip at
+        # the first skip.
+        q = getattr(config, "quoting", None)
+        self.hardburst_kill_rate: float = float(
+            getattr(q, "hardburst_suppression_kill_rate", 0.20))
+        self.hardburst_kill_min_attempts: int = int(
+            getattr(q, "hardburst_suppression_kill_min_attempts", 100))
 
         # Sustained-breach tracking. Per-signal monotonic ts of when the
         # current breach streak began; None means no active breach.
@@ -111,6 +134,11 @@ class OperationalKillMonitor:
             return
 
         self._check_fill_rate(now)
+
+        # Hardburst-suppression-rate kill runs regardless of other kill
+        # state — it's a FEATURE-DISABLE, not a full halt. Safe to evaluate
+        # even after other kills have fired.
+        self._check_hardburst_suppression()
 
     # ── Per-switch checks ─────────────────────────────────────────────
     def _check_sabr_rmse(self, now: float) -> None:
@@ -236,14 +264,61 @@ class OperationalKillMonitor:
         if long_span < self.fill_rate_min_baseline_sec:
             return  # baseline window not yet populated enough to trust
         long_rate_per_min = (long_fills / long_span) * 60.0
-        if long_rate_per_min <= 0:
+        effective_baseline = max(long_rate_per_min, self.fill_rate_baseline_floor_per_min)
+        if effective_baseline <= 0:
             return
 
-        ratio = short_rate_per_min / long_rate_per_min
+        ratio = short_rate_per_min / effective_baseline
         if ratio > self.fill_rate_mul:
+            floored = effective_baseline > long_rate_per_min
+            floor_note = f" [floored from {long_rate_per_min:.2f}]" if floored else ""
             self.risk.kill(
                 f"ABNORMAL FILL RATE: {short_rate_per_min:.1f}/min (short) "
-                f"vs {long_rate_per_min:.2f}/min (hour baseline) — "
+                f"vs {effective_baseline:.2f}/min (hour baseline{floor_note}) — "
                 f"ratio {ratio:.1f}× > {self.fill_rate_mul:.0f}×",
                 source="operational", kill_type="halt",
             )
+
+    def _check_hardburst_suppression(self) -> None:
+        """Hardburst overlay runaway-suppression guard (spec Change 3.6).
+
+        Disables the hardburst_skip gate for the rest of the session when
+        the daily suppression rate exceeds ``hardburst_kill_rate`` with
+        at least ``hardburst_kill_min_attempts`` samples. This is a
+        FEATURE-DISABLE, not a risk.kill() — the rest of the trading
+        path is still healthy.
+
+        Idempotent: QuoteManager.disable_hardburst_skip_for_session is a
+        no-op after first call, so repeated `check()` invocations post-
+        trip don't flood the Discord channel."""
+        for eng in self.engines:
+            quotes = eng.get("quotes")
+            if quotes is None:
+                continue
+            # Already killed for this session? Nothing to do.
+            if getattr(quotes, "_hardburst_skip_disabled_by_kill", False):
+                continue
+            attempts = getattr(quotes, "_hardburst_update_attempts", 0)
+            if attempts < self.hardburst_kill_min_attempts:
+                continue
+            rate = quotes.get_hardburst_suppression_rate()
+            if rate <= self.hardburst_kill_rate:
+                continue
+            # Trip
+            reason = (f"suppression_rate={rate:.3f} "
+                      f"> kill_rate={self.hardburst_kill_rate:.2f} "
+                      f"(attempts={attempts}, "
+                      f"skips={quotes._hardburst_skip_count}, "
+                      f"engine={eng.get('name', '?')})")
+            quotes.disable_hardburst_skip_for_session(reason)
+            try:
+                from .discord_notify import send_alert
+                send_alert(
+                    "HARDBURST OVERLAY AUTO-DISABLED",
+                    f"Runaway suppression — {reason}. "
+                    f"Gate OFF until session rollover. "
+                    f"Review detector threshold / window vs current regime.",
+                    color=0xF39C12,  # orange — feature kill, not full halt
+                )
+            except Exception as e:
+                logger.debug("hardburst kill discord alert failed: %s", e)

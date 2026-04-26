@@ -141,6 +141,17 @@ update the 11-strike window (drop the edge strike on one side,
 add a new strike on the other). Pending orders on dropped strikes
 cancel; new strikes begin quoting.
 
+> **Deviation 2026-04-20 (operator override, commit `bde574b`)**: active
+> paper config runs asymmetric OTM-only (calls ATM→ATM+5, puts ATM−5→ATM
+> → 12 instruments, 24 max resting orders) rather than the 22/44
+> specified above. Rationale: per-refresh gateway JVM serialization
+> latency was dominant; halving order count halved serialization time.
+> ITM strikes had thin flow / wide spreads, so pruning them freed order
+> budget without losing fill volume. Accepted risk: short-C vs short-P
+> inventory skew on persistent drift, monitored against the 5.0 delta
+> kill; re-enable `inventory_balance` gate if skew sustains >30%. See
+> `CLAUDE.md` §12 for revert procedure.
+
 ### 3.3 NOT quoted (exclusions)
 
 - Any strike with DTE > 35 (back-month)
@@ -290,7 +301,21 @@ Stage 1 / Stage 2 capital tiers:
 | SPAN margin kill | **$52,500** (70% × $75K) | **$70,000** (70% × $100K) | Absolute halt; flatten book |
 | Delta kill | ±5.0 contract-deltas | ±5.0 | Halt new opens, force-hedge to 0 |
 | Theta kill | **−$200** (2/3 of v1.3) | **−$250** | Halt new opens |
-| \|Net vega\| halt | **$500** | **$750** | Halt new opens |
+| \|Net vega\| halt | ~~**$500**~~ **DISABLED** (see below) | ~~**$750**~~ TBD | Halt new opens |
+
+**\|Net vega\| halt — DISABLED 2026-04-23.** Backtest characterization
+(HG, 2023 Q1 / 2023 Q3 / OOS 2026 panels at $250K tier) showed the $500
+threshold would halt on 67-88% of fills — operationally a choke, not a
+tail backstop. In the OOS 2026 panel, only 3.7% of $500-breaches coincide
+with margin > 80% of cap; rescaling to $3000 fixes OOS (0.0% co-occurrence)
+but breaks 2024 Q3 (97.4%). Disabling is the only choice that's clean
+across all three panels, and is consistent with §87 ("accept limited
+vega/gamma exposure, defend tail with daily P&L halt") and with SPAN
+already pricing a 25% vol scan. Evidence:
+`docs/findings/vega_kill_characterization_2026-04-23.md`. Applied at
+`config/hg_v1_4_paper.yaml:64` (`vega_kill: 0` — 0 is a no-op guard in
+`risk_monitor.py:244`). HG-specific; re-characterize before any ETH
+capital bump.
 
 **All Tier-1 kills**:
 - Override the daily P&L halt (i.e., if SPAN breaches before
@@ -1015,18 +1040,59 @@ later) with research justification.
 
 ## 23. Economic summary — what we are deploying
 
-**At Stage 2 ($100K capital, base case)**:
+At Stage 2 ($100K capital, v1.4 halt-on config):
 
-| Dimension | Value |
+| Dimension | Value | Source |
+|---|---|---|
+| Sharpe (central, realistic) | +5.2 | audit §2 — L1+L2 fill realism, halt slippage $3K/trigger, as_rate=0.35 |
+| Sharpe (95% CI) | +4.0 to +6.5 | audit §3 — bounded by halt-slippage × AS-rate uncertainty |
+| Annualized P&L (central) | ~$820K | audit, panel-mean pnl_median × 12/3.71 months |
+| Annualized P&L (95% CI) | ~$600K to ~$1.0M | scales ≈ linearly with Sharpe over tested range |
+| Max tail DD (measured) | 23% of capital | audit per-panel §5 |
+| Max tail DD (adverse realistic) | up to 29% at S=$3K halt slippage | audit §2 |
+| Halt trigger rate | ~5–6 days per ~4-month panel | audit §5 |
+
+Source: `~/crowsnest/docs/findings/defensible_sharpe_synthesis_2026-04-23.md`.
+
+### 23.1 How this number is constructed
+
+1. Baseline pipeline output: +5.91 (reproduces byte-identical).
+2. Apply realistic halt slippage ($3K/trigger central): +5.27.
+3. Apply L1+L2 fill realism: negligible (within noise). Central ≈ +5.35.
+4. Rounded: +5.0 to +5.5 central, +4.0 to +6.5 95% CI.
+
+### 23.2 Top-3 priced sensitivities
+
+| Knob | Low | Central | High | Sharpe range |
+|---|---|---|---|---|
+| Halt slippage | $1K/trigger | $3K | $8K | +5.81 → +5.27 → +4.29 |
+| AS rate | 0.20 | 0.35 (current) | 0.50 | ~+6.4 → +5.91 → +5.03 |
+| Fill realism (L1+L2) | Off | Baseline | L1+L2 on | +5.91 → +5.91 → +6.03 |
+
+Dominant uncertainty is halt slippage. Fill-realism moves the headline by <1 cross-panel SE.
+
+### 23.3 Risks NOT in the 95% CI
+
+The CI covers what is priceable from 2023–2026 HG panel data. It does NOT cover:
+
+- Decision-to-exchange latency — pipeline zero-latency, live ~10–200 ms.
+- Queue-below-top — TBBO only; behind-touch fills invisible.
+- Live AS mix — as_intensity=0.25 is literature-benchmark, not corsair-calibrated.
+- Regime coverage — 26 months of HG history; pre-2023 + 2024-Q4 + 2025-H1 absent.
+- Paper-to-live operational gap — IBKR throttling, rejections, reconnect mechanics.
+
+See audit §6 for magnitudes. Combined plausible magnitude is ±0.5–1.0 Sharpe — post-live reality may land outside +4.0 to +6.5 in either direction without any single assumption being wrong.
+
+### 23.4 Prior framing (retained for reference)
+
+| Dimension | Prior value |
 |---|---|
-| Annual P&L (projection) | ~$740K |
-| Annual P&L (realistic haircut) | $370K – $520K |
+| Annualized P&L (projection) | ~$740K |
+| Annualized P&L (realistic haircut) | $370K – $520K |
 | Sharpe (projection) | +5.91 |
 | Sharpe (realistic) | +3.5 – +4.5 |
-| Max observed tail DD | 19.7% of capital |
-| Tail event expectation | ~1 per 8-12 months (N=2 evidence) |
-| IRR (projection) | ~740% |
-| IRR (realistic haircut) | ~370%-520% |
+
+The prior "realistic" haircut was a 30–50% judgement-call reduction. The audit's per-dimension measurement finds that range more conservative than measured realism supports — primarily because as_intensity=0.25 was already modeling a significant fraction of what the haircut informally reserved for.
 
 ---
 

@@ -712,6 +712,12 @@ class MultiExpirySABR:
         # those expiries — eliminates the temporal race where a resting
         # price stays at its pre-refit edge after theo drifts.
         self._refit_pending: set = set()
+        # Thread 3 Layer A: trigger reason of the in-flight calibration.
+        # Set by calibrate_async / calibrate; read by log_calibration on the
+        # ProcessPool result callback. Single in-flight fit at a time, so
+        # no concurrency hazard. ``"elapsed"`` is the default to preserve
+        # existing log behavior when callers don't pass a reason.
+        self._pending_trigger_reason: str = "elapsed"
 
     # ------------- expiry management -------------
 
@@ -747,12 +753,16 @@ class MultiExpirySABR:
 
     # ------------- calibration -------------
 
-    def calibrate(self, forward: float, options: dict, expiry: str = None):
+    def calibrate(self, forward: float, options: dict, expiry: str = None,
+                  trigger_reason: str = "manual"):
         """Calibrate SABR. If expiry is None, calibrates all subscribed expiries.
 
         Synchronous — runs on the calling thread. Used at startup and by
         the watchdog on reconnect, where we want to block until fresh
         theos are available. Hot-path callers should use ``calibrate_async``.
+
+        ``trigger_reason`` flows through to the sabr_fits.jsonl row;
+        synchronous calls default to ``"manual"`` (startup / watchdog).
         """
         targets = [expiry] if expiry is not None else list(self._expiries)
         params = self._fit_params()
@@ -762,6 +772,7 @@ class MultiExpirySABR:
         if not expiries_data:
             return
         out = _async_fit_worker(forward, expiries_data, *params)
+        self._pending_trigger_reason = trigger_reason
         with self._params_lock:
             for exp, res in out.items():
                 surf = self._surfaces.get(exp)
@@ -805,11 +816,17 @@ class MultiExpirySABR:
                 }
         return out
 
-    def calibrate_async(self, forward: float, options: dict) -> bool:
+    def calibrate_async(self, forward: float, options: dict,
+                        trigger_reason: str = "elapsed") -> bool:
         """Fire SABR calibration on the background ProcessPool, return
         immediately. Returns True if submitted, False if a prior fit is still
         in flight (we don't queue a backlog — the next tick picks up fresh
-        state anyway)."""
+        state anyway).
+
+        ``trigger_reason`` is stashed on ``self._pending_trigger_reason``
+        for the result callback to surface in sabr_fits.jsonl. Pass
+        ``"elapsed"`` for the periodic 30-second cadence path or
+        ``"F_tick"`` when Thread 3 Layer A's |ΔF| trigger fired."""
         if self._cal_future is not None and not self._cal_future.done():
             return False
         if not self._expiries:
@@ -827,6 +844,9 @@ class MultiExpirySABR:
         except Exception as e:
             logger.warning("ProcessPool submit failed: %s", e)
             return False
+        # Stash the trigger reason BEFORE registering the callback so the
+        # done-callback's _apply_fit_to_surface path sees the right value.
+        self._pending_trigger_reason = trigger_reason
         # add_done_callback fires on a pool-internal thread; surface mutation
         # acquires _params_lock so readers never see torn state.
         self._cal_future.add_done_callback(self._apply_fit_results)
@@ -975,6 +995,8 @@ class MultiExpirySABR:
                 )
             if surf.csv_logger is not None:
                 try:
+                    trigger_reason = getattr(
+                        self, "_pending_trigger_reason", "elapsed")
                     if use_svi:
                         surf.csv_logger.log_calibration(
                             expiry=exp, side=side, model="svi",
@@ -983,6 +1005,7 @@ class MultiExpirySABR:
                             n_points=result.n_points, rmse=result.rmse,
                             a=result.a, b=result.b, rho_svi=result.rho,
                             m=result.m, sigma=result.sigma,
+                            trigger_reason=trigger_reason,
                         )
                     else:
                         surf.csv_logger.log_calibration(
@@ -992,6 +1015,7 @@ class MultiExpirySABR:
                             n_points=result.n_points, rmse=result.rmse,
                             alpha=result.alpha, beta=surf.beta,
                             rho_sabr=result.rho, nu=result.nu,
+                            trigger_reason=trigger_reason,
                         )
                 except Exception as e:
                     logger.debug("calibration telemetry log failed: %s", e)

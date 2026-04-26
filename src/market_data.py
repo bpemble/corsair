@@ -9,6 +9,7 @@ Maintains a live MarketState object with all current quotes.
 """
 
 import asyncio
+import collections
 import logging
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,84 @@ from .utils import days_to_expiry
 logger = logging.getLogger(__name__)
 
 OptionKey = tuple[float, str, str]  # (strike, expiry, right)
+
+
+class BurstDetector:
+    """Rolling front-month futs BBO magnitude detector.
+
+    Tracks |Δbid| and |Δask| between consecutive underlying ticks; emits a
+    bounded deque of (ts_ns, move_ticks) events in the trailing window.
+    ``is_hardburst()`` returns True iff any event in the window exceeds
+    ``threshold_ticks`` (per-event max, not summed).
+
+    Per-product instance — do not share across HG/ETH. Each ``MarketData\
+Manager`` owns exactly one detector.
+
+    O(1) amortized: ``_evict`` trims the deque head against ``now_ns -
+    window_ns`` each call; total work is bounded by lifetime tick count.
+
+    Rationale (2026-04-21 wing_latency_burst_thesis): when front-month
+    futs BBO moves ≥N ticks inside corsair's amend-RTT window (~40ms),
+    stale option quotes get picked off by sub-1ms-reaction aggressors
+    before corsair can amend. The detector exposes a boolean the quote
+    engine can gate on to skip new quote placement during the exposure
+    window.
+    """
+
+    def __init__(self, tick_size: float, window_ms: int,
+                 threshold_ticks: int):
+        if tick_size <= 0:
+            raise ValueError(f"tick_size must be > 0, got {tick_size}")
+        if window_ms <= 0:
+            raise ValueError(f"window_ms must be > 0, got {window_ms}")
+        if threshold_ticks <= 0:
+            raise ValueError(
+                f"threshold_ticks must be > 0, got {threshold_ticks}")
+        self.tick_size = float(tick_size)
+        self.window_ns = int(window_ms) * 1_000_000
+        self.threshold = int(threshold_ticks)
+        self._events: collections.deque = collections.deque()
+        self._last_bid: float | None = None
+        self._last_ask: float | None = None
+
+    def on_futs_bbo(self, ts_ns: int, bid: float, ask: float) -> None:
+        """Ingest a new underlying BBO sample. Call from _on_underlying_tick
+        after bid/ask have been extracted and validated (>0)."""
+        if self._last_bid is not None and self._last_ask is not None:
+            dbid = abs(bid - self._last_bid)
+            dask = abs(ask - self._last_ask)
+            move_usd = max(dbid, dask)
+            if move_usd > 0:
+                move_ticks = round(move_usd / self.tick_size)
+                if move_ticks > 0:
+                    self._events.append((ts_ns, move_ticks))
+        self._last_bid = bid
+        self._last_ask = ask
+        self._evict(ts_ns)
+
+    def _evict(self, now_ns: int) -> None:
+        # An event exactly window_ns old is OUTSIDE the window (use <=).
+        # Window semantics: trailing (now_ns - window_ns, now_ns] inclusive
+        # on the right, exclusive on the left.
+        cutoff = now_ns - self.window_ns
+        while self._events and self._events[0][0] <= cutoff:
+            self._events.popleft()
+
+    def is_hardburst(self, now_ns: int) -> bool:
+        self._evict(now_ns)
+        if not self._events:
+            return False
+        return max(m for _, m in self._events) >= self.threshold
+
+    def snapshot(self, now_ns: int) -> dict:
+        """For telemetry. O(len(events_in_window))."""
+        self._evict(now_ns)
+        return {
+            "n_events_in_window": len(self._events),
+            "max_ticks_in_window": (
+                max((m for _, m in self._events), default=0)),
+            "is_hardburst": self.is_hardburst(now_ns),
+        }
 
 
 @dataclass
@@ -137,6 +216,9 @@ class MarketDataManager:
         self._underlying_ticker: Ticker | None = None
         self._underlying_contract: Future | None = None
         self._option_contracts: dict[OptionKey, FuturesOption] = {}
+        # ATM at the last recenter pass. recenter_strike_window short-circuits
+        # when current ATM hasn't drifted at least one strike from this.
+        self._last_recenter_atm: float | None = None
         # Rotating depth subscriptions (IBKR caps at ~5 concurrent).
         self._depth_tickers: dict[OptionKey, Ticker] = {}
         self._depth_rotation_idx: int = 0
@@ -154,6 +236,26 @@ class MarketDataManager:
         # The quoter loop awaits this queue and reprices only the strikes
         # whose ticks have been pushed since the last cycle.
         self.tick_queue: asyncio.Queue | None = None
+
+        # Burst detector: rolling window over front-month futs BBO magnitude.
+        # Fed by _on_underlying_tick. Queried by quote_engine's hardburst
+        # skip gate (behind a feature flag). Disabled silently if config
+        # doesn't provide the knobs (pre-v1.5 deployments).
+        q = getattr(config, "quoting", None)
+        bd_enabled = bool(getattr(q, "hardburst_detector_enabled", True))
+        if bd_enabled and q is not None:
+            # futs tick size — HG futures tick matches options tick (0.0005).
+            # Allow explicit override via futs_tick_size for products where
+            # they diverge (e.g. ETH futs tick is 0.05, options 0.5).
+            futs_tick = float(getattr(q, "futs_tick_size",
+                                      getattr(q, "tick_size", 0.0005)))
+            self.burst_detector: BurstDetector | None = BurstDetector(
+                tick_size=futs_tick,
+                window_ms=int(getattr(q, "hardburst_window_ms", 40)),
+                threshold_ticks=int(getattr(q, "hardburst_threshold_ticks", 5)),
+            )
+        else:
+            self.burst_detector = None
 
     async def discover_and_subscribe(self):
         """Discover option chain and subscribe to all relevant market data."""
@@ -245,6 +347,18 @@ class MarketDataManager:
             self.state.underlying_bid = ticker.bid
         if ticker.ask and ticker.ask > 0:
             self.state.underlying_ask = ticker.ask
+
+        # Feed burst detector with front-month futs BBO. Only when we have
+        # both sides — prevents seeding the detector from one-sided NaN
+        # ticks at gateway reconnect.
+        if (self.burst_detector is not None
+                and self.state.underlying_bid > 0
+                and self.state.underlying_ask > 0):
+            self.burst_detector.on_futs_bbo(
+                time.time_ns(),
+                self.state.underlying_bid,
+                self.state.underlying_ask,
+            )
 
         # Prefer mid (more responsive than last in fast markets, never stale).
         # Fall back to last/close if bid/ask are unavailable.
@@ -392,6 +506,10 @@ class MarketDataManager:
         # (products like HG have mixed grids — $0.01 near ATM, $0.05/$0.25
         # in the wings — so auto-detect picks up the wrong value).
         sorted_strikes = sorted(params.strikes)
+        # Remember the full available strike grid so recenter_strike_window
+        # can rediscover strikes that drift into range without another
+        # reqSecDefOptParamsAsync round-trip.
+        self._all_strikes = sorted_strikes
         _cfg_inc = getattr(self.config.product, "strike_increment", 0)
         if _cfg_inc and _cfg_inc > 0:
             self.state.strike_increment = float(_cfg_inc)
@@ -576,6 +694,161 @@ class MarketDataManager:
                 added,
             )
         return added
+
+    async def recenter_strike_window(
+        self,
+        protected_keys: set[OptionKey] | None = None,
+    ) -> tuple[int, int]:
+        """Re-center the subscribed strike window on the current ATM.
+
+        The initial _discover_option_chain() pass freezes the subscribed
+        strike set to ATM-at-boot ± strike_range_{low,high}. Without
+        recentering, sustained underlying drift leaves the window
+        lopsided — stale subs on the drifted-away wing, no coverage on
+        the drifted-into wing. That degrades SABR wing stability (the
+        config's ±2 anchor buffer erodes fast on a 3-strike drift) and
+        wastes market-data lines on irrelevant strikes.
+
+        Diff-based: adds strikes that have entered the window, drops
+        strikes that have fallen out — except those in `protected_keys`
+        (held positions), which stay subscribed regardless so greeks
+        keep flowing for inventory the operator still cares about.
+
+        Short-circuits when ATM hasn't drifted by at least one strike
+        from the last recenter. Cheap no-op on quiet markets.
+
+        Returns (added, dropped).
+        """
+        if protected_keys is None:
+            protected_keys = set()
+
+        p = self.config.product
+        inc = self.state.strike_increment
+        atm = self.state.atm_strike
+        if inc <= 0 or atm <= 0:
+            return (0, 0)
+
+        # Drift gate: skip when ATM hasn't moved a full strike since last pass.
+        if self._last_recenter_atm is not None:
+            drift = abs(atm - self._last_recenter_atm)
+            if drift < inc - inc * 1e-6:
+                return (0, 0)
+
+        # Desired window bounds around live ATM.
+        low_bound = atm + (p.strike_range_low * inc)
+        high_bound = atm + (p.strike_range_high * inc)
+        tol = inc * 1e-6
+
+        option_types: list[str] = []
+        opt_type = p.option_type
+        if opt_type in ("calls_only", "both"):
+            option_types.append("C")
+        if opt_type in ("puts_only", "both"):
+            option_types.append("P")
+
+        # Per-expiry availability map (populated by the multi-expiry probe
+        # path) or the flat strike grid fallback.
+        per_exp = getattr(self, "_per_expiry_strikes", None)
+        all_strikes = getattr(self, "_all_strikes", None)
+        if per_exp is None and not all_strikes:
+            # No strike grid known — can't compute a desired set.
+            return (0, 0)
+
+        desired: set[OptionKey] = set()
+        for exp in self.state.expiries:
+            if per_exp is not None:
+                exp_strikes_iter = per_exp.get(exp, set())
+            else:
+                exp_strikes_iter = all_strikes
+            for s in exp_strikes_iter:
+                if not (low_bound - tol <= s <= high_bound + tol):
+                    continue
+                if abs(round(s / inc) * inc - s) >= tol:
+                    continue  # Off-grid (e.g. HG penny wing strikes)
+                for right in option_types:
+                    desired.add((float(s), exp, right))
+
+        current = set(self._option_contracts.keys())
+        to_add = desired - current
+        to_drop = (current - desired) - set(protected_keys)
+
+        added = 0
+        dropped = 0
+
+        # ADD: qualify + subscribe new strikes.
+        if to_add:
+            new_keys_list: list[OptionKey] = []
+            new_contracts: list[FuturesOption] = []
+            for key in to_add:
+                strike, exp, right = key
+                new_keys_list.append(key)
+                new_contracts.append(FuturesOption(
+                    symbol=p.option_symbol,
+                    lastTradeDateOrContractMonth=exp,
+                    strike=strike,
+                    right=right,
+                    exchange=p.exchange,
+                    currency=p.currency,
+                    tradingClass=p.trading_class,
+                ))
+            try:
+                qualified = await self.ib.qualifyContractsAsync(*new_contracts)
+            except Exception as e:
+                logger.warning("recenter_strike_window: qualify failed: %s", e)
+                qualified = []
+            for key, contract in zip(new_keys_list, qualified):
+                if contract is None or getattr(contract, "conId", 0) == 0:
+                    continue
+                self._option_contracts[key] = contract
+                self.state.options[key] = OptionQuote(
+                    strike=key[0], expiry=key[1], put_call=key[2],
+                    contract=contract,
+                )
+                try:
+                    ticker = self.ib.reqMktData(
+                        contract, genericTickList="100,101", snapshot=False)
+                except Exception as e:
+                    logger.warning(
+                        "recenter_strike_window: reqMktData %s failed: %s",
+                        key, e)
+                    continue
+                self._option_tickers[key] = ticker
+                ticker.updateEvent += lambda t, k=key: self._on_option_tick(t, k)
+                added += 1
+
+        # DROP: cancel market data (and depth, if present) for strikes that
+        # fell out of the window and aren't held as positions.
+        for key in to_drop:
+            if key in self._depth_tickers:
+                d_ticker = self._depth_tickers.pop(key)
+                try:
+                    self.ib.cancelMktDepth(d_ticker.contract, isSmartDepth=False)
+                except Exception:
+                    pass
+            ticker = self._option_tickers.pop(key, None)
+            if ticker is not None:
+                try:
+                    self.ib.cancelMktData(ticker.contract)
+                except Exception as e:
+                    logger.warning(
+                        "recenter_strike_window: cancelMktData %s failed: %s",
+                        key, e)
+            self._option_contracts.pop(key, None)
+            self.state.options.pop(key, None)
+            self._last_clean_bid.pop(key, None)
+            self._last_clean_ask.pop(key, None)
+            dropped += 1
+
+        self._last_recenter_atm = atm
+
+        if added or dropped:
+            logger.info(
+                "recenter_strike_window: ATM=%.4f window=[%.4f, %.4f] "
+                "added=%d dropped=%d (total subs=%d)",
+                atm, low_bound, high_bound, added, dropped,
+                len(self._option_tickers),
+            )
+        return (added, dropped)
 
     def rotate_depth_subscriptions(self):
         """Cycle the depth-book window forward by one batch.

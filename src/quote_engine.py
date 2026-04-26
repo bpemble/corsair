@@ -87,6 +87,58 @@ OrderKey = tuple[float, str, str, str]  # (strike, expiry, right, side)
 ORDER_REF_PREFIX = "corsair"
 
 
+class FillBurstTracker:
+    """Thread 3 Layer C rolling fill-burst window.
+
+    Maintains a deque of (ts_ns, side) for fills landed within the
+    trailing ``window_sec``. ``record_and_evaluate`` appends the new
+    fill, evicts everything older than the window, and returns the
+    same-side and any-side counts (inclusive of the just-added fill).
+
+    Side semantics: caller passes ``"BUY"`` or ``"SELL"`` per fill;
+    same-side counts match strict equality. Mixed C/P fills on the same
+    side count together — that matches the brief's "trigger_C1 = side ==
+    this_side, on any strike" definition (cross-strike same-side burst
+    is the canonical P1 signature).
+
+    O(1) amortized on the hot path: ``_evict`` trims the deque head each
+    call against ``now_ns − window_ns``; total work is bounded by
+    lifetime fill count.
+    """
+
+    __slots__ = ("_window_ns", "_events")
+
+    def __init__(self, window_sec: float):
+        if window_sec <= 0:
+            raise ValueError(f"window_sec must be > 0, got {window_sec}")
+        self._window_ns = int(window_sec * 1_000_000_000)
+        self._events: deque = deque()
+
+    def _evict(self, now_ns: int) -> None:
+        cutoff = now_ns - self._window_ns
+        ev = self._events
+        while ev and ev[0][0] <= cutoff:
+            ev.popleft()
+
+    def record_and_evaluate(self, ts_ns: int, side: str
+                            ) -> tuple[int, int]:
+        """Append one fill, evict stale entries, return
+        ``(same_side_count, any_side_count)`` over the trailing window
+        INCLUDING the fill just appended."""
+        self._events.append((ts_ns, side))
+        self._evict(ts_ns)
+        same = sum(1 for _, s in self._events if s == side)
+        return same, len(self._events)
+
+    def count_in_window(self, now_ns: int) -> int:
+        """Read-only any-side count over the trailing window. Used to
+        emit ``burst_1s_at_fill`` after the fill has been recorded.
+        Caller is responsible for ordering: query AFTER record_and_evaluate
+        so the just-added fill is included."""
+        self._evict(now_ns)
+        return len(self._events)
+
+
 def resolve_enabled_expiries(tokens, subscribed: list) -> list:
     """Resolve config.quoting.enabled_expiries tokens to concrete YYYYMMDD
     strings using the live subscribed expiry list (front-first, sorted).
@@ -352,6 +404,34 @@ class QuoteManager:
         # rate breaches the daily ceiling. Takes precedence over the
         # config flag; cleared at the next daily counter reset.
         self._hardburst_skip_disabled_by_kill: bool = False
+
+        # Thread 3 Layer C burst-pull state. Tracker is constructed lazily
+        # from config so the window_sec knob is honored even if the
+        # master flag is OFF (we keep tracker active so we can populate
+        # fills.burst_1s_at_fill regardless — that field is part of §6
+        # baseline instrumentation and must work with all flags OFF).
+        thread3 = getattr(config.quoting, "thread3", None)
+        burst_window_sec = float(getattr(
+            thread3, "layer_c_window_sec", 1.0)) if thread3 else 1.0
+        self._fill_burst_tracker: FillBurstTracker = FillBurstTracker(
+            window_sec=burst_window_sec)
+        # Cooldown deadlines (monotonic_ns). 0 = inactive.
+        # _burst_cooldown_until_ns_per_side maps "BUY" / "SELL" → deadline;
+        # _burst_cooldown_global_until_ns is the C2 global lock. Both are
+        # consulted by the placement gate at the top of _process_side.
+        self._burst_cooldown_per_side_until_ns: dict[str, int] = {
+            "BUY": 0, "SELL": 0,
+        }
+        self._burst_cooldown_global_until_ns: int = 0
+        # Diagnostic counters surfaced via get_latency_snapshot when a
+        # burst-pull dashboard is wired up. Reset at session rollover.
+        self._burst_pull_c1_count: int = 0
+        self._burst_pull_c2_count: int = 0
+        # Hedge manager handle for the priority-drain signal. Wired by
+        # main.py after construction; None when no hedge is wired (legacy
+        # / test paths).
+        self.hedge_manager = None
+
         self.ib.errorEvent += self._on_ib_error
 
     def _begin_requote_cycle(self, trigger: str) -> None:
@@ -557,6 +637,13 @@ class QuoteManager:
         underlying has moved more than sabr_fast_recal_dollars since the
         last fit. Called from the main loop, NOT from update_quotes — see
         the comment in update_quotes for why.
+
+        Thread 3 Layer A (additive, OR with elapsed-time): when the master
+        flag and lever_a_f_tick_refit_enabled are both ON, also trigger
+        a refit when |F_now − F_at_last_fit| > N_ticks × tick_size. The
+        N_ticks knob (default 5 HG ticks = $0.0025) is configured under
+        config.quoting.thread3.layer_a_n_ticks and lives separately from
+        the sabr_fast_recal_dollars knob (a coarser, far-larger threshold).
         """
         config = self.config
         state = self.market_data.state
@@ -570,19 +657,45 @@ class QuoteManager:
             forward_move = abs(state.underlying_price - self._last_sabr_forward)
         fast_recal_dollars = float(getattr(
             config.pricing, "sabr_fast_recal_dollars", 10.0))
-        should_recal = (
+
+        # Layer A: F-tick trigger. Master + per-layer flag, both default OFF.
+        thread3 = getattr(config.quoting, "thread3", None)
+        layer_a_on = (thread3 is not None
+                      and bool(getattr(thread3, "master_enabled", False))
+                      and bool(getattr(
+                          thread3, "lever_a_f_tick_refit_enabled", False)))
+        layer_a_fired = False
+        if layer_a_on and self._last_sabr_attempt is not None:
+            n_ticks = float(getattr(thread3, "layer_a_n_ticks", 5))
+            tick_size = float(getattr(config.quoting, "tick_size", 0.0005))
+            if n_ticks > 0 and tick_size > 0:
+                threshold_usd = n_ticks * tick_size
+                if forward_move > threshold_usd:
+                    layer_a_fired = True
+
+        elapsed_fired = (
             self._last_sabr_attempt is None
             or elapsed >= config.pricing.sabr_recalibrate_seconds
             or forward_move >= fast_recal_dollars
         )
+        should_recal = elapsed_fired or layer_a_fired
         if should_recal:
+            # trigger_reason: prefer "F_tick" when ONLY the Layer A path
+            # fired (elapsed/fast_recal didn't bite). When both fired,
+            # call it "elapsed" — that path would have run anyway and the
+            # sabr_fits row reflects the existing cadence.
+            if layer_a_fired and not elapsed_fired:
+                trigger_reason = "F_tick"
+            else:
+                trigger_reason = "elapsed"
             # Only advance the "attempted" clock when we actually submit.
             # calibrate_async returns False if a prior recal is still in
             # flight — in that case we want the next cycle to try again
             # rather than waiting another 60s.
             self.sabr.set_expiries(state.expiries)
             submitted = self.sabr.calibrate_async(
-                state.underlying_price, state.options)
+                state.underlying_price, state.options,
+                trigger_reason=trigger_reason)
             if submitted:
                 self._last_sabr_attempt = now
                 self._last_sabr_forward = state.underlying_price
@@ -662,6 +775,12 @@ class QuoteManager:
                         detector.snapshot(now_ns),
                     )
                     return  # skip this update cycle entirely; no cycle opened
+
+        # Thread 3 Layer B: cancel resting orders that have drifted by
+        # more than M_ticks since placement. Runs before the cycle opens
+        # so cancelled orders aren't double-evaluated below. Cheap O(N)
+        # scan over active_orders. No-op when flag is OFF.
+        self._check_layer_b()
 
         # priority_v1: reset per-cycle amend counters. Iteration order is
         # |delta|-desc (see sort below), so the first N amends to fire are
@@ -1378,6 +1497,14 @@ class QuoteManager:
         price delta is below min_modify_ticks. Without this the SABR refit
         can drop theo by 1 tick and our 1-tick price correction gets
         suppressed by the noise filter.
+
+        Thread 3 Layer C cooldown gate: when the master + lever_c flags
+        are ON and a burst-pull cooldown is active for ``side`` (or
+        globally for C2), this method is a no-op. Modifies on existing
+        resting orders are also blocked — the Layer C action already
+        cancelled all matching orders, so the active_orders entry
+        shouldn't exist; but if it does (race or stale state), don't
+        modify into a quote that was just defensively pulled.
         """
         key = (strike, expiry, right, side)
         contract = option.contract
@@ -1385,6 +1512,13 @@ class QuoteManager:
         if contract is None:
             logger.warning("No contract for %s %s%s, cannot send order",
                            expiry, int(strike), right)
+            return
+
+        # Layer C cooldown check. Cheap O(1); short-circuit before any
+        # other work (incumbent lookup, theo math, modify-storm tracking).
+        if self._layer_c_cooldown_active(side=side):
+            self._note_cycle_eval("layer_c_cooldown")
+            self._last_skip_reason[key] = "layer_c_cooldown"
             return
 
         if key in self.active_orders:
@@ -1653,6 +1787,20 @@ class QuoteManager:
         # New places are intentionally exempt from the per-tick amend cap —
         # a missing resting order is higher priority than throttling churn.
         self._last_amend_ns[key] = time.monotonic_ns()
+        # Thread 3 §6 instrumentation: per-order placement event. F_at
+        # is the underlying price at placement, used by Layer B tuning
+        # (CDF of |ΔF since placement| at cancel/fill time).
+        if self.csv_logger is not None:
+            try:
+                self.csv_logger.log_paper_order_lifecycle(
+                    order_id=trade.order.orderId, event="placed",
+                    strike=strike, expiry=expiry, right=right, side=side,
+                    price=price,
+                    forward=self.market_data.state.underlying_price,
+                    reason="",
+                )
+            except Exception:
+                logger.debug("order_lifecycle emit failed", exc_info=True)
 
     @staticmethod
     def _evict_oldest_half(d: dict) -> None:
@@ -1881,7 +2029,8 @@ class QuoteManager:
             },
         }
 
-    def _cancel_quote(self, strike: float, expiry: str, right: str, side: str):
+    def _cancel_quote(self, strike: float, expiry: str, right: str,
+                      side: str, reason: str = "requote"):
         """Cancel a quote at a specific (strike, expiry, right, side).
 
         Skips cancellation when the order was placed less than
@@ -1891,6 +2040,10 @@ class QuoteManager:
         so the order is invisible on the book and we burn a place/cancel pair
         for nothing. The next quote tick will re-evaluate and cancel then if
         the skip condition still holds.
+
+        ``reason`` is passed through to the order_lifecycle stream so
+        downstream analysis can distinguish requote-driven cancels (the
+        normal hot-path) from layer_B / layer_C / manual cancels.
         """
         key = (strike, expiry, right, side)
         if key not in self.active_orders:
@@ -1912,6 +2065,21 @@ class QuoteManager:
             # GTD expires, which is the same outcome as v1's drop.
             self._try_cancel_order(trade.order)
         del self.active_orders[key]
+        # Thread 3 §6 instrumentation. Drop tracking dicts so the next
+        # placement on this key starts clean. Also emits the cancel row.
+        self._order_underlying.pop(order_id, None)
+        if self.csv_logger is not None:
+            try:
+                self.csv_logger.log_paper_order_lifecycle(
+                    order_id=order_id, event="cancelled",
+                    strike=strike, expiry=expiry, right=right, side=side,
+                    price=getattr(getattr(trade, "order", None),
+                                  "lmtPrice", None) if trade else None,
+                    forward=self.market_data.state.underlying_price,
+                    reason=reason,
+                )
+            except Exception:
+                logger.debug("order_lifecycle emit failed", exc_info=True)
 
     def cancel_all_quotes(self):
         """Soft kill switch: cancel everything via per-order cancels.
@@ -1928,6 +2096,321 @@ class QuoteManager:
         self.active_orders.clear()
         self._order_underlying.clear()
         logger.info("All quotes cancelled")
+
+    # ── Thread 3 Layer B: cancel-on-ΔF since placement ────────────────
+    def _check_layer_b(self) -> None:
+        """Cancel any resting order whose underlying price has drifted by
+        more than ``M_ticks`` since that order's last placement/amend.
+        ``_order_underlying[order_id]`` is the anchor — set on placement
+        (line ~1700 in _send_or_update) and refreshed on every modify.
+
+        Spec: do NOT auto-replace; let the next requote cycle re-evaluate.
+        That avoids replacing a cancelled-stale order with a still-stale
+        one in the same handler tick.
+        """
+        thread3 = getattr(self.config.quoting, "thread3", None)
+        if thread3 is None:
+            return
+        if not bool(getattr(thread3, "master_enabled", False)):
+            return
+        if not bool(getattr(
+                thread3, "lever_b_cancel_on_df_enabled", False)):
+            return
+        m_ticks = float(getattr(thread3, "layer_b_m_ticks", 3))
+        tick_size = float(getattr(self.config.quoting, "tick_size", 0.0005))
+        if m_ticks <= 0 or tick_size <= 0:
+            return
+        threshold_usd = m_ticks * tick_size
+        F_now = self.market_data.state.underlying_price
+        if F_now <= 0:
+            return  # no live forward; nothing to compare against
+        for key in list(self.active_orders.keys()):
+            order_id = self.active_orders.get(key)
+            if order_id is None:
+                continue
+            F_at_placement = self._order_underlying.get(order_id)
+            if F_at_placement is None or F_at_placement <= 0:
+                continue
+            dF = abs(F_now - F_at_placement)
+            if dF <= threshold_usd:
+                continue
+            strike, expiry, right, side = key
+            trade = self._canonical_trade(order_id)
+            # Same MIN_ORDER_LIFETIME_NS guard as _cancel_quote: if IBKR
+            # hasn't acked, don't cancel — the place/cancel pair would
+            # never visit Submitted and we'd burn a round-trip. The next
+            # F-tick will catch it once acked.
+            if trade is not None:
+                placed_ns = self._placed_at_ns.get(order_id)
+                status = getattr(getattr(trade, "orderStatus", None),
+                                 "status", "")
+                if (placed_ns is not None
+                        and status in ("PendingSubmit", "ApiPending")
+                        and (time.monotonic_ns() - placed_ns)
+                                < MIN_ORDER_LIFETIME_NS):
+                    continue
+                self._try_cancel_order(trade.order)
+            self.active_orders.pop(key, None)
+            self._pending_amend.pop(order_id, None)
+            self._order_underlying.pop(order_id, None)
+            if self.csv_logger is not None:
+                try:
+                    self.csv_logger.log_paper_order_lifecycle(
+                        order_id=order_id, event="cancelled",
+                        strike=strike, expiry=expiry, right=right,
+                        side=side,
+                        price=getattr(getattr(trade, "order", None),
+                                      "lmtPrice", None) if trade else None,
+                        forward=F_now, reason="layer_B",
+                    )
+                except Exception:
+                    logger.debug("order_lifecycle emit failed", exc_info=True)
+
+    # ── Thread 3 Layer C: burst-rate quote pull ───────────────────────
+    def note_layer_c_fill(self, strike: float, expiry: str, right: str,
+                          side: str, ts_ns: int | None = None) -> int:
+        """Layer C entry point. Called by FillHandler immediately after a
+        live fill is recorded. Returns the any-side burst_1s count
+        INCLUDING the just-recorded fill (for fills.burst_1s_at_fill).
+
+        Side note: ``side`` is the FILL side ("BUY" if we bought, "SELL"
+        if we sold), which is the side of the resting order that was
+        lifted/hit. Same-side cluster semantics in the brief refer to
+        the resting-order side: aggressors lifting a row of stale asks
+        produce SELL fills (we were selling, they were buying); aggressors
+        hitting a row of stale bids produce BUY fills.
+
+        When the master flag is OFF, this method still records the fill
+        in the rolling tracker (so burst_1s_at_fill remains populated)
+        but never fires C1/C2 actions. That's the §6 baseline path:
+        instrumentation-only, all flags OFF.
+        """
+        if ts_ns is None:
+            ts_ns = time.monotonic_ns()
+        # 1. Record + read counts (always, regardless of flags). The
+        # tracker's window matches config.quoting.thread3.layer_c_window_sec
+        # — typically 1.0s.
+        same, any_count = self._fill_burst_tracker.record_and_evaluate(
+            ts_ns, side)
+
+        # 2. Master flag gate. If OFF, no actions; just return the count.
+        thread3 = getattr(self.config.quoting, "thread3", None)
+        if thread3 is None or not bool(getattr(
+                thread3, "master_enabled", False)):
+            return any_count
+        if not bool(getattr(thread3, "lever_c_burst_pull_enabled", False)):
+            return any_count
+
+        # 3. Evaluate triggers. C2 takes precedence (longer cooldown,
+        # broader scope). When BOTH would fire on the same fill, treat as
+        # C2 — we pull all sides and lock for the longer cooldown.
+        k1 = int(getattr(thread3, "layer_c1_k1_threshold", 2))
+        k2 = int(getattr(thread3, "layer_c2_k2_threshold", 3))
+        c1_on = bool(getattr(thread3, "lever_c1_same_side_enabled", False))
+        c2_on = bool(getattr(thread3, "lever_c2_any_side_enabled", False))
+        # Spec formal: trigger_C1 = count_in_window >= K1; trigger_C2 =
+        # any_side_count >= K2. ``same``/``any_count`` are post-record
+        # counts INCLUDING the just-arrived fill. With K1=2, this fires
+        # the moment a 2nd same-side fill lands inside the window —
+        # consistent with the brief's per-pattern matrix prediction
+        # ("After 2 same-side fills C1 fires; pulled before remaining
+        # 5 cluster fills can land — predicted prevention 5 of 7 P1").
+        c1_fired = c1_on and same >= k1
+        c2_fired = c2_on and any_count >= k2
+
+        if not (c1_fired or c2_fired):
+            return any_count
+
+        if c2_fired:
+            self._fire_burst_pull_c2(side=side, strike=strike,
+                                     same_count=same, any_count=any_count,
+                                     ts_ns=ts_ns)
+        else:
+            self._fire_burst_pull_c1(side=side, strike=strike,
+                                     same_count=same, any_count=any_count,
+                                     ts_ns=ts_ns)
+        return any_count
+
+    def _fire_burst_pull_c1(self, *, side: str, strike: float,
+                            same_count: int, any_count: int,
+                            ts_ns: int) -> None:
+        """C1 (same-side burst): cancel all resting same-side quotes
+        across all expiries; arm a per-side cooldown; raise hedge-drain
+        priority signal.
+        """
+        thread3 = getattr(self.config.quoting, "thread3", None)
+        cooldown_sec = float(getattr(
+            thread3, "layer_c1_cooldown_sec", 2.0)) if thread3 else 2.0
+        cooldown_ns = int(cooldown_sec * 1_000_000_000)
+        deadline = ts_ns + cooldown_ns
+        # Take the larger deadline if a prior C1 hasn't expired.
+        prev = self._burst_cooldown_per_side_until_ns.get(side, 0)
+        self._burst_cooldown_per_side_until_ns[side] = max(prev, deadline)
+
+        pulled = self._pull_resting_orders(
+            scope="same_side", side=side, reason="layer_C1")
+        self._burst_pull_c1_count += 1
+
+        # Hedge drain. Pass the cooldown deadline so the hedge engine
+        # bypasses cadence for at least the cooldown window.
+        self._raise_hedge_drain(deadline, reason="layer_C1")
+
+        # Telemetry.
+        self._emit_burst_event(
+            trigger="C1",
+            same_count=same_count, any_count=any_count,
+            cooldown_sec=cooldown_sec, cooldown_until_mono_ns=deadline,
+            pulled=pulled, fill_strike=strike, fill_side=side,
+        )
+        logger.warning(
+            "Layer C1 fired: side=%s same=%d any=%d pulled=%d cooldown=%.1fs",
+            side, same_count, any_count, len(pulled), cooldown_sec,
+        )
+
+    def _fire_burst_pull_c2(self, *, side: str, strike: float,
+                            same_count: int, any_count: int,
+                            ts_ns: int) -> None:
+        """C2 (any-side burst): cancel ALL resting quotes (both sides,
+        all strikes, all expiries); arm a global cooldown; raise hedge-
+        drain priority signal. Spec §3 hard requirement: hedge-drain is
+        coupled to C2.
+        """
+        thread3 = getattr(self.config.quoting, "thread3", None)
+        cooldown_sec = float(getattr(
+            thread3, "layer_c2_cooldown_sec", 3.0)) if thread3 else 3.0
+        cooldown_ns = int(cooldown_sec * 1_000_000_000)
+        deadline = ts_ns + cooldown_ns
+        # C2 cooldown supersedes any C1 cooldown.
+        self._burst_cooldown_global_until_ns = max(
+            self._burst_cooldown_global_until_ns, deadline)
+        # Also extend per-side cooldowns up to the global deadline so
+        # the per-side gate doesn't unlock earlier than the global one.
+        for s in ("BUY", "SELL"):
+            prev = self._burst_cooldown_per_side_until_ns.get(s, 0)
+            self._burst_cooldown_per_side_until_ns[s] = max(prev, deadline)
+
+        pulled = self._pull_resting_orders(
+            scope="all", side=side, reason="layer_C2")
+        self._burst_pull_c2_count += 1
+
+        self._raise_hedge_drain(deadline, reason="layer_C2")
+
+        self._emit_burst_event(
+            trigger="C2",
+            same_count=same_count, any_count=any_count,
+            cooldown_sec=cooldown_sec, cooldown_until_mono_ns=deadline,
+            pulled=pulled, fill_strike=strike, fill_side=side,
+        )
+        logger.critical(
+            "Layer C2 fired: side=%s same=%d any=%d pulled=%d cooldown=%.1fs",
+            side, same_count, any_count, len(pulled), cooldown_sec,
+        )
+
+    def _pull_resting_orders(self, *, scope: str, side: str,
+                             reason: str) -> list[int]:
+        """Cancel the orders matched by ``scope`` and emit per-order
+        lifecycle rows. Returns the list of cancelled orderIds.
+
+        ``scope == "same_side"``: cancel every active_orders entry whose
+            (strike, expiry, right, side) tuple's side equals ``side``.
+        ``scope == "all"``: cancel every active_orders entry.
+        """
+        pulled: list[int] = []
+        forward = self.market_data.state.underlying_price
+        for key in list(self.active_orders.keys()):
+            _, _, _, key_side = key
+            if scope == "same_side" and key_side != side:
+                continue
+            order_id = self.active_orders.get(key)
+            if order_id is None:
+                continue
+            strike, expiry, right, ks = key
+            trade = self._canonical_trade(order_id)
+            # Use the underlying cancel primitive (token-bucketed). Skip
+            # the MIN_ORDER_LIFETIME guard from _cancel_quote because
+            # the burst-pull is a defensive panic action — we'd rather
+            # burn a place/cancel pair than leave a stale order live
+            # through the cooldown window.
+            if trade is not None:
+                self._try_cancel_order(trade.order)
+            self.active_orders.pop(key, None)
+            self._pending_amend.pop(order_id, None)
+            self._order_underlying.pop(order_id, None)
+            pulled.append(order_id)
+            if self.csv_logger is not None:
+                try:
+                    self.csv_logger.log_paper_order_lifecycle(
+                        order_id=order_id, event="cancelled",
+                        strike=strike, expiry=expiry, right=right,
+                        side=ks,
+                        price=getattr(getattr(trade, "order", None),
+                                      "lmtPrice", None) if trade else None,
+                        forward=forward, reason=reason,
+                    )
+                except Exception:
+                    logger.debug("order_lifecycle emit failed", exc_info=True)
+        return pulled
+
+    def _raise_hedge_drain(self, cooldown_until_mono_ns: int,
+                           reason: str) -> None:
+        """Hedge-drain priority signal (spec §3 HARD REQUIREMENT).
+        Synchronous: returns once the hedge manager has observed the
+        flag. Wired as a soft handle (``self.hedge_manager``) injected
+        by main.py after construction."""
+        hm = self.hedge_manager
+        if hm is None:
+            return
+        try:
+            hm.request_priority_drain(
+                cooldown_until_mono_ns=cooldown_until_mono_ns,
+                reason=reason)
+        except Exception:
+            logger.exception("hedge priority-drain signal failed")
+
+    def _emit_burst_event(self, *, trigger: str,
+                          same_count: int, any_count: int,
+                          cooldown_sec: float,
+                          cooldown_until_mono_ns: int,
+                          pulled: list[int], fill_strike: float,
+                          fill_side: str) -> None:
+        if self.csv_logger is None:
+            return
+        try:
+            self.csv_logger.log_paper_burst_event(
+                trigger=trigger,
+                same_side_count=same_count,
+                any_side_count=any_count,
+                window_sec=float(getattr(getattr(self.config.quoting,
+                                                  "thread3", None),
+                                          "layer_c_window_sec", 1.0)),
+                pulled_order_ids=pulled,
+                cooldown_sec=cooldown_sec,
+                cooldown_until_mono_ns=cooldown_until_mono_ns,
+                forward=self.market_data.state.underlying_price,
+                fill_strike=fill_strike,
+                fill_side=fill_side,
+            )
+        except Exception:
+            logger.debug("burst_events emit failed", exc_info=True)
+
+    def _layer_c_cooldown_active(self, side: str | None = None,
+                                 now_ns: int | None = None) -> bool:
+        """True if a Layer C cooldown blocks placement on ``side`` (or
+        any side, if ``side`` is None — used by the global gate at the
+        top of update_quotes). Cheap O(1) lookup."""
+        if now_ns is None:
+            now_ns = time.monotonic_ns()
+        if self._burst_cooldown_global_until_ns > now_ns:
+            return True
+        if side is not None:
+            until = self._burst_cooldown_per_side_until_ns.get(side, 0)
+            if until > now_ns:
+                return True
+        else:
+            for until in self._burst_cooldown_per_side_until_ns.values():
+                if until > now_ns:
+                    return True
+        return False
 
     def panic_cancel(self) -> None:
         """Fast cancel-all for graceful degradation paths.

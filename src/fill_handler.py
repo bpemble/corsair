@@ -249,6 +249,42 @@ class FillHandler:
             underlying_price=underlying_at_fill,
         )
 
+        # Hardburst detector shadow-logging (spec Change 3.1). Query the
+        # detector at fill time regardless of whether hardburst_skip_enabled
+        # is ON. This gives a counterfactual column: when the flag is OFF,
+        # detector_was_hardburst==True marks fills the overlay WOULD have
+        # suppressed if enabled. Used by the validation protocol to
+        # compute suppressed_fill signed_bias before flipping the flag.
+        detector_was_hardburst = None
+        try:
+            import time as _time
+            bd = getattr(self.market_data, "burst_detector", None)
+            if bd is not None:
+                detector_was_hardburst = bool(bd.is_hardburst(_time.time_ns()))
+        except Exception:
+            # Best-effort — never break the fill path over telemetry.
+            logger.debug("burst detector query at fill failed", exc_info=True)
+
+        # Thread 3 Layer C: feed the fill into the burst tracker and (when
+        # the master flag is ON) potentially trip C1 / C2 burst-pull. The
+        # call returns the any-side burst_1s count INCLUDING this fill,
+        # which we surface as fills.burst_1s_at_fill regardless of
+        # whether any C-action fired — that field is part of the §6
+        # baseline instrumentation and must populate with all flags OFF.
+        # Live fills only (replayed fills are historical; including them
+        # would corrupt the rolling window).
+        burst_1s_at_fill = None
+        if trade is not None:
+            try:
+                import time as _time
+                fill_side = "BUY" if quantity > 0 else "SELL"
+                burst_1s_at_fill = self.quotes.note_layer_c_fill(
+                    strike=strike, expiry=expiry, right=put_call,
+                    side=fill_side, ts_ns=_time.monotonic_ns(),
+                )
+            except Exception:
+                logger.exception("Layer C note_layer_c_fill failed")
+
         # Paper-trading JSONL event — corsair→crowsnest interface, spec
         # hg_spec_v1.3.md §17.1/17.2. Emits per fill; missing recommended
         # fields (theo_at_quote, quoter_count, corsair_bid/ask at quote time,
@@ -269,6 +305,16 @@ class FillHandler:
                 "theta_at_fill": self.portfolio.net_theta,
                 "vega_at_fill": self.portfolio.net_vega,
                 "forward_at_fill": underlying_at_fill,
+                # Shadow-logging: True iff hardburst detector was firing
+                # at the moment of this fill. None when detector is
+                # disabled (e.g. pre-v1.5 deployments).
+                "detector_was_hardburst": detector_was_hardburst,
+                # Thread 3 §6 instrumentation: count of fills (any side,
+                # any strike) within the trailing layer_c_window_sec at
+                # the moment of this fill, INCLUDING this fill itself.
+                # Populated even with all flags OFF — required for §7
+                # baseline measurement.
+                "burst_1s_at_fill": burst_1s_at_fill,
             })
         except Exception as e:
             logger.debug("paper fill event emit failed: %s", e)

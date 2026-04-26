@@ -4,7 +4,7 @@ Hard-earned lessons. Read before debugging anything weird around connectivity,
 order lifecycle, or margin display. Each entry took hours to find live; the
 goal of this doc is to never re-discover them.
 
-## Current spec: v1.4 (HG front-only, sym_5)
+## Current spec: v1.4 (HG front-only)
 
 Active strategy spec: `docs/hg_spec_v1.4.md` (APPROVED 2026-04-19). Active
 config: `config/hg_v1_4_paper.yaml` (selected via `CORSAIR_CONFIG` env var
@@ -12,8 +12,9 @@ in docker-compose.yml; defaults to v1.4). v1.3 config is preserved for
 rollback at `config/corsair_v2_config.yaml`.
 
 Key v1.4 differences from v1.3 (see §9 below for details):
-- Strike scope: **symmetric ATM ± 5 nickels** (calls AND puts at each strike
-  → 22 instruments → 44 resting orders). v1.3 was asymmetric NEAR-OTM+ATM.
+- Strike scope per spec: **symmetric ATM ± 5 nickels** (sym_5). Active
+  config deviates — **asymmetric OTM-only**: calls ATM→ATM+5, puts ATM−5→ATM.
+  See §12 for rationale and measurement. v1.3 was asymmetric NEAR-OTM+ATM.
 - **Daily P&L halt at −5% capital (−$3,750)** is the PRIMARY defense — not
   just cancels quotes, FLATTENS options + hedge, session-level halt.
 - Capital: $200K → $75K (Stage 1). Kill switches rescaled accordingly.
@@ -184,7 +185,7 @@ the primary control):
 - `margin_kill_pct: 0.70` (kill at $350K, **halt not flatten** — see below)
 - `daily_pnl_halt_pct: 0.05` (daily halt at −$25K, **halt not flatten** — §8)
 - `delta_ceiling: 3.0`, `theta_floor: -500`, `theta_kill: -500`
-- `delta_kill: 5.0`, `vega_kill: 500`
+- `delta_kill: 5.0`, `vega_kill: 0` (disabled 2026-04-23 — see §13)
 
 **Greek kills did NOT scale with capital** when we moved to $500K. 5
 contract-deltas is the same hedge capacity regardless of book size, so
@@ -261,36 +262,45 @@ Non-daily_halt induced kills are sticky — `docker compose restart corsair`
 to clear. daily_halt induced kills auto-clear at the next CME session
 rollover (17:00 CT).
 
-## 10. Hedge mode: execute (flipped 2026-04-22 in paper)
+## 10. Hedge mode: observe (reverted 2026-04-22; IBKR near-expiry lockout)
 
 `src/hedge_manager.py` runs in one of two modes via
 `config.hedging.mode`:
-- **observe**: computes required hedge trades and logs intent to
-  `logs-paper/hedge_trades-YYYY-MM-DD.jsonl`; does NOT place futures
-  orders. Local `hedge_qty` is updated optimistically so daily P&L
-  halt still sees hedge MTM as if trades had filled.
+- **observe** (CURRENT): computes required hedge trades and logs
+  intent to `logs-paper/hedge_trades-YYYY-MM-DD.jsonl`; does NOT
+  place futures orders. Local `hedge_qty` is updated optimistically
+  so daily P&L halt still sees hedge MTM as if trades had filled.
 - **execute**: places aggressive IOC limit orders at market ± 1 tick
-  on the front-month HG futures contract. Currently active in paper
-  as of 2026-04-22 — Gate 0 induced tests pass (5/5 green at boot)
-  and observe-mode logs confirmed the rebalance targets were correct
-  on today's fills.
+  on the front-month HG futures contract.
 
-**KNOWN LIMITATION (still unfixed, do NOT enable in LIVE until
-resolved)**: local `hedge_qty` is updated optimistically at the
-resting-quote forward F, NOT at the actual IOC fill price. There is
-no execDetailsEvent callback wired for hedge fills, and no periodic
-reconciliation against `ib.positions()`. In paper, this means:
-- If an IOC doesn't fill (market moved past the ±1-tick limit in the
-  round-trip window), local `hedge_qty` says we hedged but IBKR says
-  we didn't — silent drift.
+**Current state 2026-04-23**: config is `mode: "observe"`. Execute was
+flipped on 2026-04-22 (commit `2fc3858`) and reverted the same day
+(commit `470d09f`) because **IBKR rejects orders on front-month HG
+futures (HGJ6) during the near-expiry lockout window** — so execute
+mode can't actually place hedges against the contract our options
+expire into. Until the front-month rolls to HGK6/HGM6 or the lockout
+window closes, execute is functionally disabled.
+
+Implications:
+- Hedge drift cannot be measured against real IBKR positions during
+  the lockout — no orders are flowing to IBKR to drift against.
+- Daily P&L halt still includes hedge MTM via local `hedge_qty`, but
+  that's **intent**, not **executed** — there's no futures exposure
+  offsetting options delta. The portfolio is effectively unhedged at
+  IBKR's book.
+- v1.5 execDetailsEvent wiring (the real reconciliation fix) is
+  blocked until execute mode can actually place orders to reconcile.
+
+**KNOWN LIMITATION (v1.5 blocker, do NOT enable in LIVE until
+resolved)**: no execDetailsEvent callback for hedge fills, no periodic
+reconciliation against `ib.positions()`. If/when execute is re-enabled:
+- If an IOC doesn't fill (market moved past ±1-tick limit in RTT
+  window), local `hedge_qty` says we hedged but IBKR says we didn't.
 - If the IOC fills at the limit (not F), `avg_entry_F` is off by 1
-  tick — small hedge MTM error.
+  tick — small MTM error.
 
-The paper session with execute mode ON is the instrument to measure
-drift magnitudes and build the v1.5 reconciliation pass. Watch
-`hedge_trades-YYYY-MM-DD.jsonl` vs `ib.positions()` out-of-band to
-catch drift early. **To revert**: flip `hedging.mode: execute → observe`
-in yaml and restart.
+**To re-enable execute** (only after front-month rolls / lockout
+lifts): flip `hedging.mode: observe → execute` in yaml and restart.
 
 Bounds note: hedge_manager has no explicit cap on `hedge_qty`. Target
 is always `-round(net_delta)` to flatten the options delta. Effective
@@ -308,3 +318,62 @@ Streamlit is request/response. Currently:
 
 If you need true push, you have to escape Streamlit (FastAPI + SSE / WebSocket
 sidecar). Several hours of work; deferred indefinitely.
+
+## 12. Strike scope deviation: asymmetric, not sym_5
+
+**Operator override 2026-04-20** (commit `bde574b`): deviates from v1.4
+§3.2 which specified symmetric sym_5 (11 strikes × 2 rights = 22
+instruments, 44 resting orders). Active config is asymmetric OTM-only:
+
+- Calls: `quote_range_low: 0, high: 5` → ATM to ATM+$0.25 (OTM + ATM)
+- Puts:  `quote_range_low: -5, high: 0` → ATM−$0.25 to ATM (OTM + ATM)
+
+Result: ~12 instruments, ~24 max resting orders (ATM strike shared C+P).
+
+**Measurement that justified the deviation**: per-refresh gateway JVM
+serialization latency was the dominant bottleneck (see
+`project_fix_colo_evidence`). Halving order count halved per-refresh
+serialization time. ITM strikes had thin flow and wide spreads — quoting
+them consumed the order budget without generating fill volume.
+
+**Risk being monitored**: short-C vs short-P inventory imbalance on
+persistent underlying drift. If skew sustains >30%, re-enable the
+`inventory_balance` gate (removed when v1.4 symmetric scope made it
+redundant; re-needs code in quote_engine). Delta kill at 5.0 is the
+backstop.
+
+**Subscription vs quote scope are separate**: `strike_range_low/high`
+governs market-data subscription (±7 strikes = $0.35 window for SABR
+wing stability), while `quote_range_low/high` governs where we rest
+orders. The subscription window is rolled on ATM drift by
+`market_data.recenter_strike_window` (added 2026-04-22) so the boot-ATM
+anchor no longer goes stale — prior behavior froze subs at boot ATM,
+leaving the window lopsided after a few strikes of drift.
+
+**To revert to sym_5**: set `quote_range_low: -5, high: 5` on both calls
+and puts. Expect ~2× per-refresh serialization cost unless FIX/colo has
+shipped by then.
+
+## 13. vega_kill disabled 2026-04-23 (Alabaster characterization)
+
+`vega_kill: 0` in `config/hg_v1_4_paper.yaml`. Deviates from v1.4 §6.2
+which specified $500. Alabaster backtest (HG, 2024 Q1 / 2024 Q3 / OOS
+2026 panels, $250K tier, production per-key cap=5) found the $500
+threshold binds on **67-88% of fills** — choke, not tail backstop — and
+in the OOS panel only **3.7% of $500-breaches coincide with margin > 80%
+of cap**, so vega isn't leading margin stress. Rescaling to $3000 fixes
+OOS (0.0% co-occurrence) but breaks 2024 Q3 (97.4%). Disable is the only
+choice clean across all three panels; consistent with §87 ("defend tail
+with daily P&L halt") and SPAN already pricing a 25% vol scan.
+
+Precipitating incident: 2026-04-23 14:30 CT a real VEGA HALT fired at
+net_vega=−624 on a $103K-margin book (21% of cap) — not a tail event,
+just a strangle that drifted slightly short vega on a normal fill mix.
+The sticky halt left us out of the market for the rest of the US
+session until restart.
+
+Guard: `risk_monitor.py:244` is `if vega_kill > 0 and abs(worst_vega) > vega_kill`,
+so 0 is a no-op — no code change needed.
+
+Evidence: `docs/findings/vega_kill_characterization_2026-04-23.md`.
+HG-specific; re-characterize before any ETH capital bump.

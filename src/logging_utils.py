@@ -407,9 +407,13 @@ class CSVLogger:
     def log_paper_sabr_fit(self, expiry: str, side: str, model: str,
                            forward: float, tte_years: float,
                            n_points: int, rmse: float,
-                           params: dict) -> None:
+                           params: dict,
+                           trigger_reason: str = "elapsed") -> None:
         """Record a SABR/SVI surface fit. ``params`` is the model-native
-        parameter dict (e.g. {a,b,rho,m,sigma} for SVI)."""
+        parameter dict (e.g. {a,b,rho,m,sigma} for SVI). ``trigger_reason``
+        is one of ``"elapsed"`` (≤30s cadence path), ``"F_tick"`` (Thread 3
+        Layer A — |ΔF since last fit| > N_ticks), or ``"manual"`` (startup
+        / watchdog reseed)."""
         self.log_paper_stream("sabr_fits", {
             "event_type": "sabr_fit",
             "expiry": expiry,
@@ -420,6 +424,7 @@ class CSVLogger:
             "n_points": n_points,
             "rmse": rmse,
             "params": params,
+            "trigger_reason": trigger_reason,
         })
 
     def log_paper_margin_snapshot(self, current_margin_usd: float,
@@ -490,6 +495,104 @@ class CSVLogger:
             "order_id": order_id,
         })
 
+    def log_paper_requote_cycle(self, *, cycle_id: int, trigger: str,
+                                forward: float,
+                                forward_delta_usd: float,
+                                forward_delta_ticks: int,
+                                tick_size: float,
+                                orders_evaluated: int,
+                                orders_amended: int,
+                                orders_deferred: int,
+                                orders_skipped_reasons: dict,
+                                deferred_queue_depth_at_start: int,
+                                deferred_queue_depth_at_end: int,
+                                first_ack_us: int | None,
+                                last_ack_us: int | None,
+                                p50_ack_us: int | None,
+                                p99_ack_us: int | None,
+                                cycle_total_us: int,
+                                refit_expiries: list | None = None) -> None:
+        """Per-tick re-quote cycle summary. One row per update_quotes() cycle
+        that issued at least one amend. Used to measure the full-book cycle
+        time (tick → last amend ack) that determines whether we stay inside
+        the edge-decay plateau or fall off the cliff."""
+        self.log_paper_stream("requote_cycles", {
+            "event_type": "requote_cycle",
+            "cycle_id": int(cycle_id),
+            "trigger": trigger,
+            "refit_expiries": list(refit_expiries) if refit_expiries else [],
+            "forward": float(forward) if forward is not None else None,
+            "forward_delta_usd": float(forward_delta_usd),
+            "forward_delta_ticks": int(forward_delta_ticks),
+            "tick_size": float(tick_size),
+            "orders_evaluated": int(orders_evaluated),
+            "orders_amended": int(orders_amended),
+            "orders_deferred": int(orders_deferred),
+            "orders_skipped_reasons": dict(orders_skipped_reasons),
+            "deferred_queue_depth_at_start": int(deferred_queue_depth_at_start),
+            "deferred_queue_depth_at_end": int(deferred_queue_depth_at_end),
+            "first_ack_us": first_ack_us,
+            "last_ack_us": last_ack_us,
+            "p50_ack_us": p50_ack_us,
+            "p99_ack_us": p99_ack_us,
+            "cycle_total_us": int(cycle_total_us),
+        })
+
+    def log_paper_order_lifecycle(self, *, order_id: int, event: str,
+                                  strike: float, expiry: str, right: str,
+                                  side: str, price: float | None = None,
+                                  forward: float | None = None,
+                                  reason: str = "") -> None:
+        """Per-order lifecycle row. ``event`` is one of
+        ``"placed"`` | ``"cancelled"`` | ``"filled"``. ``reason`` is the
+        cancel reason for cancelled events: ``"requote"`` | ``"layer_B"`` |
+        ``"layer_C1"`` | ``"layer_C2"`` | ``"manual"`` | ``"flatten"``.
+        ``forward`` is the underlying price at the moment of the event
+        (placement F → F_at_placement on a "placed" row; cancel F on a
+        "cancelled" row). Used to evaluate Thread 3 Layer B + C deployments
+        and calibrate M_ticks against the empirical CDF of |ΔF since
+        placement|."""
+        self.log_paper_stream("order_lifecycle", {
+            "event_type": event,
+            "order_id": int(order_id),
+            "strike": float(strike),
+            "expiry": expiry,
+            "right": right,
+            "side": side,
+            "price": float(price) if price is not None else None,
+            "forward": float(forward) if forward is not None else None,
+            "reason": reason,
+        })
+
+    def log_paper_burst_event(self, *, trigger: str,
+                              same_side_count: int, any_side_count: int,
+                              window_sec: float,
+                              pulled_order_ids: list,
+                              cooldown_sec: float,
+                              cooldown_until_mono_ns: int,
+                              forward: float | None = None,
+                              fill_strike: float | None = None,
+                              fill_side: str = "") -> None:
+        """Layer C burst-pull event row. Emitted on every C1 or C2 fire.
+        ``trigger`` is ``"C1"`` (same-side) or ``"C2"`` (any-side).
+        ``pulled_order_ids`` lists every active orderId cancelled by the
+        pull. ``cooldown_until_mono_ns`` is the monotonic-clock deadline
+        for re-arming new quotes on the locked side(s)."""
+        self.log_paper_stream("burst_events", {
+            "event_type": "burst_pull",
+            "trigger": trigger,
+            "same_side_count": int(same_side_count),
+            "any_side_count": int(any_side_count),
+            "window_sec": float(window_sec),
+            "pulled_order_ids": [int(o) for o in pulled_order_ids],
+            "cooldown_sec": float(cooldown_sec),
+            "cooldown_until_mono_ns": int(cooldown_until_mono_ns),
+            "forward": float(forward) if forward is not None else None,
+            "fill_strike": (float(fill_strike)
+                            if fill_strike is not None else None),
+            "fill_side": fill_side,
+        })
+
     def log_fill(self, strike, expiry, put_call, side, quantity, fill_price,
                  spread_captured_theo, spread_captured_mid,
                  margin_after, delta_after, theta_after, vega_after,
@@ -519,16 +622,16 @@ class CSVLogger:
         """
         self._append_row(self._trade_path, [
             datetime.now().isoformat(), strike, put_call,
-            f"{last_price:.2f}" if last_price is not None else "",
+            f"{last_price:.4f}" if last_price is not None else "",
             last_size if last_size is not None else "",
             trades_in_burst,
-            f"{mkt_bid:.2f}" if mkt_bid else "",
-            f"{mkt_ask:.2f}" if mkt_ask else "",
-            f"{our_bid:.2f}" if our_bid is not None else "",
-            f"{our_ask:.2f}" if our_ask is not None else "",
+            f"{mkt_bid:.4f}" if mkt_bid else "",
+            f"{mkt_ask:.4f}" if mkt_ask else "",
+            f"{our_bid:.4f}" if our_bid is not None else "",
+            f"{our_ask:.4f}" if our_ask is not None else "",
             int(bool(our_bid_live)),
             int(bool(our_ask_live)),
-            f"{theo:.2f}" if theo is not None else "",
+            f"{theo:.4f}" if theo is not None else "",
             side_inferred or "",
         ])
 
@@ -541,14 +644,14 @@ class CSVLogger:
         self._maybe_rotate_quotes_for_date()
         self._append_row(self._quote_path, [
             datetime.now().isoformat(), strike, side,
-            f"{our_price:.2f}" if our_price is not None else "",
-            f"{incumbent_price:.2f}" if incumbent_price is not None else "",
+            f"{our_price:.4f}" if our_price is not None else "",
+            f"{incumbent_price:.4f}" if incumbent_price is not None else "",
             incumbent_level if incumbent_level is not None else "",
             incumbent_size if incumbent_size is not None else "",
             incumbent_age_ms if incumbent_age_ms is not None else "",
-            f"{bbo_width:.2f}" if bbo_width is not None else "",
+            f"{bbo_width:.4f}" if bbo_width is not None else "",
             skip_reason,
-            f"{theo:.2f}" if theo is not None else "",
+            f"{theo:.4f}" if theo is not None else "",
             put_call,
         ])
 
@@ -568,7 +671,8 @@ class CSVLogger:
                         forward: float, tte_years: float,
                         n_points: int, rmse: float,
                         alpha=None, beta=None, rho_sabr=None, nu=None,
-                        a=None, b=None, rho_svi=None, m=None, sigma=None):
+                        a=None, b=None, rho_svi=None, m=None, sigma=None,
+                        trigger_reason: str = "elapsed"):
         """One row per accepted SABR/SVI fit.
 
         ``model`` is ``"sabr"`` or ``"svi"``. Unused param columns are
@@ -599,6 +703,7 @@ class CSVLogger:
                 expiry=expiry, side=side, model=model,
                 forward=float(forward), tte_years=float(tte_years),
                 n_points=int(n_points), rmse=float(rmse), params=params,
+                trigger_reason=trigger_reason,
             )
         except Exception:
             pass

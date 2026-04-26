@@ -204,9 +204,13 @@ async def run_phase2(fills, csv_out=None):
     print(f"Connecting to {host}:{port} as clientId=44")
 
     ib = IB()
+    # Lean connect — skip ib_insync's stock connectAsync which issues
+    # completedOrders + per-sub-account account updates in parallel and
+    # times out on FA logins (CLAUDE.md §5). We only need the API
+    # handshake for reqHistoricalTicksAsync.
     try:
         await asyncio.wait_for(
-            ib.connectAsync(host, port, clientId=44, timeout=15),
+            ib.client.connectAsync(host, port, clientId=44, timeout=15),
             timeout=20,
         )
     except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as e:

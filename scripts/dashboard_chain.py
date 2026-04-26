@@ -73,8 +73,15 @@ def _fmt_side(s, pfmt="1"):
     else:
         pos_html = '<span class="chain-pos zero">0</span>'
 
-    mkt_bid_html = f"{mkt_bid:.{pfmt}f}" if mkt_bid > 0 else "-"
-    mkt_ask_html = f"{mkt_ask:.{pfmt}f}" if mkt_ask > 0 else "-"
+    # Fall back to raw L1 for observation-only strikes: get_clean_bbo only
+    # populates market_bid/ask for strikes find_incumbent evaluates (quoted
+    # set). Wings outside the quote window stream raw ticks but never fill
+    # the clean cache — raw is safe to show there because we have no orders
+    # to filter out on those strikes.
+    disp_bid = mkt_bid if mkt_bid > 0 else raw_bid
+    disp_ask = mkt_ask if mkt_ask > 0 else raw_ask
+    mkt_bid_html = f"{disp_bid:.{pfmt}f}" if disp_bid > 0 else "-"
+    mkt_ask_html = f"{disp_ask:.{pfmt}f}" if disp_ask > 0 else "-"
     return (
         f"{s.get('open_interest', 0) or 0:,}",
         f"{s.get('volume', 0) or 0:,}",

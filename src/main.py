@@ -348,6 +348,14 @@ async def main():
                                 product_filter=pcfg.product.underlying_symbol,
                                 hedge_manager=hedge)
 
+        # Thread 3 Layer C: wire the per-product hedge handle into the
+        # quote engine so the burst-pull path can raise the priority-
+        # drain signal synchronously (HARD REQUIREMENT, brief §3).
+        try:
+            quotes.hedge_manager = hedge
+        except Exception:
+            logger.exception("failed to wire hedge_manager into quotes")
+
         engines.append({
             "name": pcfg.name,
             "config": pcfg,
@@ -534,6 +542,9 @@ async def main():
     last_margin_snap = _time.monotonic() - margin_snap_cadence  # fire immediately
     last_pnl_snap = _time.monotonic() - pnl_snap_cadence
     last_depth_rotation = datetime.min
+    last_recenter = datetime.min
+    recenter_interval_sec = float(getattr(getattr(config, "operations", object()),
+                                          "strike_recenter_interval_sec", 5.0))
     last_full_refresh = _time.monotonic()
     last_snapshot_write = _time.monotonic()
     depth_rotation_interval = float(getattr(config.quoting, "depth_rotation_interval_sec", 2.0))
@@ -695,6 +706,25 @@ async def main():
                 except Exception as e:
                     logger.warning("depth rotation %s error: %s", eng["name"], e)
             last_depth_rotation = now
+
+        # Re-center the subscribed strike window on live ATM. Cheap no-op
+        # when ATM hasn't drifted one strike since the last pass. Held
+        # positions are passed as protected_keys so inventory stays
+        # subscribed even if it falls outside the fresh window.
+        if (now - last_recenter).total_seconds() >= recenter_interval_sec:
+            for eng in engines:
+                try:
+                    own_positions = portfolio.positions_for_product(
+                        eng["config"].product.underlying_symbol)
+                    protected = {
+                        (float(pos.strike), pos.expiry, pos.put_call)
+                        for pos in own_positions
+                    }
+                    await eng["md"].recenter_strike_window(protected)
+                except Exception as e:
+                    logger.warning("recenter_strike_window %s error: %s",
+                                   eng["name"], e)
+            last_recenter = now
 
         # SABR recalibration for every engine (hoisted out of update_quotes
         # so it doesn't land between the tick handler and placeOrder, which

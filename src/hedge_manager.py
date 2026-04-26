@@ -131,6 +131,12 @@ class HedgeManager:
         self.hedge_qty: int = 0
         self.avg_entry_F: float = 0.0
         self._last_periodic_ns: int = 0
+        # Thread 3 Layer C priority drain deadline (monotonic_ns). When
+        # nonzero and now_ns < this value, rebalance_periodic bypasses
+        # the cadence gate and runs every loop iteration. Set by
+        # request_priority_drain; cleared the first periodic tick after
+        # the deadline passes.
+        self._priority_drain_until_ns: int = 0
         self._account = config.account.account_id
         # One-time contract-resolution log flag. On first _place_or_log
         # call we dump the futures contract attributes (symbol, secType,
@@ -175,10 +181,35 @@ class HedgeManager:
         """Called by main loop at rebalance_cadence_sec intervals. Hedges
         delta drift from underlying price moves that didn't involve
         a fill (passive gamma bleed).
+
+        Thread 3 Layer C priority drain: while the priority flag is up
+        (set by ``request_priority_drain``), bypass the cadence gate so
+        we can re-issue hedge trades on every loop iteration until the
+        book is back inside tolerance AND the cooldown deadline has
+        passed. The flag clears the first time a periodic tick observes
+        both conditions.
         """
         if not self.enabled:
             return
         now_ns = time.monotonic_ns()
+        priority_until = getattr(self, "_priority_drain_until_ns", 0)
+        priority_active = priority_until > 0 and now_ns < priority_until
+        if priority_active:
+            # Drain unconditionally — cadence is suspended while the
+            # burst-pull cooldown is still in effect. The act of calling
+            # _maybe_rebalance is itself idempotent: tolerance check
+            # short-circuits if the book is already inside the band.
+            self._last_periodic_ns = now_ns
+            self._maybe_rebalance(reason="priority_drain_periodic")
+            return
+        if priority_until > 0 and now_ns >= priority_until:
+            # Cooldown expired — clear the flag. Run one final rebalance
+            # so any residual delta gets one more shot synchronously
+            # before we go back to cadence-gated mode.
+            self._priority_drain_until_ns = 0
+            self._last_periodic_ns = now_ns
+            self._maybe_rebalance(reason="priority_drain_clear")
+            return
         if (now_ns - self._last_periodic_ns) / 1e9 < self.rebalance_cadence_sec:
             return
         self._last_periodic_ns = now_ns
@@ -196,6 +227,41 @@ class HedgeManager:
             return
         # Bypass tolerance: aim for exactly 0 regardless of where we are.
         self._rebalance(tolerance_override=0.0, reason=reason)
+
+    def request_priority_drain(self, cooldown_until_mono_ns: int,
+                               reason: str = "burst_pull") -> None:
+        """Thread 3 Layer C hedge-drain signal.
+
+        Called by Layer C (FillHandler) at the moment a burst-pull fires.
+        Immediately runs ``_maybe_rebalance`` outside the cadence gate so
+        any unhedged delta from the just-recorded burst of fills starts
+        being neutralized before the next periodic tick. Then arms a flag
+        consumed by ``rebalance_periodic`` so subsequent calls bypass the
+        cadence gate until ``cooldown_until_mono_ns`` has passed AND the
+        book is back inside tolerance.
+
+        This is the HARD REQUIREMENT for Layer C deployment per the
+        Thread 3 brief §3: C alone (cancelling future quotes) does not
+        prevent the queued-hedge → unhedged-delta → margin-trip cascade
+        that was the actual loss mechanism on 2026-04-20. The drain
+        signal closes that gap by ensuring in-flight unhedged delta is
+        neutralized synchronously with the burst pull, not on the next
+        30-second periodic tick.
+        """
+        if not self.enabled:
+            return
+        # Stash the cooldown deadline; rebalance_periodic consults it.
+        # Take the longest deadline if multiple bursts overlap.
+        prev = getattr(self, "_priority_drain_until_ns", 0)
+        self._priority_drain_until_ns = max(int(prev),
+                                            int(cooldown_until_mono_ns))
+        # Synchronous drain: run the rebalance immediately, regardless of
+        # cadence. Mirror the path _maybe_rebalance takes so observe-mode
+        # logging stays consistent.
+        try:
+            self._maybe_rebalance(reason=f"priority_drain_{reason}")
+        except Exception:
+            logger.exception("hedge priority drain failed")
 
     def flatten_on_halt(self, reason: str = "flatten") -> None:
         """v1.4 §6.1: on daily P&L halt or SPAN margin kill, close the

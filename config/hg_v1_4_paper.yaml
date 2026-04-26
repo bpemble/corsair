@@ -61,7 +61,19 @@ kill_switch:
   daily_pnl_halt_pct: 0.05     # fraction of capital
   # Per-product thresholds.
   delta_kill: 5.0              # |net_delta| kill (v1.4 §6.2 unchanged)
-  vega_kill: 500               # |net_vega| halt ($500 Stage 1 per §6.2)
+  vega_kill: 0                 # disabled 2026-04-23 — was $500 per §6.2.
+                               # Backtest on 2023-24 + OOS 2026 panels (HG,
+                               # $250K tier, production per-key cap=5):
+                               # $500 thr binds on 67-88% of fills — choke,
+                               # not tail backstop. Only 3.7% of $500-breaches
+                               # co-occur with margin>80% of cap in OOS —
+                               # vega is not leading margin stress. Rescaling
+                               # to $3000 fixes OOS but breaks 2024 Q3. Clean
+                               # choice across panels is disable; consistent
+                               # with spec §87 ("defend tail with daily P&L
+                               # halt") and SPAN already pricing 25% vol scan.
+                               # Evidence: docs/findings/vega_kill_characterization_2026-04-23.md
+                               # 0 is a no-op guard in risk_monitor.py:244.
   theta_kill: -500             # theta halt (raised from -200 to allow bid-side quoting while long-option positions decay)
 
 # Operational kill switches (v1.4 §7). These are infrastructure-level
@@ -88,6 +100,13 @@ operational_kills:
   abnormal_fill_rate_mul: 10.0
   abnormal_fill_baseline_window_sec: 3600
   abnormal_fill_baseline_min_coverage_sec: 1800   # require ≥30min of baseline
+  # Floor prevents false positives at regime transitions: when
+  # overnight quiet gives 0.08/min baseline, even a 4/min legitimate
+  # RTH open fill cluster reads as 48× ratio and trips the kill.
+  # Observed 2026-04-23 07:47 CDT. Floor raises effective baseline to
+  # 0.5/min, so kill threshold becomes 5/min — still catches genuine
+  # adverse-selection runaways (10+/min) but not regime transitions.
+  abnormal_fill_baseline_floor_per_min: 0.5
 
 # ── Hedging (v1.4 §5) ──────────────────────────────────────────────────
 # NEW in v1.4. Delta-hedge the options book via HG futures front-month.
@@ -144,6 +163,10 @@ logging:
     margin_snapshots: true
     pnl_snapshots: true
     hedge_trades: true
+    # Thread 3 instrumentation streams (gated by code, not by these flags;
+    # listed here for documentation parity).
+    order_lifecycle: true              # per-order placement / cancel events
+    burst_events: true                 # Layer C burst-pull fires
   margin_snapshots_cadence_sec: 60   # 1 min per spec §9.5
   pnl_snapshots_cadence_sec: 30      # 30s per spec §9.5
 
@@ -212,6 +235,36 @@ quoting:
   # update_quotes invocations. Guards against runaway suppression from
   # a miscalibrated threshold or a regime shift.
   hardburst_suppression_kill_rate: 0.20
+
+  # ── Thread 3: quote-staleness + burst mitigation ──────────────────
+  # Three layers, each independently flag-gated. Master flag must be ON
+  # in addition to the per-layer flag for any layer to bite. Stage-1
+  # rollout enables only thread3_master + lever_c2; subsequent stages
+  # add c1, then a, then b. See docs/briefs/ for the full brief.
+  #
+  # Defaults are all OFF. Until the §6 instrumentation has emitted
+  # ≥1 of each pattern (P1 passive pickoff + P2 aggressor sweep) under
+  # all-flags-OFF baseline AND the hedge-drain priority signal has
+  # been verified, do NOT flip any flag ON. See brief deploy gate.
+  thread3:
+    master_enabled: false              # MASTER FLAG — false short-circuits all layers
+    # Layer A: F-tick-triggered SABR refit (additive to elapsed-time).
+    lever_a_f_tick_refit_enabled: false
+    layer_a_n_ticks: 5                 # |F_now - F_at_last_fit| > N_ticks → refit
+    # Layer B: per-order cancel on ΔF since placement.
+    lever_b_cancel_on_df_enabled: false
+    layer_b_m_ticks: 3                 # |F_now - F_at_placement| > M_ticks → cancel
+    # Layer C: burst-rate quote pull. C1 = same-side, C2 = any-side.
+    # Hedge-drain priority signal is coupled to C (not independently flagged).
+    lever_c_burst_pull_enabled: false
+    lever_c1_same_side_enabled: false
+    lever_c2_any_side_enabled: false
+    layer_c_window_sec: 1.0            # rolling fill-burst window
+    layer_c1_k1_threshold: 2           # 3rd same-side fill in window fires C1
+    layer_c2_k2_threshold: 3           # 4th any-side fill in window fires C2
+    layer_c1_cooldown_sec: 2.0         # per-side cooldown after C1
+    layer_c2_cooldown_sec: 3.0         # global cooldown after C2
+
   delta_retreat_threshold: 5.0
   api_bucket_capacity: 250
   api_bucket_refill_per_sec: 250
@@ -300,14 +353,12 @@ products:
       # anchors per wing for SVI stability. Tightened from ±11 on 2026-04-19
       # to reduce event-loop contention under tick load (amend RTT p50 was
       # 351ms with 138 subscriptions vs 39ms on an idle Gateway — the gap
-      # was mostly our own tick-processing overhead).
-      #
-      # TEMP 2026-04-21 evening: bumped to ±10 for dashboard visibility.
-      # Expected latency cost ~30-50ms on amend p50. REVERT to ±7 before
-      # tomorrow's 4dp precision + min_edge experiment so the data
-      # collection is against the production subscription width.
-      strike_range_low: -10
-      strike_range_high: 10
+      # was mostly our own tick-processing overhead). The rolling recenter
+      # in market_data.recenter_strike_window keeps this window tracking
+      # live ATM; dashboard visibility beyond ±7 was the reason for the
+      # 2026-04-21 temporary bump to ±10, no longer needed.
+      strike_range_low: -7
+      strike_range_high: 7
       # Asymmetric scope: CALLS quote ATM to ATM+5 nickels (OTM calls +
       # ATM). PUTS quote ATM-5 to ATM (see puts.quote_range_* below).
       # Shared ATM strike means 11 unique strikes, ~12 instruments (6 calls
