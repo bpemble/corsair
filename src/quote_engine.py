@@ -2180,10 +2180,13 @@ class QuoteManager:
         produce SELL fills (we were selling, they were buying); aggressors
         hitting a row of stale bids produce BUY fills.
 
-        When the master flag is OFF, this method still records the fill
-        in the rolling tracker (so burst_1s_at_fill remains populated)
-        but never fires C1/C2 actions. That's the §6 baseline path:
-        instrumentation-only, all flags OFF.
+        Per Thread 3 deployment runbook Phase 3 instrumentation
+        correction: threshold-crossing always emits a burst_events row
+        regardless of master/sub-flag state. The flag gates the
+        ACTION (cancel quotes + cooldown + hedge drain), not the
+        OBSERVATION. Observational rows have ``action_fired=False`` and
+        empty ``pulled_order_ids``; downstream tooling uses them to
+        detect P1/P2-shaped patterns under flag-OFF baseline (§7).
         """
         if ts_ns is None:
             ts_ns = time.monotonic_ns()
@@ -2193,43 +2196,90 @@ class QuoteManager:
         same, any_count = self._fill_burst_tracker.record_and_evaluate(
             ts_ns, side)
 
-        # 2. Master flag gate. If OFF, no actions; just return the count.
+        # 2. Always evaluate thresholds (observational logging is
+        # independent of action eligibility).
         thread3 = getattr(self.config.quoting, "thread3", None)
-        if thread3 is None or not bool(getattr(
-                thread3, "master_enabled", False)):
+        if thread3 is None:
             return any_count
-        if not bool(getattr(thread3, "lever_c_burst_pull_enabled", False)):
-            return any_count
-
-        # 3. Evaluate triggers. C2 takes precedence (longer cooldown,
-        # broader scope). When BOTH would fire on the same fill, treat as
-        # C2 — we pull all sides and lock for the longer cooldown.
         k1 = int(getattr(thread3, "layer_c1_k1_threshold", 2))
         k2 = int(getattr(thread3, "layer_c2_k2_threshold", 3))
-        c1_on = bool(getattr(thread3, "lever_c1_same_side_enabled", False))
-        c2_on = bool(getattr(thread3, "lever_c2_any_side_enabled", False))
-        # Spec formal: trigger_C1 = count_in_window >= K1; trigger_C2 =
-        # any_side_count >= K2. ``same``/``any_count`` are post-record
-        # counts INCLUDING the just-arrived fill. With K1=2, this fires
-        # the moment a 2nd same-side fill lands inside the window —
-        # consistent with the brief's per-pattern matrix prediction
-        # ("After 2 same-side fills C1 fires; pulled before remaining
-        # 5 cluster fills can land — predicted prevention 5 of 7 P1").
-        c1_fired = c1_on and same >= k1
-        c2_fired = c2_on and any_count >= k2
-
-        if not (c1_fired or c2_fired):
+        c1_crossed = same >= k1
+        c2_crossed = any_count >= k2
+        if not (c1_crossed or c2_crossed):
             return any_count
 
-        if c2_fired:
-            self._fire_burst_pull_c2(side=side, strike=strike,
-                                     same_count=same, any_count=any_count,
-                                     ts_ns=ts_ns)
+        # 3. Determine action eligibility. C2 takes precedence over C1
+        # when both cross AND both sub-flags are enabled.
+        master_on = bool(getattr(thread3, "master_enabled", False))
+        layer_c_on = (master_on
+                      and bool(getattr(thread3,
+                                       "lever_c_burst_pull_enabled", False)))
+        c1_enabled = (layer_c_on
+                      and bool(getattr(thread3,
+                                       "lever_c1_same_side_enabled", False)))
+        c2_enabled = (layer_c_on
+                      and bool(getattr(thread3,
+                                       "lever_c2_any_side_enabled", False)))
+        fire_c2 = c2_crossed and c2_enabled
+        fire_c1 = c1_crossed and c1_enabled and not fire_c2
+
+        # 4. Execute and emit. ALWAYS emit a row per crossed trigger; set
+        # action_fired only on the trigger whose action actually ran.
+        if fire_c2:
+            self._fire_burst_pull_c2(
+                side=side, strike=strike,
+                same_count=same, any_count=any_count, ts_ns=ts_ns)
+            if c1_crossed:
+                # C1 also crossed but C2 superseded — emit observational.
+                self._emit_burst_event_observation(
+                    trigger="C1", same_count=same, any_count=any_count,
+                    ts_ns=ts_ns, fill_strike=strike, fill_side=side)
+        elif fire_c1:
+            self._fire_burst_pull_c1(
+                side=side, strike=strike,
+                same_count=same, any_count=any_count, ts_ns=ts_ns)
+            if c2_crossed:
+                # C2 crossed but its sub-flag is off (otherwise C2 would
+                # have fired by precedence). Observational only.
+                self._emit_burst_event_observation(
+                    trigger="C2", same_count=same, any_count=any_count,
+                    ts_ns=ts_ns, fill_strike=strike, fill_side=side)
         else:
-            self._fire_burst_pull_c1(side=side, strike=strike,
-                                     same_count=same, any_count=any_count,
-                                     ts_ns=ts_ns)
+            # Pure observation — neither action eligible.
+            if c2_crossed:
+                self._emit_burst_event_observation(
+                    trigger="C2", same_count=same, any_count=any_count,
+                    ts_ns=ts_ns, fill_strike=strike, fill_side=side)
+            if c1_crossed:
+                self._emit_burst_event_observation(
+                    trigger="C1", same_count=same, any_count=any_count,
+                    ts_ns=ts_ns, fill_strike=strike, fill_side=side)
         return any_count
+
+    def _emit_burst_event_observation(self, *, trigger: str,
+                                      same_count: int, any_count: int,
+                                      ts_ns: int, fill_strike: float,
+                                      fill_side: str) -> None:
+        """Emit a burst_events row for an observational threshold cross
+        (master OFF, sub-flag OFF, or superseded by another trigger).
+        Reports the as-if cooldown deadline so downstream can reconstruct
+        the counterfactual window without recomputing thresholds."""
+        thread3 = getattr(self.config.quoting, "thread3", None)
+        if thread3 is None:
+            return
+        if trigger == "C1":
+            cooldown_sec = float(getattr(
+                thread3, "layer_c1_cooldown_sec", 2.0))
+        else:
+            cooldown_sec = float(getattr(
+                thread3, "layer_c2_cooldown_sec", 3.0))
+        deadline = ts_ns + int(cooldown_sec * 1_000_000_000)
+        self._emit_burst_event(
+            trigger=trigger,
+            same_count=same_count, any_count=any_count,
+            cooldown_sec=cooldown_sec, cooldown_until_mono_ns=deadline,
+            pulled=[], fill_strike=fill_strike, fill_side=fill_side,
+            action_fired=False)
 
     def _fire_burst_pull_c1(self, *, side: str, strike: float,
                             same_count: int, any_count: int,
@@ -2261,6 +2311,7 @@ class QuoteManager:
             same_count=same_count, any_count=any_count,
             cooldown_sec=cooldown_sec, cooldown_until_mono_ns=deadline,
             pulled=pulled, fill_strike=strike, fill_side=side,
+            action_fired=True,
         )
         logger.warning(
             "Layer C1 fired: side=%s same=%d any=%d pulled=%d cooldown=%.1fs",
@@ -2300,6 +2351,7 @@ class QuoteManager:
             same_count=same_count, any_count=any_count,
             cooldown_sec=cooldown_sec, cooldown_until_mono_ns=deadline,
             pulled=pulled, fill_strike=strike, fill_side=side,
+            action_fired=True,
         )
         logger.critical(
             "Layer C2 fired: side=%s same=%d any=%d pulled=%d cooldown=%.1fs",
@@ -2372,20 +2424,22 @@ class QuoteManager:
                           cooldown_sec: float,
                           cooldown_until_mono_ns: int,
                           pulled: list[int], fill_strike: float,
-                          fill_side: str) -> None:
+                          fill_side: str,
+                          action_fired: bool) -> None:
         if self.csv_logger is None:
             return
         try:
             self.csv_logger.log_paper_burst_event(
                 trigger=trigger,
-                same_side_count=same_count,
-                any_side_count=any_count,
+                K1_count=same_count,
+                K2_count=any_count,
                 window_sec=float(getattr(getattr(self.config.quoting,
                                                   "thread3", None),
                                           "layer_c_window_sec", 1.0)),
                 pulled_order_ids=pulled,
                 cooldown_sec=cooldown_sec,
                 cooldown_until_mono_ns=cooldown_until_mono_ns,
+                action_fired=action_fired,
                 forward=self.market_data.state.underlying_price,
                 fill_strike=fill_strike,
                 fill_side=fill_side,

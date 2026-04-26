@@ -565,28 +565,43 @@ class CSVLogger:
         })
 
     def log_paper_burst_event(self, *, trigger: str,
-                              same_side_count: int, any_side_count: int,
+                              K1_count: int, K2_count: int,
                               window_sec: float,
                               pulled_order_ids: list,
                               cooldown_sec: float,
                               cooldown_until_mono_ns: int,
+                              action_fired: bool,
                               forward: float | None = None,
                               fill_strike: float | None = None,
                               fill_side: str = "") -> None:
-        """Layer C burst-pull event row. Emitted on every C1 or C2 fire.
-        ``trigger`` is ``"C1"`` (same-side) or ``"C2"`` (any-side).
-        ``pulled_order_ids`` lists every active orderId cancelled by the
-        pull. ``cooldown_until_mono_ns`` is the monotonic-clock deadline
-        for re-arming new quotes on the locked side(s)."""
+        """Layer C burst-pull row. Emitted on every C1 or C2 threshold
+        cross — regardless of whether the action actually executed —
+        per Thread 3 deployment runbook Phase 3 instrumentation
+        correction. ``action_fired`` distinguishes real fires (cancel +
+        cooldown + drain happened) from observational rows (threshold
+        crossed but a flag was OFF or the trigger was superseded by
+        another rule).
+
+        Field names match brief §6.3: ``K1_count`` is the same-side
+        fill count in the trailing window (the value that's compared
+        against K1 for the C1 trigger); ``K2_count`` is the any-side
+        count (compared against K2 for C2).
+
+        On observational rows: ``pulled_order_ids`` is empty,
+        ``cooldown_until_mono_ns`` reports the as-if deadline (ts +
+        configured cooldown) so downstream tooling can reconstruct
+        the counterfactual without recomputing thresholds.
+        """
         self.log_paper_stream("burst_events", {
             "event_type": "burst_pull",
             "trigger": trigger,
-            "same_side_count": int(same_side_count),
-            "any_side_count": int(any_side_count),
+            "K1_count": int(K1_count),
+            "K2_count": int(K2_count),
             "window_sec": float(window_sec),
             "pulled_order_ids": [int(o) for o in pulled_order_ids],
             "cooldown_sec": float(cooldown_sec),
             "cooldown_until_mono_ns": int(cooldown_until_mono_ns),
+            "action_fired": bool(action_fired),
             "forward": float(forward) if forward is not None else None,
             "fill_strike": (float(fill_strike)
                             if fill_strike is not None else None),

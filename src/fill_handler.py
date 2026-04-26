@@ -332,6 +332,14 @@ class FillHandler:
                 # Populated even with all flags OFF — required for §7
                 # baseline measurement.
                 "burst_1s_at_fill": burst_1s_at_fill,
+                # Brief §6.5: signed edge in dollars (multiplier applied).
+                # Negative = paid through theo (toxic fill). Headline metric
+                # for §8 criterion C1 (≥50% reduction in negative-Phase-1
+                # dollars). spread_captured_theo is the same quantity (just
+                # a longer-standing field name); duplicating under the
+                # spec-canonical name so downstream tooling can match the
+                # brief without an aliasing rule.
+                "signed_edge": spread_captured_theo,
             })
         except Exception as e:
             logger.debug("paper fill event emit failed: %s", e)
