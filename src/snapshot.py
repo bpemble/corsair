@@ -126,8 +126,29 @@ def _build_side(state, market_data, sabr, portfolio, active_quotes,
     }
 
 
+def _hedge_block(hedge, state):
+    """Snapshot view of HedgeManager state. None-safe at call site —
+    this is only invoked when ``hedge`` is not None.
+    """
+    contract = hedge._resolved_hedge_contract
+    qty = int(hedge.hedge_qty)
+    return {
+        "enabled": bool(hedge.enabled),
+        "mode": str(hedge.mode),
+        "qty": qty,
+        "avg_entry": round(float(hedge.avg_entry_F), 4) if qty != 0 else 0.0,
+        "forward": round(float(state.underlying_price), 4),
+        "mtm_usd": round(float(hedge.hedge_mtm_usd()), 2),
+        "realized_pnl_usd": round(float(hedge.realized_pnl_usd), 2),
+        "contract": (getattr(contract, "localSymbol", None)
+                     or getattr(contract, "symbol", None) or "—"),
+        "expiry": getattr(contract, "lastTradeDateOrContractMonth", "") or "",
+        "tolerance": float(hedge.tolerance),
+    }
+
+
 def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
-                         ib, account_id, config):
+                         ib, account_id, config, hedge=None):
     """Write a JSON snapshot of the full option chain for the dashboard.
 
     Multi-product: every per-product invocation (primary + each observer)
@@ -263,6 +284,30 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
     if _ibkr_realized != 0.0:
         portfolio.realized_pnl_persisted = _ibkr_realized
     account["realized_pnl"] = round(portfolio.realized_pnl_persisted, 2)
+    # Fold hedge into account totals: IBKR's RealizedPnL stream doesn't
+    # pick up futures fills on this paper account (verified 2026-04-26),
+    # and account.unrealized_pnl above is options-only. Without folding,
+    # the account row silently understates exposure by hedge MTM +
+    # cumulative hedge realized. Note: hedge.realized_pnl_usd is local
+    # in-memory and resets on restart — partial coverage until v1.5
+    # reconciliation lands.
+    if hedge is not None:
+        account["unrealized_pnl"] += round(float(hedge.hedge_mtm_usd()), 2)
+        account["realized_pnl"] += round(float(hedge.realized_pnl_usd), 2)
+
+    # "Today's P&L" = current Net Liq − Net Liq at session open. Anchor
+    # is captured opportunistically here on the first non-zero NLV reading
+    # after reset_daily() / startup, then persisted via daily_state so a
+    # mid-session container rebuild doesn't re-anchor against intraday NLV.
+    _net_liq_raw = float(account.get("net_liq", 0) or 0)
+    if portfolio.session_open_nlv is None and _net_liq_raw > 0:
+        portfolio.session_open_nlv = _net_liq_raw
+    if portfolio.session_open_nlv is not None and _net_liq_raw > 0:
+        account["session_open_nlv"] = round(portfolio.session_open_nlv, 2)
+        account["daily_pnl_nlv"] = round(_net_liq_raw - portfolio.session_open_nlv, 2)
+    else:
+        account["session_open_nlv"] = None
+        account["daily_pnl_nlv"] = None
 
     # Per-product portfolio aggregates: each dashboard shows only its own
     # product's risk numbers (mixing ETH and HG contract-equivalent delta
@@ -275,9 +320,21 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
     def _agg(group, attr):
         return sum(getattr(p, attr) * p.quantity for p in group)
 
+    # Forward staleness: weekend / maintenance windows freeze the
+    # underlying tick feed, leaving daily P&L marked against last-known
+    # forward (e.g. 2026-04-26 showed +$31K MtM frozen for 8h until
+    # Sunday session reopen, then rebased to +$5K). Surface the age so
+    # the dashboard can suppress / badge stale-mark P&L.
+    _now = datetime.now(timezone.utc)
+    _last = state.underlying_last_update
+    if _last.tzinfo is None:
+        _last = _last.replace(tzinfo=timezone.utc)
+    forward_age_s = max(0.0, (_now - _last).total_seconds())
+
     snapshot = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": _now.isoformat(),
         "underlying_price": state.underlying_price,
+        "underlying_age_s": round(forward_age_s, 1),
         "atm_strike": state.atm_strike,
         "front_month_expiry": state.front_month_expiry,
         "expiries": expiries_list,
@@ -286,7 +343,28 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
         "latency": quotes.get_latency_snapshot(),
         "limits": limits,
         "portfolio": {
-            "net_delta": round(portfolio.delta_for_product(product), 4),
+            # Delta breakdown: options_delta + hedge_delta = effective_delta.
+            # As of 2026-04-27 (CLAUDE.md §14) effective_delta is the metric
+            # the constraint checker and risk monitor gate against. Surfacing
+            # the triple side-by-side lets the operator see when the hedge
+            # is masking option-side drift (which would matter immediately
+            # if local hedge_qty diverges from IBKR's actual position —
+            # see CLAUDE.md §10 reconciliation gap).
+            "options_delta": round(portfolio.delta_for_product(product), 4),
+            "hedge_delta": (int(hedge.hedge_qty) if hedge is not None else 0),
+            "effective_delta": round(
+                portfolio.delta_for_product(product)
+                + (int(hedge.hedge_qty) if hedge is not None else 0),
+                4,
+            ),
+            # net_delta retained for dashboard backward-compat — alias of
+            # effective_delta now that gates use effective. Will be removed
+            # once dashboard reads options_delta / hedge_delta explicitly.
+            "net_delta": round(
+                portfolio.delta_for_product(product)
+                + (int(hedge.hedge_qty) if hedge is not None else 0),
+                4,
+            ),
             "net_theta": round(portfolio.theta_for_product(product), 2),
             "net_vega": round(portfolio.vega_for_product(product), 2),
             "net_gamma": round(_agg(own_positions, "gamma"), 6),
@@ -311,6 +389,7 @@ def write_chain_snapshot(market_data, quotes, portfolio, sabr, margin,
                 "gross": sum(abs(p.quantity) for p in own_puts),
             },
         },
+        "hedge": _hedge_block(hedge, state) if hedge is not None else None,
         "strikes": strikes_data,
     }
 

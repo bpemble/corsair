@@ -64,6 +64,11 @@ class PortfolioState:
         # read 0 briefly after a reconnect; we hold the last non-zero value
         # so the dashboard shows a stable running total.
         self.realized_pnl_persisted: float = 0.0
+        # Anchor for "Today's P&L" tile: NLV at the most recent CME session
+        # rollover (17:00 CT). Captured opportunistically by snapshot.py on
+        # the first IBKR account read after reset_daily() / startup. Persisted
+        # via daily_state so it survives `up -d --build corsair`.
+        self.session_open_nlv: float | None = None
         self._greeks_calc = GreeksCalculator()
         # Product registry: underlying_symbol → {multiplier, market_data, sabr}
         # Populated by main.py via register_product() at engine setup time.
@@ -403,5 +408,6 @@ class PortfolioState:
         self.spread_capture_mid_today = 0.0
         self.daily_pnl = 0.0
         self.realized_pnl_persisted = 0.0
+        self.session_open_nlv = None
         logger.info("Daily counters reset")
 

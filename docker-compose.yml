@@ -11,6 +11,11 @@ services:
     restart: unless-stopped
     network_mode: host
     env_file: .env
+    # CPU pinning A/B test 2026-04-27: dedicate 4 physical cores (cores
+    # 0-3, plus their SMT siblings 6-9) to the gateway JVM. Removes
+    # SMT-level contention with corsair's SABR worker and keeps gateway
+    # threads on warm caches. Revert by deleting this line.
+    cpuset: "0-3,6-9"
     command: ["/bin/bash", "/mnt/scripts/gateway_run.sh"]
     environment:
       TRADING_MODE: ${TRADING_MODE:-paper}
@@ -39,6 +44,11 @@ services:
         condition: service_healthy
     network_mode: host
     env_file: .env
+    # CPU pinning A/B test 2026-04-27: 2 physical cores (cores 4,5 +
+    # SMT siblings 10,11) for main asyncio loop and SABR ProcessPool
+    # worker. Disjoint from gateway's set so SABR's 60s burst can't
+    # preempt JVM threads. Revert by deleting this line.
+    cpuset: "4-5,10-11"
     environment:
       CORSAIR_GATEWAY_HOST: "127.0.0.1"
       CORSAIR_GATEWAY_PORT: "${TWS_PORT:-4002}"
@@ -81,6 +91,9 @@ services:
       dockerfile: Dockerfile.dashboard
     restart: unless-stopped
     network_mode: host
+    # Shares corsair's cpuset (low-priority piggyback). Removing has no
+    # latency impact; kept disjoint from gateway for symmetry.
+    cpuset: "4-5,10-11"
     volumes:
       - ./logs:/app/logs:ro
       - ./logs-paper:/app/logs-paper:ro  # v1.4 §9.5 paper JSONL streams

@@ -36,6 +36,8 @@ Kill source (governs auto-clear rules):
 import logging
 import os
 
+from .discord_notify import send_alert
+
 logger = logging.getLogger(__name__)
 
 # v1.4 §9.4 induced-test sentinels. Each sentinel file drops the
@@ -166,6 +168,27 @@ class RiskMonitor:
         # numbers across products with different multipliers (ETH 50 vs
         # HG 25000) is meaningless, so the kill switches gate on the
         # most-exposed single product instead of a nonsense sum.
+        #
+        # Effective-delta gating (2026-04-27): worst_delta is computed
+        # against (options + hedge_qty) so the hedge subsystem unlocks
+        # capacity instead of just risk-flattening. Toggle off via
+        # constraints.effective_delta_gating to fall back to options-only
+        # — rollback path while CLAUDE.md §10 reconciliation is incomplete.
+        # CLAUDE.md §10 hedge reconciliation is a HARD prerequisite for
+        # live deployment; hedge_qty is local intent, not IBKR-confirmed.
+        # TODO(§10 reconciliation): close hedge_qty trust gap before live.
+        use_effective = bool(getattr(
+            self.config.constraints, "effective_delta_gating", True))
+
+        def _hedge_qty(prod: str) -> int:
+            hm = self.hedge_manager
+            if hm is None or not use_effective:
+                return 0
+            try:
+                return int(hm.hedge_qty_for_product(prod))
+            except Exception:
+                return 0
+
         products = list(self.portfolio.products()) or ["__all__"]
         worst_delta = 0.0
         worst_delta_prod = ""
@@ -174,12 +197,17 @@ class RiskMonitor:
         worst_theta = 0.0  # most-negative
         worst_theta_prod = ""
         if products == ["__all__"]:
-            worst_delta = self.portfolio.net_delta
+            # Cross-product fallback (no products registered). Sum hedge
+            # qty across the fanout to keep the effective-delta semantics
+            # consistent with the per-product path.
+            worst_delta = self.portfolio.net_delta + sum(
+                _hedge_qty(p) for p in self.portfolio.products()
+            )
             worst_vega = self.portfolio.net_vega
             worst_theta = self.portfolio.net_theta
         else:
             for prod in products:
-                d = self.portfolio.delta_for_product(prod)
+                d = self.portfolio.delta_for_product(prod) + _hedge_qty(prod)
                 v = self.portfolio.vega_for_product(prod)
                 t = self.portfolio.theta_for_product(prod)
                 if abs(d) > abs(worst_delta):
@@ -357,6 +385,18 @@ class RiskMonitor:
         logger.critical(
             "KILL SWITCH ACTIVATED [%s / %s]: %s", source, kill_type, reason
         )
+        # Discord alert (2026-04-27) — operator-facing notification on every
+        # kill. Non-blocking (fires in a thread); webhook silent if
+        # DISCORD_WEBHOOK_URL unset. Suppress for induced sentinel tests so
+        # the boot self-test doesn't spam the channel on every restart.
+        if not source.startswith("induced_"):
+            try:
+                send_alert(
+                    f"🚨 KILL: {source} / {kill_type}",
+                    reason,
+                )
+            except Exception as e:
+                logger.error("kill: send_alert failed: %s", e)
         # Always cancel resting quotes first. This is the minimum action
         # for every kill type and matches IBKR "safe-first" semantics:
         # even if flatten flips a failure, the book is at least quiet.

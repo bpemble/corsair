@@ -18,9 +18,9 @@ Key v1.4 differences from v1.3 (see §9 below for details):
 - **Daily P&L halt at −5% capital (−$3,750)** is the PRIMARY defense — not
   just cancels quotes, FLATTENS options + hedge, session-level halt.
 - Capital: $200K → $75K (Stage 1). Kill switches rescaled accordingly.
-- NEW hedging subsystem via HG futures front-month (`src/hedge_manager.py`).
-  Default mode: **observe** (logs intent, no orders). Flip to **execute**
-  once Gate 0 induced tests validate the paths.
+- NEW hedging subsystem via HG futures (`src/hedge_manager.py`).
+  Mode **execute** as of 2026-04-26 (Phase 0 fix `b598c7b` skips
+  near-expiry contracts). See §10 for current state.
 - NEW operational kills (`src/operational_kills.py`): SABR RMSE sustained
   >0.05, quote latency median >2s for 60s, abnormal fill rate >10× baseline.
 - 8 JSONL streams in `logs-paper/` per spec §9.5.
@@ -262,45 +262,82 @@ Non-daily_halt induced kills are sticky — `docker compose restart corsair`
 to clear. daily_halt induced kills auto-clear at the next CME session
 rollover (17:00 CT).
 
-## 10. Hedge mode: observe (reverted 2026-04-22; IBKR near-expiry lockout)
+## 10. Hedge mode: execute (re-enabled 2026-04-26 after Phase 0 fix)
 
 `src/hedge_manager.py` runs in one of two modes via
 `config.hedging.mode`:
-- **observe** (CURRENT): computes required hedge trades and logs
-  intent to `logs-paper/hedge_trades-YYYY-MM-DD.jsonl`; does NOT
-  place futures orders. Local `hedge_qty` is updated optimistically
-  so daily P&L halt still sees hedge MTM as if trades had filled.
-- **execute**: places aggressive IOC limit orders at market ± 1 tick
-  on the front-month HG futures contract.
+- **observe**: computes required hedge trades and logs intent to
+  `logs-paper/hedge_trades-YYYY-MM-DD.jsonl`; does NOT place futures
+  orders. Local `hedge_qty` is updated optimistically so daily P&L
+  halt still sees hedge MTM as if trades had filled.
+- **execute** (CURRENT): places aggressive IOC limit orders at market
+  ± 1 tick on the first tradeable HG futures contract past the
+  near-expiry cutoff.
 
-**Current state 2026-04-23**: config is `mode: "observe"`. Execute was
-flipped on 2026-04-22 (commit `2fc3858`) and reverted the same day
-(commit `470d09f`) because **IBKR rejects orders on front-month HG
-futures (HGJ6) during the near-expiry lockout window** — so execute
-mode can't actually place hedges against the contract our options
-expire into. Until the front-month rolls to HGK6/HGM6 or the lockout
-window closes, execute is functionally disabled.
+**Current state 2026-04-26**: config is `mode: "execute"`.
+`hedge_manager.resolve_hedge_contract()` now skips contracts within
+`near_expiry_lockout_days` (default 7), routing trades to e.g. HGK6
+instead of HGJ6 during HGJ6's lockout window — that was the Phase 0
+fix (commit `b598c7b`). First execute fill landed 2026-04-26 19:30
+UTC (order id `141`, BUY 3 at 6.0755, periodic rebalance, net_delta
+−3.08 → −0.08); zero Error 201 rejections in the gateway log for the
+session.
 
-Implications:
-- Hedge drift cannot be measured against real IBKR positions during
-  the lockout — no orders are flowing to IBKR to drift against.
-- Daily P&L halt still includes hedge MTM via local `hedge_qty`, but
-  that's **intent**, not **executed** — there's no futures exposure
-  offsetting options delta. The portfolio is effectively unhedged at
-  IBKR's book.
-- v1.5 execDetailsEvent wiring (the real reconciliation fix) is
-  blocked until execute mode can actually place orders to reconcile.
+**Phase 0 gate** (Thread 3 deployment runbook): ≥1 trading session
+with execute firing AND no Error 201 rejections. 2026-04-26 session
+result: 4 execute fills (BUY 3@6.0755, BUY 1@6.0248, SELL 1@6.0080,
+SELL 1@5.9983), every fill at F (zero tick slippage), position
+cycled to flat, peak hedge MTM drawdown −$412.50, zero Error 201s.
+**Gate satisfied** — but treat the flip as conditional until further
+sessions confirm; revert to observe if Error 201s reappear.
 
-**KNOWN LIMITATION (v1.5 blocker, do NOT enable in LIVE until
-resolved)**: no execDetailsEvent callback for hedge fills, no periodic
-reconciliation against `ib.positions()`. If/when execute is re-enabled:
+History: execute was previously flipped 2026-04-22 (commit `2fc3858`)
+and reverted same day (commit `470d09f`) because IBKR rejected orders
+on front-month HG futures (HGJ6) during the near-expiry lockout
+window. The 2026-04-26 fix is the contract resolver skipping
+near-expiry, not a config-only revert.
+
+**RESOLVED 2026-04-27 evening** (was elevated to live-deployment hard
+prerequisite earlier same day when §14 effective-delta gating shipped).
+Three-layer reconciliation now in place:
+
+- **Boot reconcile** (`hedge_manager.reconcile_from_ibkr`): on every
+  startup, reads `ib.positions()`, finds the FUT position matching the
+  resolved hedge contract by conId/localSymbol, sets `hedge_qty` and
+  `avg_entry_F` to match. Wired in `main.py` after `resolve_hedge_contract`,
+  before the first `risk_monitor.check()`. Closes the boot-state-loss
+  failure mode (in-memory `hedge_qty` reset → spurious delta_kill on
+  every restart with options_delta > 5.0).
+- **Periodic reconcile** (`hedge_manager.rebalance_periodic` calls
+  `reconcile_from_ibkr(silent=True)` at the top of every 30s tick).
+  Catches divergences from non-filling IOCs that previously left
+  optimistic `hedge_qty` out of sync. Silent when local matches IBKR;
+  loud on actual divergence so operator sees auto-corrections.
+- **execDetailsEvent listener** (`hedge_manager._on_exec_details`):
+  subscribed at construction; filters for FUT fills matching the
+  resolved hedge contract; updates `hedge_qty` + `avg_entry_F` +
+  `realized_pnl_usd` from IBKR's actual execution data. Deduped by
+  execId. **Replaces the optimistic-on-placement update path** in
+  `_place_or_log` execute branch — observe mode still uses optimistic
+  since no real order is sent.
+
+Plus a related fix: `_subscribe_hedge_market_data` subscribes to the
+resolved hedge contract's live ticker so IOC limits are anchored on
+the **actual hedge contract** (HGK6), not the options-engine
+underlying (HGJ6). Calendar spread of 7 ticks observed 2026-04-27
+made every BUY IOC die against the wrong-contract anchor.
+
+Original limitation note (preserved for context): no
+execDetailsEvent callback for hedge fills, no periodic
+reconciliation against `ib.positions()`. Implications now that
+execute is live:
 - If an IOC doesn't fill (market moved past ±1-tick limit in RTT
   window), local `hedge_qty` says we hedged but IBKR says we didn't.
 - If the IOC fills at the limit (not F), `avg_entry_F` is off by 1
   tick — small MTM error.
 
-**To re-enable execute** (only after front-month rolls / lockout
-lifts): flip `hedging.mode: observe → execute` in yaml and restart.
+**To revert to observe**: flip `hedging.mode: execute → observe` in
+`config/hg_v1_4_paper.yaml` and `docker compose up -d --build corsair`.
 
 Bounds note: hedge_manager has no explicit cap on `hedge_qty`. Target
 is always `-round(net_delta)` to flatten the options delta. Effective
@@ -377,3 +414,65 @@ so 0 is a no-op — no code change needed.
 
 Evidence: `docs/findings/vega_kill_characterization_2026-04-23.md`.
 HG-specific; re-characterize before any ETH capital bump.
+
+## 14. Effective-delta gating (2026-04-27 — paper-acceptable, live-blocked)
+
+`delta_ceiling` (constraint checker) and `delta_kill` (risk monitor) now
+gate against **effective_delta = options_delta + hedge_qty** instead of
+options-only. The hedge subsystem unlocks quoting capacity rather than
+just flattening risk — the design intent of v1.4 §5 ("hedge target: net
+book delta ≈ 0 at all times"), now realized at the gate level.
+
+**What changed**:
+- `constraint_checker.py:546`: `delta_for_product(prod) + hedge.hedge_qty`
+- `risk_monitor.py:182, 177`: same, applied to per-product worst_delta
+  loop AND the `__all__` cross-product fallback
+- `hedge_manager.HedgeFanout.hedge_qty_for_product(product)` exposes
+  per-product hedge state to RiskMonitor
+- `main.py`: HedgeManager constructed before ConstraintChecker; passed
+  in via `hedge_manager=hedge` kwarg (per-product); `RiskMonitor` gets
+  the multi-product `hedge_fanout` (already wired)
+- `snapshot.py`: portfolio block emits `options_delta` + `hedge_delta`
+  + `effective_delta` triple; `net_delta` aliased to effective for
+  dashboard back-compat
+- `dashboard.py`: Net Delta tile shows `opt +X.XX | hdg ±N` breakdown
+  beneath the headline so hedge masking is visible at a glance
+
+**Toggle**: `constraints.effective_delta_gating: true` (default). Flip
+false to fall back to options-only — wiring stays unconditional, the
+flag is read inside both gate paths. Use for rollback during testing.
+
+**Why this is paper-acceptable but live-blocked**: gates now depend on
+`hedge_manager.hedge_qty` — local intent, not IBKR-confirmed state. Per
+§10 there is no `execDetailsEvent` callback for hedge fills and no
+periodic reconciliation against `ib.positions()`. Failure modes that
+were tolerable when gates used options-only become safety regressions
+under effective gating:
+- IOC didn't fill (market moved past ±1-tick limit in RTT) — local
+  says hedged, IBKR says no, gates think effective is flat, options
+  drift unbounded
+- Error 201 rejection at IBKR — silently rejected, local already
+  credited, same as above
+- Gateway disconnect during hedge order — order never reached the
+  wire, local still credits
+
+In paper today these are research concerns (paper hedge fills are
+reliable). For LIVE, **§10 reconciliation is now a HARD prerequisite**:
+- `execDetailsEvent` callback for hedge fills (or equivalent
+  verification mechanism)
+- Periodic `ib.positions()` reconciliation against `hedge_qty`
+- Alert / kill on drift between intended and confirmed hedge state
+
+Do not deploy live with effective-delta gating until the above is in
+place. To run live before §10 lands, flip `effective_delta_gating: false`
+to revert to options-only gates (capacity loss, but safety bound is
+no longer hedge-trust-dependent).
+
+**Spec status**: v1.4 spec (§5 + §6.2) doesn't explicitly mandate either
+options-only or effective gating. §5 says "hedge target: net book delta
+≈ 0 at all times" implying the relevant exposure metric is combined;
+§6.2 says "±5.0 contract-deltas" without specifying. This change reads
+the spec consistently as "all directional gates use the same combined
+metric the hedge subsystem already targets." Per
+`feedback_spec_deviation`, the change is documented at each call site
+and here.

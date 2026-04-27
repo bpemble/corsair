@@ -249,7 +249,22 @@ if snapshot is not None:
     port = snapshot.get("portfolio", {})
     underlying = snapshot.get("underlying_price", 0)
     margin_val = port.get("margin", 0)
-    net_delta = port.get("net_delta", 0)
+    # Headline Net Delta = effective (options + hedge). Per-side Calls/Puts
+    # buckets below stay options-only since hedge isn't a Call or Put.
+    # Falls back to options-only net_delta on snapshots without the field
+    # (engine boots before the hedge subsystem registers).
+    net_delta = port.get("effective_delta", port.get("net_delta", 0))
+    # Breakdown components for the Net Delta tile so the operator can see
+    # at a glance whether the hedge is masking options drift (CLAUDE.md §14
+    # — gates use effective_delta, so options can drift while effective
+    # stays inside the ceiling). delta_breakdown is None on legacy snapshots
+    # (pre-2026-04-27) where options_delta/hedge_delta aren't populated.
+    options_delta = port.get("options_delta")
+    hedge_delta = port.get("hedge_delta")
+    if options_delta is not None and hedge_delta is not None:
+        delta_breakdown = f"opt {options_delta:+.2f} | hdg {hedge_delta:+d}"
+    else:
+        delta_breakdown = None
     net_theta = port.get("net_theta", 0)
     fills_today = port.get("fills_today", 0)
     spread_capture = port.get("spread_capture", 0)
@@ -293,11 +308,21 @@ if snapshot is not None:
 
     col1, col2, col3, col4, col5, col6 = st.columns(6)
 
+    # Stale forward detection: weekend / CME maintenance windows freeze the
+    # underlying tick stream, leaving daily P&L marked against a dead price.
+    # 30s is comfortably above normal tick cadence (sub-second in active
+    # hours) and below the shortest expected feed gap.
+    forward_age = float(snapshot.get("underlying_age_s", 0) or 0)
+    marks_stale = forward_age > 30.0
+    stale_label = (f' <span class="amber" style="font-size:0.5em;font-weight:normal;">'
+                   f'STALE {forward_age:.0f}s</span>') if marks_stale else ""
+    underlying_cls = " amber" if marks_stale else ""
+
     with col1:
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">Underlying</div>
-            <div class="metric-value">${underlying:,.2f}</div>
+            <div class="metric-value{underlying_cls}">${underlying:,.4f}{stale_label}</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -314,10 +339,13 @@ if snapshot is not None:
     with col3:
         dc = _delta_color(net_delta)
         cls = f" {dc}" if dc else ""
+        sub = (f'<div class="metric-sub">{delta_breakdown}</div>'
+               if delta_breakdown else "")
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">Net Delta</div>
             <div class="metric-value{cls}">{net_delta:+.2f}</div>
+            {sub}
         </div>
         """, unsafe_allow_html=True)
 
@@ -362,16 +390,36 @@ if snapshot is not None:
 
     st.markdown('<div class="section-header">Account</div>', unsafe_allow_html=True)
 
-    a1, a2, a3, a4, a5, a6 = st.columns(6)
+    a1, a2, a3, a4, a5, a6, a7 = st.columns(7)
+    # Unrealized P&L marks against `underlying_price` and option mids — both
+    # freeze when the underlying tick stream stalls. Render in amber + STALE
+    # tag instead of green/red so a +$30K phantom doesn't read as a real win.
+    unr = acct.get("unrealized_pnl", 0)
+    unr_label = f"${unr:,.0f}" + (" <span style='font-size:0.55em;opacity:0.7;font-weight:normal;'>STALE</span>"
+                                  if marks_stale else "")
+    unr_color = "amber" if marks_stale else ("green" if unr >= 0 else "red")
+    # Today's P&L = NLV − NLV-at-session-open (real intraday move). Honest
+    # number for "how much did we make today"; differs from Unrealized +
+    # Realized, which are anchored to fill price / session-cumulative and
+    # don't isolate today's move on already-open positions. None until the
+    # first NLV read after the 17:00 CT rollover sets the anchor.
+    daily_nlv = acct.get("daily_pnl_nlv")
+    if daily_nlv is None:
+        daily_label = "—"
+        daily_color = None
+    else:
+        daily_label = f"${daily_nlv:+,.0f}"
+        daily_color = "green" if daily_nlv >= 0 else "red"
     cells = [
         ("Account",       acct.get("account_id", "—"),                None),
         ("Cash",          f"${acct.get('cash', 0):,.0f}",              None),
         ("Net Liq",       f"${acct.get('net_liq', 0):,.0f}",           None),
+        ("Today's P&L",   daily_label,                                 daily_color),
         ("Maint Margin",  f"${acct.get('maint_margin', 0):,.0f}",      None),
-        ("Unrealized P&L", f"${acct.get('unrealized_pnl', 0):,.0f}",   "green" if acct.get("unrealized_pnl", 0) >= 0 else "red"),
+        ("Unrealized P&L", unr_label,                                  unr_color),
         ("Realized P&L",  f"${acct.get('realized_pnl', 0):,.0f}",      "green" if acct.get("realized_pnl", 0) >= 0 else "red"),
     ]
-    for col, (label, value, color) in zip([a1, a2, a3, a4, a5, a6], cells):
+    for col, (label, value, color) in zip([a1, a2, a3, a4, a5, a6, a7], cells):
         cls = f" {color}" if color else ""
         col.markdown(f"""
         <div class="metric-card">
@@ -463,6 +511,48 @@ if snapshot is not None:
     puts_positions = [p for p in positions if p.get("right") == "P"]
 
     if calls_b or puts_b or positions:
+        # Hedge tile — futures hedge state from HedgeManager. Surfaces
+        # expiry, qty, avg entry, mark, and MTM P&L. Hidden when the
+        # snapshot has no hedge block (older snapshots, or hedge
+        # subsystem disabled).
+        hedge_b = snapshot.get("hedge") if snapshot else None
+        if hedge_b:
+            qty = int(hedge_b.get("qty", 0))
+            avg = float(hedge_b.get("avg_entry", 0) or 0)
+            fwd = float(hedge_b.get("forward", 0) or 0)
+            mtm = float(hedge_b.get("mtm_usd", 0) or 0)
+            real = float(hedge_b.get("realized_pnl_usd", 0) or 0)
+            exp = hedge_b.get("expiry", "") or ""
+            exp_label = f"{exp[4:6]}/{exp[6:8]}" if len(exp) == 8 else (exp or "—")
+            qty_class = "pos-long" if qty > 0 else ("pos-short" if qty < 0 else "")
+            mtm_class = "positive" if mtm >= 0 else "negative"
+            real_class = "positive" if real >= 0 else "negative"
+            qty_label = "Flat" if qty == 0 else f"{qty:+d}"
+            avg_label = f"${avg:.4f}" if qty != 0 else "—"
+            mark_label = f"${fwd:.4f}" if fwd > 0 else "—"
+            mtm_label = f"${mtm:+,.2f}" if qty != 0 else "$0"
+            real_label = f"${real:+,.2f}"
+            st.markdown('<div class="section-header">Hedge</div>', unsafe_allow_html=True)
+            st.markdown(f"""
+            <table class="chain-table bucket-table">
+              <thead><tr>
+                <th>Exp</th><th>Qty</th>
+                <th>Avg Entry</th><th>Mark (F)</th>
+                <th>Unrealized</th><th>Realized</th>
+              </tr></thead>
+              <tbody>
+                <tr>
+                  <td>{exp_label}</td>
+                  <td class="{qty_class}">{qty_label}</td>
+                  <td>{avg_label}</td>
+                  <td>{mark_label}</td>
+                  <td class="chain-edge {mtm_class}">{mtm_label}</td>
+                  <td class="chain-edge {real_class}">{real_label}</td>
+                </tr>
+              </tbody>
+            </table>
+            """, unsafe_allow_html=True)
+
         st.markdown('<div class="section-header">Risk by Side</div>', unsafe_allow_html=True)
         rcol1, rcol2 = st.columns(2)
         with rcol1:

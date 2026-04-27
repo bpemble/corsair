@@ -3,6 +3,9 @@
 import logging
 import os
 from datetime import datetime, date, timezone
+from zoneinfo import ZoneInfo
+
+_CME_TZ = ZoneInfo("America/Chicago")
 
 
 def setup_logging(log_config) -> None:
@@ -31,9 +34,16 @@ def setup_logging(log_config) -> None:
 
 
 def days_to_expiry(expiry: str) -> int:
-    """Return calendar days from today to expiry (YYYYMMDD string)."""
+    """Return calendar days from today to expiry (YYYYMMDD string).
+
+    "Today" is the CME calendar date (America/Chicago) — `date.today()` in
+    a UTC container rolls over six hours early and zeros out TTE for
+    positions whose expiry is the upcoming CT business day, collapsing
+    delta to intrinsic and theta to 0.
+    """
     exp_date = datetime.strptime(expiry, "%Y%m%d").date()
-    return (exp_date - date.today()).days
+    today_cme = datetime.now(_CME_TZ).date()
+    return (exp_date - today_cme).days
 
 
 def time_to_expiry_years(expiry: str) -> float:

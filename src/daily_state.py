@@ -22,7 +22,8 @@ TMP = "data/daily_state.json.tmp"
 def save(session_day: date, *, fills_today: int,
          spread_capture_today: float, spread_capture_mid_today: float,
          daily_pnl: float, realized_pnl: float,
-         seen_exec_ids: list = None) -> None:
+         seen_exec_ids: list = None,
+         session_open_nlv: float | None = None) -> None:
     payload = {
         "session_day": session_day.isoformat(),
         "fills_today": int(fills_today),
@@ -30,6 +31,8 @@ def save(session_day: date, *, fills_today: int,
         "spread_capture_mid_today": float(spread_capture_mid_today),
         "daily_pnl": float(daily_pnl),
         "realized_pnl": float(realized_pnl),
+        "session_open_nlv": (float(session_open_nlv)
+                             if session_open_nlv is not None else None),
         # Persist the dedup set so the replay path on the next restart
         # doesn't double-count fills already attributed in a prior process.
         "seen_exec_ids": list(seen_exec_ids) if seen_exec_ids else [],

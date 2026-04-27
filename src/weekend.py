@@ -100,10 +100,15 @@ def monday_startup(market_state, portfolio, margin_checker, config) -> bool:
         )
         return False
 
-    # 4. Check for near-expiry positions
+    # 4. Check for near-expiry positions. monday_startup is called with the
+    # global config (has `products` plural); per-product configs (with
+    # `product` singular) live on each engine. HG-only deployment today —
+    # use products[0]; revisit if multi-product deployments need per-position
+    # min_dte lookup.
+    min_dte = config.products[0].min_dte
     for pos in portfolio.positions:
         dte = days_to_expiry(pos.expiry)
-        if dte <= config.product.min_dte:
+        if dte <= min_dte:
             logger.info(
                 "Position %s%.0f at %d DTE — will not quote this strike",
                 pos.put_call, pos.strike, dte,

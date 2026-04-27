@@ -43,7 +43,9 @@ def _make_monitor(rmse=None, p50_us=None, enabled=True,
                   latency_ms_max=2000.0, latency_window_sec=60.0,
                   fill_rate_mul=10.0,
                   fill_rate_baseline_window_sec=3600.0,
-                  fill_rate_min_baseline_sec=1800.0):
+                  fill_rate_min_baseline_sec=1800.0,
+                  fill_rate_floor_per_min=2.5,
+                  fill_rate_min_short_count=15):
     """Build an OperationalKillMonitor with a single synthetic engine."""
     config = SimpleNamespace(
         operational_kills=SimpleNamespace(
@@ -55,6 +57,8 @@ def _make_monitor(rmse=None, p50_us=None, enabled=True,
             abnormal_fill_rate_mul=fill_rate_mul,
             abnormal_fill_baseline_window_sec=fill_rate_baseline_window_sec,
             abnormal_fill_baseline_min_coverage_sec=fill_rate_min_baseline_sec,
+            abnormal_fill_baseline_floor_per_min=fill_rate_floor_per_min,
+            abnormal_fill_min_short_count=fill_rate_min_short_count,
         )
     )
     engines = [{
@@ -174,23 +178,49 @@ def test_fill_rate_skips_when_baseline_span_too_short():
 
 
 def test_fill_rate_fires_once_baseline_span_sufficient():
-    """After the baseline window is populated, a genuine burst still
-    fires the kill. Needs ≥2 samples in the last 60s so the short-
-    window rate has a denominator."""
+    """After the baseline window is populated, a genuine burst (>= the
+    absolute short-count guard) still fires the kill."""
     mon, risk = _make_monitor(
         fill_rate_min_baseline_sec=1800.0,
         fill_rate_mul=10.0,
+        fill_rate_min_short_count=15,
     )
     # ~35 min of slow-fill baseline + a pre-burst anchor at t=2040.
     mon._fill_hist = [
         (0, 0), (400, 1), (800, 2), (1200, 3), (1600, 4),
         (2000, 5), (2040, 5),
     ]
-    # Burst: 4 fills between t=2040 and t=2100
-    mon.portfolio.fills_today = 9
+    # Burst: 20 fills in 60s — exceeds both ratio (20/min vs 2.5/min
+    # floor = 8× — wait that's under 10×, so we need higher) and the
+    # absolute count guard. Use 30 fills in 60s = 30/min short rate
+    # vs 2.5/min floor = 12× ratio.
+    mon.portfolio.fills_today = 35
     mon._check_fill_rate(now=2100.0)
     assert risk.killed
     assert "ABNORMAL FILL RATE" in risk.kill_calls[0][0]
+
+
+def test_fill_rate_absolute_count_guard_suppresses_small_bursts():
+    """A 5-fills-in-60s burst against a 0.08/min baseline mathematically
+    hits ratio 10× when the floor is 0.5/min — but the absolute short-
+    count guard suppresses the kill since 5 < 15. Models the
+    2026-04-27 incident that motivated the guard."""
+    mon, risk = _make_monitor(
+        fill_rate_min_baseline_sec=1800.0,
+        fill_rate_mul=10.0,
+        fill_rate_floor_per_min=0.5,        # legacy floor; reproduces the bug
+        fill_rate_min_short_count=15,        # new guard
+    )
+    mon._fill_hist = [
+        (0, 0), (400, 1), (800, 2), (1200, 3), (1600, 4),
+        (2000, 5), (2040, 5),
+    ]
+    # Burst: 5 fills in 60s — would have tripped pre-fix.
+    mon.portfolio.fills_today = 10
+    mon._check_fill_rate(now=2100.0)
+    assert not risk.killed, (
+        "absolute short-count guard must suppress small-absolute-count bursts"
+    )
 
 
 # ── Disabled / safety ─────────────────────────────────────────────────

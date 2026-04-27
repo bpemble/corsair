@@ -43,9 +43,18 @@ constraints:
   # fills through above ceiling.
   capital: 500000
   margin_ceiling_pct: 0.50     # 50% of $500K = $250K soft ceiling
-  delta_ceiling: 3.0           # |portfolio net_delta| must be <= this
+  delta_ceiling: 3.0           # |effective_delta| must be <= this; effective = options + hedge_qty
   theta_floor: -500            # soft theta floor ($/day)
   margin_escape_enabled: true  # fills that reduce margin ok above ceiling
+  # Effective-delta gating (2026-04-27 — CLAUDE.md §14). When true, the
+  # delta_ceiling (this section) AND delta_kill (kill_switch) check
+  # (options_delta + hedge_qty) instead of options-only. Hedge subsystem
+  # unlocks capacity rather than just flattening risk. Toggling false
+  # falls back to options-only for both gates (rollback path). PAPER-
+  # ACCEPTABLE today; LIVE deployment requires CLAUDE.md §10 reconciliation
+  # (no execDetailsEvent for hedge fills, no ib.positions() reconciliation
+  # — local hedge_qty is intent, not confirmed state).
+  effective_delta_gating: true
 
 kill_switch:
   # SPAN margin kill (v1.4 §6.2). 70% × $500K = $350K. Fires as HALT
@@ -103,10 +112,18 @@ operational_kills:
   # Floor prevents false positives at regime transitions: when
   # overnight quiet gives 0.08/min baseline, even a 4/min legitimate
   # RTH open fill cluster reads as 48× ratio and trips the kill.
-  # Observed 2026-04-23 07:47 CDT. Floor raises effective baseline to
-  # 0.5/min, so kill threshold becomes 5/min — still catches genuine
-  # adverse-selection runaways (10+/min) but not regime transitions.
-  abnormal_fill_baseline_floor_per_min: 0.5
+  # Bumped 0.5 → 2.5 on 2026-04-27 after a 5-fills-in-60s normal burst
+  # at 15:25 UTC tripped the 10× ratio (5 / 0.5 = 10×), halted ~3.5h
+  # and cost us the April expiry settlement window. Effective trigger
+  # is now ~25 fills/min absolute during quiet baselines — well above
+  # any non-runaway burst, still below true runaway-loop rates (100s+/min).
+  abnormal_fill_baseline_floor_per_min: 2.5
+  # Absolute count guard: even at 100× ratio, kill won't fire unless
+  # at least this many fills landed in the short window. Defends
+  # against the "5 fills divided by 0.5/min floor reads as 10×" failure
+  # that ratios alone can't catch. 15 fills in 60s is well above any
+  # legitimate non-runaway burst observed to date.
+  abnormal_fill_min_short_count: 15
 
 # ── Hedging (v1.4 §5) ──────────────────────────────────────────────────
 # NEW in v1.4. Delta-hedge the options book via HG futures front-month.
@@ -145,6 +162,14 @@ hedging:
   # rollback (commit 470d09f). hedge_manager picks the FIRST contract
   # whose expiry is >= today + this window. Set to 0 to disable.
   near_expiry_lockout_days: 7
+  # IOC limit aggression in ticks past F. Bumped 1 → 2 on 2026-04-27
+  # after periodic BUY-4 IOCs systematically died because F+1 tick
+  # landed inside the bid-ask spread (late-RTH thin-liquidity regime,
+  # spread observed ~3 ticks wide). 2 ticks crosses ASK on BUY (or
+  # BID on SELL) in spreads up to 4 ticks wide. Round-trip slippage is
+  # bounded at 2 × ioc_tick_offset = 4 ticks worst case. Increase if
+  # IOCs still don't fill; decrease if hedge round-trip cost is too high.
+  ioc_tick_offset: 2
   # Mark-to-market tracking: when true, hedge P&L is included in the
   # daily_pnl_halt calculation per v1.4 §6.1. Keep on even in observe
   # mode — "would-be" hedge P&L is still real exposure.

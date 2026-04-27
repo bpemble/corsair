@@ -490,7 +490,7 @@ class ConstraintChecker:
     deployment ramp spec.
     """
 
-    def __init__(self, margin_checker, portfolio, config):
+    def __init__(self, margin_checker, portfolio, config, hedge_manager=None):
         self.margin = margin_checker
         self.portfolio = portfolio
         self.config = config
@@ -499,6 +499,14 @@ class ConstraintChecker:
         # delta across ETH (mult 50) and HG (mult 25000) is meaningless).
         # Combined-across-products margin still goes through the coordinator.
         self._product = config.product.underlying_symbol
+        # Effective-delta gating (2026-04-27): when wired, the delta cap is
+        # checked against (options_delta + hedge_qty), so hedge capacity
+        # extends quoting capacity instead of just risk-flattening. None
+        # fallback preserves options-only behavior for tests / rollback.
+        # CLAUDE.md §10 hedge reconciliation is now a HARD prerequisite for
+        # live deployment — hedge_qty is local intent, not IBKR-confirmed.
+        # TODO(§10 reconciliation): close hedge_qty trust gap before live.
+        self._hedge = hedge_manager
 
     def _ceilings(self) -> tuple[float, float, float]:
         """Return (margin_ceiling, delta_ceiling, theta_floor) — the single
@@ -543,7 +551,17 @@ class ConstraintChecker:
         # Per-product delta/theta — see __init__ note. Each product has its
         # own ConstraintChecker with its own caps; mixing HG's net delta into
         # ETH's gating decision (or vice versa) would silently break both.
-        cur_delta = self.portfolio.delta_for_product(self._product)
+        # Effective delta = options + hedge_qty (each futures contract = 1
+        # contract-delta). Toggle off via constraints.effective_delta_gating
+        # to fall back to options-only — rollback path while CLAUDE.md §10
+        # reconciliation is incomplete. hedge_qty is local intent, not
+        # IBKR-confirmed; live deployment requires §10 reconciliation first.
+        use_effective = bool(getattr(
+            self.config.constraints, "effective_delta_gating", True))
+        hedge_qty = (int(self._hedge.hedge_qty)
+                     if (use_effective and self._hedge is not None) else 0)
+        cur_delta = (self.portfolio.delta_for_product(self._product)
+                     + hedge_qty)
         post_delta = cur_delta + (option_quote.delta * fill_qty)
 
         option_theta = option_quote.theta * multiplier

@@ -331,15 +331,20 @@ async def main():
         margin = IBKRMarginChecker(ib, pcfg, md, portfolio, sabr=sabr,
                                    csv_logger=csv_logger)
         margin_coord.register(margin)
-        cc = ConstraintChecker(margin, portfolio, pcfg)
+        # v1.4 §5 delta hedge manager. Constructed per-product since
+        # each product has its own underlying future. No-op when
+        # config.hedging.enabled is false or absent. Constructed BEFORE
+        # ConstraintChecker so the effective-delta gating path can take a
+        # reference to it (2026-04-27 — see CLAUDE.md §14). The
+        # effective-delta toggle (constraints.effective_delta_gating, default
+        # true) is read inside ConstraintChecker / RiskMonitor; wiring is
+        # unconditional. CLAUDE.md §10 reconciliation required before live.
+        hedge = HedgeManager(ib, pcfg, md, portfolio, csv_logger=csv_logger)
+        cc = ConstraintChecker(margin, portfolio, pcfg, hedge_manager=hedge)
         quotes = QuoteManager(ib, pcfg, md, sabr, cc, csv_logger=csv_logger)
         # Back-reference so the trade-tape capture in market_data can look
         # up our resting state at print time.
         md.quotes = quotes
-        # v1.4 §5 delta hedge manager. Constructed per-product since
-        # each product has its own underlying future. No-op when
-        # config.hedging.enabled is false or absent.
-        hedge = HedgeManager(ib, pcfg, md, portfolio, csv_logger=csv_logger)
         # product_filter must be the IBKR underlying symbol (what
         # fill.contract.symbol returns). Before 2026-04-14 this was set
         # to option_symbol and silently dropped every fill.
@@ -368,6 +373,21 @@ async def main():
         except Exception:
             logger.exception("hedge.resolve_hedge_contract failed [%s]",
                              pcfg.name)
+
+        # §10 boot reconciliation (added 2026-04-27 after a double-hedge
+        # incident: 3 restarts each force_flat'd a fresh -5 SELL because
+        # in-memory hedge_qty resets to 0, leaving IBKR at -10 vs local -5
+        # and effective_delta gating reading a stale +0.50 instead of the
+        # true -4.50). Must run BEFORE the first risk_monitor.check() so
+        # hedge_qty reflects ground truth before the delta kill is evaluated.
+        try:
+            hedge.reconcile_from_ibkr()
+        except Exception:
+            logger.exception("hedge.reconcile_from_ibkr failed [%s] — "
+                             "hedge_qty will start at 0; expect delta_kill "
+                             "if options_delta > %g",
+                             pcfg.name,
+                             getattr(pcfg.kill_switch, "delta_kill", 5.0))
 
         engines.append({
             "name": pcfg.name,
@@ -584,6 +604,9 @@ async def main():
         portfolio.spread_capture_mid_today = float(_persisted.get("spread_capture_mid_today", 0.0))
         portfolio.daily_pnl = float(_persisted.get("daily_pnl", 0.0))
         portfolio.realized_pnl_persisted = float(_persisted.get("realized_pnl", 0.0))
+        _persisted_open_nlv = _persisted.get("session_open_nlv")
+        if _persisted_open_nlv is not None:
+            portfolio.session_open_nlv = float(_persisted_open_nlv)
         # Restore the dedup set so the replay path doesn't double-count
         # fills already attributed in a prior process within the same session.
         for eid in _persisted.get("seen_exec_ids", []):
@@ -616,6 +639,7 @@ async def main():
                 daily_pnl=portfolio.daily_pnl,
                 realized_pnl=portfolio.realized_pnl_persisted,
                 seen_exec_ids=list(fills._seen_exec_ids),
+                session_open_nlv=portfolio.session_open_nlv,
             )
         except Exception as e:
             logger.warning("daily_state per-fill save error: %s", e)
@@ -833,7 +857,7 @@ async def main():
                     write_chain_snapshot(
                         eng["md"], eng["quotes"], portfolio, eng["sabr"],
                         eng["margin"], ib, config.account.account_id,
-                        eng["config"],
+                        eng["config"], hedge=eng.get("hedge"),
                     )
                 except Exception as e:
                     logger.warning("Snapshot %s error: %s", eng["name"], e)
@@ -849,6 +873,7 @@ async def main():
                     daily_pnl=portfolio.daily_pnl,
                     realized_pnl=portfolio.realized_pnl_persisted,
                     seen_exec_ids=list(fills._seen_exec_ids),
+                    session_open_nlv=portfolio.session_open_nlv,
                 )
             except Exception as e:
                 logger.warning("daily_state save error: %s", e)

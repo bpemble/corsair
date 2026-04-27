@@ -87,8 +87,20 @@ class OperationalKillMonitor:
         # vs 0.08/min hour baseline → 150× ratio, kill fired. Floor
         # sets the minimum effective baseline so the kill only fires
         # on genuinely abnormal burst rates, not regime transitions.
+        # Bumped 0.5 → 2.5 on 2026-04-27 after a 5-fills-in-60s normal
+        # burst at 15:25 UTC tripped 5/0.5 = 10× ratio, halted ~3.5h and
+        # cost us the April settlement window. New floor lifts trigger
+        # to ~25 fills/min absolute during quiet baselines, well above
+        # any realistic non-runaway burst.
         self.fill_rate_baseline_floor_per_min: float = float(
-            getattr(op, "abnormal_fill_baseline_floor_per_min", 0.5))
+            getattr(op, "abnormal_fill_baseline_floor_per_min", 2.5))
+        # Absolute floor on the short-window fill count. Independent of
+        # ratio: even a 100× ratio can't fire if fewer than this many
+        # fills landed in the short window. Defends against the
+        # "tiny-numbers ratio explodes" failure mode where 5 vs 0.5 is
+        # mathematically 10× but operationally just normal flow.
+        self.fill_rate_min_short_count: int = int(
+            getattr(op, "abnormal_fill_min_short_count", 15))
         self.rvol_alert_threshold: float = float(
             getattr(op, "rvol_alert_5d_threshold", 0.50))
 
@@ -269,13 +281,14 @@ class OperationalKillMonitor:
             return
 
         ratio = short_rate_per_min / effective_baseline
-        if ratio > self.fill_rate_mul:
+        if ratio > self.fill_rate_mul and short_fills >= self.fill_rate_min_short_count:
             floored = effective_baseline > long_rate_per_min
             floor_note = f" [floored from {long_rate_per_min:.2f}]" if floored else ""
             self.risk.kill(
-                f"ABNORMAL FILL RATE: {short_rate_per_min:.1f}/min (short) "
-                f"vs {effective_baseline:.2f}/min (hour baseline{floor_note}) — "
-                f"ratio {ratio:.1f}× > {self.fill_rate_mul:.0f}×",
+                f"ABNORMAL FILL RATE: {short_rate_per_min:.1f}/min (short, "
+                f"{short_fills} fills in window) vs {effective_baseline:.2f}/min "
+                f"(hour baseline{floor_note}) — ratio {ratio:.1f}× > "
+                f"{self.fill_rate_mul:.0f}×",
                 source="operational", kill_type="halt",
             )
 
