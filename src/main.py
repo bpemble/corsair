@@ -744,6 +744,21 @@ async def main():
             try:
                 mismatches = _reconcile_positions(portfolio, ib, config.account.account_id, config)
                 if mismatches:
+                    # `ib.positions()` lags `execDetailsEvent` by hundreds of ms,
+                    # so a fill that just booked locally can show up here as
+                    # drift. Force a fresh position pull and re-check before
+                    # killing — persistent silent drift (the 2026-04-08 failure
+                    # mode) survives the re-check; a post-fill race does not.
+                    logger.warning(
+                        "Reconciliation mismatch (%d): %s — re-checking after fresh reqPositions",
+                        len(mismatches), mismatches[:5],
+                    )
+                    try:
+                        await ib.reqPositionsAsync()
+                    except Exception as ee:
+                        logger.warning("reqPositionsAsync during reconcile recheck failed: %s", ee)
+                    mismatches = _reconcile_positions(portfolio, ib, config.account.account_id, config)
+                if mismatches:
                     logger.critical(
                         "POSITION RECONCILIATION MISMATCH (%d): %s — killing",
                         len(mismatches), mismatches[:5],

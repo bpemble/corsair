@@ -309,10 +309,31 @@ class MarketDataManager:
             logger.error("No contract details for %s", p.underlying_symbol)
             return
 
-        # Sort by expiry, pick the nearest one that hasn't expired
-        now_str = datetime.now().strftime("%Y%m%d")
+        # Skip contracts inside the near-expiry lockout window. Mirrors
+        # hedge_manager — without this, on the front-month's last trading
+        # day the resolver picks a contract that goes silent intra-session
+        # and freezes underlying_price (2026-04-28 incident, HGJ6).
+        lockout_days = int(getattr(
+            getattr(self.config, "hedging", object()),
+            "near_expiry_lockout_days", 7))
+        cutoff_dt = datetime.now() + timedelta(days=max(lockout_days, 0))
+        cutoff_str = cutoff_dt.strftime("%Y%m%d")
         valid = [d for d in details_list
-                 if d.contract.lastTradeDateOrContractMonth >= now_str]
+                 if d.contract.lastTradeDateOrContractMonth >= cutoff_str]
+        if not valid:
+            # Fall back to the original any-future-not-yet-expired filter
+            # so we don't go forwardless if every contract is inside the
+            # window (shouldn't happen with a 7-day lockout on a monthly
+            # cycle, but be defensive).
+            now_str = datetime.now().strftime("%Y%m%d")
+            valid = [d for d in details_list
+                     if d.contract.lastTradeDateOrContractMonth >= now_str]
+            if valid:
+                logger.warning(
+                    "Underlying lockout-skip: no contract past %d-day cutoff "
+                    "(%s) — falling back to nearest non-expired",
+                    lockout_days, cutoff_str,
+                )
         if not valid:
             logger.error("No valid future expiries found for %s", p.underlying_symbol)
             return
