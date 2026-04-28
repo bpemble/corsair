@@ -254,18 +254,8 @@ if snapshot is not None:
     # Falls back to options-only net_delta on snapshots without the field
     # (engine boots before the hedge subsystem registers).
     net_delta = port.get("effective_delta", port.get("net_delta", 0))
-    # Breakdown components for the Net Delta tile so the operator can see
-    # at a glance whether the hedge is masking options drift (CLAUDE.md §14
-    # — gates use effective_delta, so options can drift while effective
-    # stays inside the ceiling). delta_breakdown is None on legacy snapshots
-    # (pre-2026-04-27) where options_delta/hedge_delta aren't populated.
-    options_delta = port.get("options_delta")
-    hedge_delta = port.get("hedge_delta")
-    if options_delta is not None and hedge_delta is not None:
-        delta_breakdown = f"opt {options_delta:+.2f} | hdg {hedge_delta:+d}"
-    else:
-        delta_breakdown = None
     net_theta = port.get("net_theta", 0)
+    net_vega = port.get("net_vega", 0)
     fills_today = port.get("fills_today", 0)
     spread_capture = port.get("spread_capture", 0)
     spread_capture_mid = port.get("spread_capture_mid", 0)
@@ -306,7 +296,7 @@ if snapshot is not None:
             return "amber"
         return "red"
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
 
     # Stale forward detection: weekend / CME maintenance windows freeze the
     # underlying tick stream, leaving daily P&L marked against a dead price.
@@ -339,13 +329,10 @@ if snapshot is not None:
     with col3:
         dc = _delta_color(net_delta)
         cls = f" {dc}" if dc else ""
-        sub = (f'<div class="metric-sub">{delta_breakdown}</div>'
-               if delta_breakdown else "")
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">Net Delta</div>
             <div class="metric-value{cls}">{net_delta:+.2f}</div>
-            {sub}
         </div>
         """, unsafe_allow_html=True)
 
@@ -360,6 +347,18 @@ if snapshot is not None:
         """, unsafe_allow_html=True)
 
     with col5:
+        # Vega: §13 disabled vega_kill (threshold characterization showed it
+        # bound on 67-88% of fills as a choke). With no gate, no color band —
+        # we display it for operator visibility since it's now the largest
+        # unhedged risk vector.
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">Net Vega</div>
+            <div class="metric-value">{net_vega:+,.0f}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col6:
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">Fills Today</div>
@@ -367,7 +366,7 @@ if snapshot is not None:
         </div>
         """, unsafe_allow_html=True)
 
-    with col6:
+    with col7:
         sc_color = "green" if spread_capture >= 0 else "red"
         mid_color = "green" if spread_capture_mid >= 0 else "red"
         st.markdown(f"""
@@ -414,8 +413,8 @@ if snapshot is not None:
         ("Account",       acct.get("account_id", "—"),                None),
         ("Cash",          f"${acct.get('cash', 0):,.0f}",              None),
         ("Net Liq",       f"${acct.get('net_liq', 0):,.0f}",           None),
-        ("Today's P&L",   daily_label,                                 daily_color),
         ("Maint Margin",  f"${acct.get('maint_margin', 0):,.0f}",      None),
+        ("Today's P&L",   daily_label,                                 daily_color),
         ("Unrealized P&L", unr_label,                                  unr_color),
         ("Realized P&L",  f"${acct.get('realized_pnl', 0):,.0f}",      "green" if acct.get("realized_pnl", 0) >= 0 else "red"),
     ]
