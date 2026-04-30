@@ -39,6 +39,8 @@ services:
         condition: service_healthy
     network_mode: host
     env_file: .env
+    cap_add:
+      - SYS_PTRACE
     environment:
       CORSAIR_GATEWAY_HOST: "127.0.0.1"
       CORSAIR_GATEWAY_PORT: "${TWS_PORT:-4002}"

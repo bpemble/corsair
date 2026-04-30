@@ -1826,9 +1826,11 @@ class QuoteManager:
     def _record_send_latency(self, strike: float, expiry: str, right: str, order_id: int):
         """Capture TTT (tick→placeOrder) and arm RTT/fill timers for this order.
 
-        TTT is only sampled when the underlying tick is fresh (<50ms old).
-        Older ticks come from the periodic 1s fallback refresh, where the
-        recorded delta is data age rather than compute latency.
+        TTT is sampled when the tick is fresh (<500ms old). Older deltas
+        come from the periodic 1s fallback refresh, where the recorded
+        value is data age rather than compute latency. Cap raised from
+        50ms → 500ms 2026-04-30 after the histogram pegged at the prior
+        ceiling (p99 ~49.6ms) hiding the real tail.
 
         Two timers are armed:
           - _pending_rtt: cleared on Submitted ack (used for RTT histogram)
@@ -1842,7 +1844,7 @@ class QuoteManager:
         tick_ns = self._decision_tick_ns.get((strike, expiry, right), 0)
         if tick_ns > 0:
             ttt_us = (now_ns - tick_ns) // 1000
-            if 0 <= ttt_us < 50_000:
+            if 0 <= ttt_us < 500_000:
                 self._ttt_us.append(ttt_us)
         # Place RTT is measured ONCE per orderId — from the original
         # placeOrder to the first openOrder ack. Modifies don't overwrite
