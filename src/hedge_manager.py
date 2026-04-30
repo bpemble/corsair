@@ -31,11 +31,17 @@ side (deferred to v1.5 or when flipping to execute).
 
 import logging
 import time
+from collections import deque
 from datetime import date, datetime, timedelta
 
 from ib_insync import Future, LimitOrder
 
 logger = logging.getLogger(__name__)
+
+# Soft cap on _processed_exec_ids dedupe set. FIFO eviction once the
+# matching deque hits this size — keeps memory bounded while the dedupe
+# window stays comfortably wider than any realistic execDetails replay.
+PROCESSED_EXEC_IDS_MAX = 10_000
 
 
 class HedgeFanout:
@@ -189,13 +195,15 @@ class HedgeManager:
         # ask=6.0275 → 7-tick gap, all BUY IOCs died regardless of
         # offset). None until subscribed; falls back to options F.
         self._hedge_ticker = None
-        # execDetailsEvent dedupe set — second half of CLAUDE.md §10
+        # execDetailsEvent dedupe — second half of CLAUDE.md §10
         # (completed 2026-04-27). Replaces optimistic-on-placement
         # accounting with authoritative-on-fill from IBKR. Keyed by
         # execId so the same fill event firing multiple times never
-        # double-counts. Set never trims (~hundreds of ids/day at
-        # current volumes).
+        # double-counts. Bounded to PROCESSED_EXEC_IDS_MAX via paired
+        # FIFO deque; the set membership check stays O(1) and memory
+        # caps at ~10K ids regardless of session length.
         self._processed_exec_ids: set[str] = set()
+        self._processed_exec_ids_order: deque[str] = deque()
         # Subscribe to fill confirmations. Handler filters for FUT
         # fills on our resolved hedge contract (set later by
         # resolve_hedge_contract). Optimistic-on-placement was removed
@@ -516,7 +524,11 @@ class HedgeManager:
         exec_id = getattr(execution, "execId", "")
         if not exec_id or exec_id in self._processed_exec_ids:
             return
+        if len(self._processed_exec_ids_order) >= PROCESSED_EXEC_IDS_MAX:
+            old = self._processed_exec_ids_order.popleft()
+            self._processed_exec_ids.discard(old)
         self._processed_exec_ids.add(exec_id)
+        self._processed_exec_ids_order.append(exec_id)
         raw_side = (getattr(execution, "side", "") or "").upper()
         side = "BUY" if raw_side in ("BOT", "BUY", "B") else "SELL"
         try:

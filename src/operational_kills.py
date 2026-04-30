@@ -27,6 +27,7 @@ check that relied on sample alignment against the window edge and
 silently failed at moderately-slow check cadences.
 """
 
+import bisect
 import logging
 import time
 
@@ -244,35 +245,56 @@ class OperationalKillMonitor:
         Early-session handling: if baseline window has <2 snapshots or
         <5 total fills, skip — the ratio is meaningless when numbers
         are small.
+
+        Performance: throttles appends to ≥1s spacing (the rate calc
+        only needs first/last sample of each window, so denser sampling
+        is wasted), uses bisect for O(log N) window-start lookups, and
+        slice-evicts in a single O(N) pass instead of repeated pop(0).
+        Prior implementation grew _fill_hist by tens of entries per
+        second and ran two O(N) listcomps per check() call — at T+43min
+        post-restart it was 33% of the asyncio loop and TTT had doubled.
         """
         fills_today = int(getattr(self.portfolio, "fills_today", 0))
-        self._fill_hist.append((now, fills_today))
-        # Evict samples older than the baseline window + buffer.
+        # Throttle to ≥1s spacing. fills_today is monotonic; the rate
+        # calc only consults bracket samples, so finer resolution adds
+        # cost without information.
+        if not self._fill_hist or (now - self._fill_hist[-1][0]) >= 1.0:
+            self._fill_hist.append((now, fills_today))
+
+        # Slice-eviction: bisect once, splice out the prefix in one shot.
         cutoff = now - (self.fill_rate_baseline_window_sec + 60)
-        while self._fill_hist and self._fill_hist[0][0] < cutoff:
-            self._fill_hist.pop(0)
+        if self._fill_hist and self._fill_hist[0][0] < cutoff:
+            cut = bisect.bisect_left(self._fill_hist, cutoff,
+                                     key=lambda s: s[0])
+            if cut > 0:
+                del self._fill_hist[:cut]
 
         if len(self._fill_hist) < 3:
             return
 
-        # Short window: last 60s.
+        # Short window: last 60s. Bisect to find first sample ≥ cutoff,
+        # then take that as window-start; first/last is all we need.
         short_cutoff = now - 60.0
-        short_samples = [s for s in self._fill_hist if s[0] >= short_cutoff]
-        if len(short_samples) < 2:
+        si = bisect.bisect_left(self._fill_hist, short_cutoff,
+                                key=lambda s: s[0])
+        if si >= len(self._fill_hist) - 1:
             return
-        short_fills = max(0, short_samples[-1][1] - short_samples[0][1])
-        short_span = max(1.0, short_samples[-1][0] - short_samples[0][0])
+        short_first, short_last = self._fill_hist[si], self._fill_hist[-1]
+        short_fills = max(0, short_last[1] - short_first[1])
+        short_span = max(1.0, short_last[0] - short_first[0])
         short_rate_per_min = (short_fills / short_span) * 60.0
 
-        # Baseline: past `baseline_window_sec`.
+        # Baseline: past `baseline_window_sec`. Same bisect pattern.
         long_cutoff = now - self.fill_rate_baseline_window_sec
-        long_samples = [s for s in self._fill_hist if s[0] >= long_cutoff]
-        if len(long_samples) < 2:
+        li = bisect.bisect_left(self._fill_hist, long_cutoff,
+                                key=lambda s: s[0])
+        if li >= len(self._fill_hist) - 1:
             return
-        long_fills = max(0, long_samples[-1][1] - long_samples[0][1])
+        long_first, long_last = self._fill_hist[li], self._fill_hist[-1]
+        long_fills = max(0, long_last[1] - long_first[1])
         if long_fills < 5:
             return  # not enough fills to trust the ratio
-        long_span = max(1.0, long_samples[-1][0] - long_samples[0][0])
+        long_span = max(1.0, long_last[0] - long_first[0])
         if long_span < self.fill_rate_min_baseline_sec:
             return  # baseline window not yet populated enough to trust
         long_rate_per_min = (long_fills / long_span) * 60.0
