@@ -336,21 +336,28 @@ class QuoteManager:
             config.quoting, "max_resting_per_side", 60))
         # Theo-vs-incumbent sanity gate (defense vector #3): if SABR theo
         # disagrees with the market mid by more than this many ticks, treat
-        # Per-cycle canonical trade index — populated by _build_our_prices_index
-        # at the top of each update_quotes / get_active_quotes call. Reading
-        # from this dict is O(1) vs an O(N) walk of openTrades, which matters
-        # at 4Hz × ~50 active orders. Cleared opportunistically; readers fall
-        # back to walking openTrades when the cache is empty (cold path).
+        # Canonical trade index — orderId → live Trade for OUR open orders
+        # (filtered by orderRef prefix). Maintained event-driven by the
+        # openOrderEvent handler (insert/replace) and orderStatusEvent
+        # handler (evict on DoneStates). Replaces a per-cycle walk over
+        # ib.openTrades(); ib_insync's wrapper.trades dict only grows over
+        # the session lifetime, so that walk got progressively more
+        # expensive (11.7% of the loop at T+43min on 2026-04-30).
+        # Seeded once from openTrades on the first cycle to capture any
+        # orders adopted via reqAutoOpenOrders before our subscription
+        # was active.
         self._canonical_idx: dict[int, object] = {}
+        self._canonical_idx_seeded: bool = False
 
-        # Event-driven RTT/AMEND measurement: subscribe once to the IB-level
-        # openOrderEvent, which fires whenever IBKR sends an openOrder message
-        # in response to a place or modify. The handler pops _pending_rtt /
-        # _pending_amend and records latency in their respective rings. This
-        # replaces the snapshot-quantized _capture_rtt_from_log path that was
-        # adding 0-250ms uniform quantization noise (4Hz polling cadence) on
-        # top of real ~1ms amend latency, making the metric meaningless.
+        # Event-driven RTT/AMEND measurement + canonical-idx maintenance.
+        # openOrderEvent fires when IBKR sends an openOrder message in
+        # response to a place or modify; the handler records RTT and
+        # also inserts/replaces in _canonical_idx (last-write-wins
+        # handles the orphan→canonical Trade replacement per CLAUDE.md
+        # §2). orderStatusEvent fires on every status change; we use it
+        # to evict from _canonical_idx when an order goes terminal.
         self.ib.openOrderEvent += self._on_open_order_ack
+        self.ib.orderStatusEvent += self._on_order_status_evict
         # Error 104 ("Cannot modify a filled order") cleanup. ib_insync
         # surfaces every TWS error via errorEvent(reqId, code, msg, contract).
         # Without this hook, after a fill races our modify the active_orders
@@ -564,41 +571,83 @@ class QuoteManager:
         """Return the canonical (latest) Trade object for an orderId, or
         None if it's no longer open.
 
-        Hot path: reads from `self._canonical_idx`, which is populated once
-        per cycle by `_build_our_prices_index`. The cached entry is the same
-        Trade *instance* that ib_insync mutates in place, so reading its
-        `.orderStatus.status` always returns the latest value even between
-        cache rebuilds.
+        Hot path: reads from `self._canonical_idx`, maintained
+        event-driven by openOrderEvent (insert/replace) and
+        orderStatusEvent (evict on terminal). Reading the cached
+        Trade returns the live ib_insync instance, so its
+        `.orderStatus.status` always reflects the latest state.
 
-        Cold path: when the cache is empty (e.g., a caller outside the
-        update_quotes / get_active_quotes flow), fall back to walking
-        openTrades. This preserves correctness if the call site changes.
+        Cold path: if the cache hasn't been seeded yet (called before
+        the first update_quotes cycle) or the orderId genuinely isn't
+        in our cache, seed from openTrades and try once more. After
+        seeding, the cache is authoritative.
 
-        Why we don't cache the placeOrder return value: ib_insync sometimes
-        constructs a NEW Trade object when an openOrder callback fires
-        (notably after reqAutoOpenOrders adopts the order on clientId=0).
-        The Trade returned by placeOrder becomes an orphan that nobody
-        updates — it'd stay at PendingSubmit forever. The fix is to always
-        re-resolve from the canonical store.
+        Why we don't cache the placeOrder return value directly:
+        ib_insync sometimes constructs a NEW Trade object when an
+        openOrder callback fires (notably after reqAutoOpenOrders
+        adopts the order on clientId=0). The Trade returned by
+        placeOrder becomes an orphan that nobody updates — it'd stay
+        at PendingSubmit forever. The openOrderEvent handler updates
+        the cache to the canonical Trade once the ack arrives.
 
-        Subtlety: openTrades() can return MULTIPLE Trade objects with the
-        same orderId — the original (stale) Trade and a fresh one from the
-        openOrder callback. We MUST return the LAST match in the iteration
-        (the canonical one with up-to-date status), not the first.
+        Subtlety: openTrades() can return MULTIPLE Trade objects with
+        the same orderId — the original (stale) Trade and a fresh one
+        from the openOrder callback. We MUST return the LAST match in
+        the iteration (the canonical one with up-to-date status), not
+        the first.
         """
         cached = self._canonical_idx.get(order_id)
         if cached is not None:
             return cached
+        # Seed-on-miss: covers the small window between IB connect
+        # and the first update_quotes cycle, plus genuine cache
+        # misses on session-startup adopted orders.
+        if not self._canonical_idx_seeded:
+            self._seed_canonical_idx()
+            cached = self._canonical_idx.get(order_id)
+            if cached is not None:
+                return cached
+        # True cold path — order isn't in our cache (perhaps not ours,
+        # or already terminal). Walk openTrades as a final fallback;
+        # caller's intent here is correctness, not performance.
         latest = None
         for t in self.ib.openTrades():
             if t.order.orderId == order_id:
                 latest = t
         return latest
 
+    def _seed_canonical_idx(self) -> None:
+        """Populate _canonical_idx from a one-shot walk of openTrades.
+
+        Called once at first use; after that the index is maintained
+        event-driven by _on_open_order_ack (insert/replace) and
+        _on_order_status_evict (evict on terminal status). The walk
+        captures orders adopted via reqAutoOpenOrders on clientId=0
+        before our event subscriptions were active, plus any orders
+        that survived a restart.
+
+        Idempotent. Filters by orderRef prefix so foreign orders never
+        enter the index.
+        """
+        if self._canonical_idx_seeded:
+            return
+        for t in self.ib.openTrades():
+            ref = getattr(t.order, "orderRef", "") or ""
+            if not ref.startswith(ORDER_REF_PREFIX):
+                continue
+            if not self._is_order_live(t):
+                continue
+            # last-write-wins per CLAUDE.md §2: when openTrades returns
+            # both an orphan and a canonical Trade for the same orderId,
+            # ib_insync iterates them in insertion order, so the most
+            # recent one (the canonical) wins.
+            self._canonical_idx[t.order.orderId] = t
+        self._canonical_idx_seeded = True
+
     def _build_our_prices_index(self) -> dict[tuple[float, str, str, str], set]:
-        """One-pass build of {(strike, expiry, right, side): set(prices)} for
-        self-filter use across an entire update_quotes cycle. Walks
-        openTrades exactly once per cycle instead of N times.
+        """Build {(strike, expiry, right, side): set(prices)} from our
+        canonical trade cache. Used as the self-filter source across an
+        entire update_quotes cycle.
 
         Keyed by side (BUY/SELL) so the self-filter for the bid incumbent
         only sees our resting BUY prices, not our SELL prices (and vice
@@ -606,31 +655,14 @@ class QuoteManager:
         the BUY path, falling back to a stale _last_clean_bid cache and
         penny-jumping an old price — leaving the bid many ticks behind.
 
-        Two-step to handle ib_insync's multi-Trade-per-orderId quirk: first
-        build {orderId: canonical_trade} (last-write-wins picks the canonical
-        non-orphan instance), then bucket by (strike, expiry, right, side).
-
-        Side effect: populates `self._canonical_idx` so `_canonical_trade()`
-        can do O(1) lookups during the rest of the cycle instead of walking
-        openTrades on every call.
+        The cache (self._canonical_idx) is event-driven; this function
+        just reads it. The first call seeds it from openTrades — this
+        is the only place we walk that list. Subsequent cycles do
+        zero work proportional to ib_insync's wrapper.trades size.
         """
-        # Last-write-wins per CLAUDE.md §2: when openTrades() returns
-        # multiple Trades for the same orderId, the canonical (live)
-        # instance is whichever one ib_insync's openOrder callback
-        # constructed most recently — that's the one receiving real
-        # status updates. The placeOrder-return Trade is the orphan and
-        # gets stuck at PendingSubmit. Don't try to be clever with a
-        # clientId tiebreak: on FA logins the canonical entry can carry
-        # clientId=-1 (master adoption), so a "prefer my clientId"
-        # tiebreak would pick exactly the orphan we want to avoid.
-        canonical: dict[int, object] = {}
-        for t in self.ib.openTrades():
-            ref = getattr(t.order, "orderRef", "") or ""
-            if ref.startswith(ORDER_REF_PREFIX):
-                canonical[t.order.orderId] = t
-        self._canonical_idx = canonical  # cache for _canonical_trade reads
+        self._seed_canonical_idx()
         out: dict[tuple[float, str, str, str], set] = {}
-        for t in canonical.values():
+        for t in self._canonical_idx.values():
             if not self._is_order_live(t):
                 continue
             c = t.contract
@@ -1893,6 +1925,16 @@ class QuoteManager:
             oid = trade.order.orderId
             now_ns = time.monotonic_ns()
 
+            # ── canonical-idx maintenance ─────────────────────────
+            # Last-write-wins handles the orphan→canonical Trade
+            # replacement per CLAUDE.md §2: ib_insync constructs a new
+            # Trade when an openOrder callback arrives after
+            # reqAutoOpenOrders adopts the order, and our cache should
+            # always point at the latest (status-receiving) instance.
+            ref = getattr(trade.order, "orderRef", "") or ""
+            if ref.startswith(ORDER_REF_PREFIX):
+                self._canonical_idx[oid] = trade
+
             # ── place-RTT (one sample per orderId) ────────────────
             if oid not in self._rtt_captured_oids:
                 sent_ns = self._pending_rtt.pop(oid, None)
@@ -1912,6 +1954,28 @@ class QuoteManager:
                 if 0 <= amend_us < 5_000_000:
                     self._amend_us.append(amend_us)
                     self._note_cycle_amend_ack(oid, amend_us)
+        except Exception:
+            pass
+
+    def _on_order_status_evict(self, trade) -> None:
+        """Evict from _canonical_idx when an order enters a terminal
+        state. Counterpart to _on_open_order_ack's insert/replace.
+
+        Together these maintain the cache event-driven across the
+        session — _build_our_prices_index reads from it without
+        walking ib_insync's wrapper.trades dict (which only grows
+        over the session lifetime).
+
+        Tolerant of mis-matched event types (defensive — ib_insync
+        passes Trade for orderStatusEvent, but the API has been
+        slightly inconsistent across versions).
+        """
+        try:
+            status = getattr(getattr(trade, "orderStatus", None), "status", None)
+            if status is None:
+                return
+            if status in OrderStatus.DoneStates:
+                self._canonical_idx.pop(trade.order.orderId, None)
         except Exception:
             pass
 
@@ -2805,13 +2869,14 @@ class QuoteManager:
     def get_active_quotes(self) -> dict:
         """Return dict keyed by (strike, expiry, right, side) -> live quote info.
 
-        Refreshes the canonical-trade index up front so the per-order lookups
-        below are O(1) instead of O(N) per call. This is the snapshot writer's
-        4Hz hot path; without the refresh we'd walk openTrades once per
+        Touches _seed_canonical_idx to guarantee the index is populated on
+        first call. After that, the cache is event-driven and the
+        per-order lookups below are O(1). This is the snapshot writer's
+        4Hz hot path; without the cache we'd walk openTrades once per
         active order per snapshot (~50 × 200 = 10K iterations every 250ms).
         """
-        # Side-effect: populates self._canonical_idx that _canonical_trade reads.
-        self._build_our_prices_index()
+        # Idempotent — only does work the very first time.
+        self._seed_canonical_idx()
         quotes = {}
         for (strike, expiry, right, side), order_id in self.active_orders.items():
             trade = self._canonical_trade(order_id)
