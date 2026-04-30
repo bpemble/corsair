@@ -667,6 +667,18 @@ async def main():
         name="watchdog",
     )
 
+    # Diagnostic: detect synchronous blocks on the asyncio loop ≥ 50ms
+    # and capture the main-thread stack mid-block. Used to localize the
+    # per-cycle synchronous handler that's driving TTT p99 (snapshot
+    # build, SABR dispatch, ib_insync TCP burst processing, GC pauses,
+    # OS scheduler preemption all candidates). Disable via
+    # CORSAIR_LOOP_BLOCK_DISABLED=1 if a deeper py-spy session is preferred.
+    from .loop_block_detector import maybe_start as _start_block_detector
+    _block_detector = _start_block_detector(
+        asyncio.get_running_loop(),
+        jsonl_dir=getattr(csv_logger, "_paper_log_dir", "/app/logs-paper"),
+    )
+
     while not shutdown_event.is_set():
         now = datetime.now()
         now_utc = datetime.now(tz=timezone.utc)

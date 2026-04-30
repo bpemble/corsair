@@ -49,6 +49,13 @@ services:
       # v1.4 Stage 1 paper config. Flip to corsair_v2_config.yaml to
       # roll back to the v1.3 config (asymmetric scope, $200K cap).
       CORSAIR_CONFIG: "${CORSAIR_CONFIG:-config/hg_v1_4_paper.yaml}"
+      # Loop-block detector knobs (src/loop_block_detector.py). Override
+      # from the host shell to tune without a rebuild — e.g. set
+      # CORSAIR_LOOP_BLOCK_THRESHOLD_MS=20 for finer-grained capture, or
+      # CORSAIR_LOOP_BLOCK_DISABLED=1 to silence during a deep py-spy run.
+      CORSAIR_LOOP_BLOCK_THRESHOLD_MS: "${CORSAIR_LOOP_BLOCK_THRESHOLD_MS:-50}"
+      CORSAIR_LOOP_BLOCK_PING_MS: "${CORSAIR_LOOP_BLOCK_PING_MS:-10}"
+      CORSAIR_LOOP_BLOCK_DISABLED: "${CORSAIR_LOOP_BLOCK_DISABLED:-}"
     volumes:
       - ./logs:/app/logs
       - ./logs-paper:/app/logs-paper      # v1.4 §9.5 paper JSONL streams
