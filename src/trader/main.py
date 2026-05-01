@@ -930,6 +930,13 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # NOT using uvloop on the trader despite it being broker's loop.
+    # Tested 2026-05-01: uvloop produced WORSE SHM polling latency
+    # (TTT p50 0.47ms → 1.02ms). Default asyncio's `sleep(0)`
+    # semantics produce a tighter hot loop on the SHM consumer.
+    # Hypothesis: uvloop's libuv-based scheduler has slightly higher
+    # overhead per yield in this very-tight polling pattern, and/or
+    # gives more time to other tasks. Default selector loop wins.
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
