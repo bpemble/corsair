@@ -580,6 +580,26 @@ async def main():
     _session_start = _session_start_utc(datetime.now(tz=timezone.utc),
                                         reset_hour_ct_early)
 
+    # CRITICAL boot-order: load seen_exec_ids from daily_state BEFORE
+    # running replay_missed_executions. Otherwise replay sees an empty
+    # dedup set and re-processes every fill of the current session as
+    # new, double-counting them into fills_today / spread_capture /
+    # realized_pnl. 2026-05-01: this bug caused daily P&L to be
+    # restored as -$38K after every restart, persisting the loss
+    # forever (or until session rollover) and locking the system into
+    # daily_halt — even though daily_state.json had been manually reset.
+    _startup_session_day_early = _session_day(
+        datetime.now(tz=timezone.utc), reset_hour_ct_early)
+    _persisted_early = daily_state.load(_startup_session_day_early)
+    if _persisted_early is not None:
+        for eng in engines:
+            for eid in _persisted_early.get("seen_exec_ids", []):
+                eng["fills"]._seen_exec_ids.add(eid)
+        logger.info(
+            "Pre-replay seed: loaded %d seen_exec_ids from daily_state",
+            len(_persisted_early.get("seen_exec_ids", [])),
+        )
+
     # Replay and force-subscribe per engine. Each engine's replay sees only
     # its own product's fills (filtered in FillHandler via product_filter);
     # off-window position subscriptions use each engine's own market_data.

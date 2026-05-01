@@ -123,10 +123,14 @@ def decide(
     # parity tests still work; trader sets them via state.
     market_bid_size: Optional[int] = None,
     market_ask_size: Optional[int] = None,
-    min_bbo_size: int = 5,
+    min_bbo_size: int = 1,
     fit_forward: Optional[float] = None,
     current_forward: Optional[float] = None,
-    max_forward_drift_ticks: int = 20,
+    # Tuned 2026-05-01: futures forward moves continuously vs SABR
+    # refit cadence. 200 ticks = $0.10 of underlying drift before we
+    # bail. Below that, broker's surface refit (every ~60s) is the
+    # right cure. Above that, surface extrapolation is too suspect.
+    max_forward_drift_ticks: int = 200,
 ) -> dict:
     """Make a single (strike, expiry, right, side) quote decision.
 

@@ -66,8 +66,12 @@ kill_switch:
   # Either max_daily_loss (absolute) or daily_pnl_halt_pct (fraction of
   # capital) can be set; code prefers _pct when present and derives the
   # absolute threshold. Both here for explicitness.
-  max_daily_loss: -25000       # absolute $; = -5% × 500000
-  daily_pnl_halt_pct: 0.05     # fraction of capital
+  # TEMPORARY widen 2026-05-01: today's IBKR-tracked realized = -$38K
+  # from cut-over incidents. Threshold raised to -$50K to allow cut-over
+  # validation today; reverts at 22:00 UTC session rollover when IBKR's
+  # realized P&L resets. Restore to -25000 / 0.05 next session.
+  max_daily_loss: -50000       # was -25000
+  daily_pnl_halt_pct: 0.10     # was 0.05; doubled temporarily
   # Per-product thresholds.
   delta_kill: 5.0              # |net_delta| kill (v1.4 §6.2 unchanged)
   vega_kill: 0                 # disabled 2026-04-23 — was $500 per §6.2.

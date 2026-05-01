@@ -79,7 +79,10 @@ RISK_STATE_STALE_S = 5.0
 # BBO size requirement — paper IBKR matches against displayed depth
 # even when size is 1; refusing to quote into thin books eliminates
 # that vector. Override-able by env if a thinner-book product needs it.
-MIN_BBO_SIZE = int(os.environ.get("CORSAIR_TRADER_MIN_BBO_SIZE", "5"))
+# 2026-05-01: tightening from 5 → 1 after live test showed 5 was too
+# strict for HG options at the wings (legitimate 1-3 size books were
+# being rejected). 1 still blocks fully-empty-on-one-side states.
+MIN_BBO_SIZE = int(os.environ.get("CORSAIR_TRADER_MIN_BBO_SIZE", "1"))
 
 
 class TraderState:
