@@ -63,6 +63,14 @@ PLACES_ORDERS = os.environ.get("CORSAIR_TRADER_PLACES_ORDERS", "").strip() == "1
 STALENESS_INTERVAL_S = 0.10       # 10Hz scan
 STALENESS_TICKS = 1               # cancel when off-by-more-than 1 tick vs theo
 
+# Per-key place cooldown (cleanup pass 4, 2026-05-01). After the trader
+# sends a place_order for a (strike, expiry, right, side) key, refuse
+# to re-place at that key for COOLDOWN_NS nanoseconds. Bounds the
+# re-placement rate at ~4Hz/key under the current 250ms default; without
+# this, theo bouncing 1 tick on every option update produced ~80
+# places/sec total and pushed IPC p99 to 700-1900ms.
+COOLDOWN_NS = 250_000_000         # 250 ms
+
 # Cleanup pass 3 (2026-05-01) defensive constants. Trader will refuse
 # to quote outside this band of ATM strikes — wing extrapolation of
 # the SVI surface is least reliable there, and that's where the
@@ -192,6 +200,11 @@ class Trader:
         # tick-arrive → place_order-emit latency instead, reports via
         # telemetry. Bounded ring of recent samples.
         self.ttt_us: deque[int] = deque(maxlen=500)
+        # Per-key place cooldown timestamps (cleanup pass 4, 2026-05-01).
+        # Maps (strike, expiry, right, side) → time.monotonic_ns of last
+        # place attempt. Used to enforce COOLDOWN_NS between re-places.
+        self._last_place_ns: dict = {}
+
         # Phase 3: track our just-sent place_order requests so the
         # next tick on the same key doesn't churn-amend if the price
         # didn't change. Cleared on terminal order_ack so a Cancelled
@@ -377,6 +390,35 @@ class Trader:
                 existing = self._our_orders_by_key.get(key)
                 if existing is not None and existing.get("price") == d["price"]:
                     continue
+                # Per-key cooldown (cleanup pass 4, 2026-05-01): block
+                # re-placement at the same key within COOLDOWN_S of the
+                # last attempt, regardless of price change. Prevents the
+                # 80-places/sec churn that built up IPC backpressure to
+                # 700ms p99 — theo bouncing 1 tick was triggering re-
+                # placements every option update. With the existing
+                # 5s GTD as the natural order lifetime, 250ms cooldown
+                # bounds re-placement rate at 4Hz/key without losing
+                # responsiveness.
+                last_place_ns = self._last_place_ns.get(key, 0)
+                if (send_ns_now := time.monotonic_ns()) - last_place_ns < COOLDOWN_NS:
+                    self.decisions_made["skip_cooldown"] += 1
+                    continue
+                # NEW: dark-book ON-PLACE guard — re-check the latest
+                # tick state for this option. The decide_quote check
+                # used the ticks at decision time. The book may have
+                # gone dark while we were processing. Refuse if either
+                # side has zero size or zero price now.
+                latest_tick = self.state.options.get((float(strike), expiry, right))
+                if latest_tick:
+                    bid_now = latest_tick.get("bid")
+                    ask_now = latest_tick.get("ask")
+                    bsz = latest_tick.get("bid_size") or 0
+                    asz = latest_tick.get("ask_size") or 0
+                    if (not bid_now or bid_now <= 0 or
+                            not ask_now or ask_now <= 0 or
+                            bsz <= 0 or asz <= 0):
+                        self.decisions_made["skip_dark_at_place"] += 1
+                        continue
                 # Cleanup gap #2 — trader-side TTT instrumentation.
                 # Measure broker-tick-emit (wall clock) → trader-place-
                 # order-send (wall clock). Cross-process delta captures
@@ -405,6 +447,7 @@ class Trader:
                     "price": d["price"], "ts_ns": send_ns,
                     "orderId": None,  # filled in by first non-terminal order_ack
                 }
+                self._last_place_ns[key] = send_ns_now
 
     def _apply(self, msg: dict) -> None:
         t = msg.get("type")
@@ -559,6 +602,33 @@ class Trader:
                     # not yet acked — can't cancel something the broker
                     # doesn't know about yet. Wait for next cycle.
                     continue
+                # NEW (cleanup pass 4): dark-book ON-REST guard. Cancel
+                # if the latest tick state shows the underlying market
+                # has gone one-sided / dark / size-zero. The decide_quote
+                # check ran at decision time only; this catches markets
+                # that thinned out *while* our order was resting — which
+                # is exactly when paper-IBKR's matching sweeps resting
+                # orders for adverse fills (2026-05-01 15:06 burst:
+                # 17 fills in 11 seconds, all at bid=0/ask=0).
+                latest = self.state.options.get((strike, expiry, right))
+                if latest:
+                    bid_now = latest.get("bid")
+                    ask_now = latest.get("ask")
+                    bsz = latest.get("bid_size") or 0
+                    asz = latest.get("ask_size") or 0
+                    market_dark = (
+                        not bid_now or bid_now <= 0
+                        or not ask_now or ask_now <= 0
+                        or bsz <= 0 or asz <= 0
+                    )
+                    if market_dark:
+                        self._cancel_stale_order(
+                            order_id, key, order_price, 0.0, 0.0,
+                        )
+                        self.decisions_made["staleness_cancel_dark"] = (
+                            self.decisions_made.get("staleness_cancel_dark", 0) + 1
+                        )
+                        continue
                 # Pick vol surface for this option's right; fall back to
                 # the other side during bootstrap.
                 vp_msg = (
