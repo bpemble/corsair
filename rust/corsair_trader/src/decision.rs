@@ -48,6 +48,14 @@ impl Side {
             Side::Sell => "SELL",
         }
     }
+    /// Compact single-char encoding for HashMap keys ('B'/'S').
+    /// Saves one heap allocation per key vs the String form.
+    pub fn as_char(self) -> char {
+        match self {
+            Side::Buy => 'B',
+            Side::Sell => 'S',
+        }
+    }
 }
 
 /// Top-level decision entry point. Mirrors `_decide_on_tick` flow
@@ -102,12 +110,13 @@ pub fn decide_on_tick(
         return out;
     }
 
-    // Vol surface lookup: try (expiry, right) then either side.
+    // Vol surface lookup: try (expiry, right_char) then either side.
+    let r_char = right.chars().next().unwrap_or('C').to_ascii_uppercase();
     let vp_msg = state
         .vol_surfaces
-        .get(&(expiry.clone(), right.clone()))
-        .or_else(|| state.vol_surfaces.get(&(expiry.clone(), "C".to_string())))
-        .or_else(|| state.vol_surfaces.get(&(expiry.clone(), "P".to_string())));
+        .get(&(expiry.clone(), r_char))
+        .or_else(|| state.vol_surfaces.get(&(expiry.clone(), 'C')))
+        .or_else(|| state.vol_surfaces.get(&(expiry.clone(), 'P')));
     let vp_msg = match vp_msg {
         Some(v) => v.clone(),
         None => {
@@ -132,8 +141,8 @@ pub fn decide_on_tick(
 
     // Pre-compute theo once per tick (side-independent within a right).
     // BUT theo IS right-dependent (calls and puts have different prices
-    // even at the same iv). Pass the option's right.
-    let r_char = right.chars().next().unwrap_or('C').to_ascii_uppercase();
+    // even at the same iv). Pass the option's right (already computed
+    // above as r_char for the vol_surfaces key).
     let (iv, theo) = match compute_theo(fit_forward, strike, tte, r_char, &vp_msg.params) {
         Some(v) => v,
         None => {
@@ -230,11 +239,14 @@ pub fn decide_on_tick(
             _ => {}
         }
 
+        // Compact key: strike-bits + expiry (one String) + right-char +
+        // side-char. Saves 2 String allocations per key construction
+        // vs the previous all-strings form.
         let key = (
             TraderState::strike_key(strike),
             expiry.clone(),
-            right.clone(),
-            side.as_str().to_string(),
+            r_char,
+            side.as_char(),
         );
 
         // Dead-band + GTD-refresh check.
@@ -376,21 +388,7 @@ pub fn compute_theo(
 }
 
 /// Convert a YYYYMMDD expiry string to time-to-expiry in years.
-/// 16:00 CT = 21:00 UTC settlement. Mirrors Python's
-/// `time_to_expiry_years` in src/sabr.py.
-pub fn time_to_expiry_years(expiry: &str) -> Option<f64> {
-    if expiry.len() != 8 {
-        return None;
-    }
-    let year: i32 = expiry[0..4].parse().ok()?;
-    let month: u32 = expiry[4..6].parse().ok()?;
-    let day: u32 = expiry[6..8].parse().ok()?;
-    let exp_dt = chrono::Utc
-        .with_ymd_and_hms(year, month, day, 21, 0, 0)
-        .single()?;
-    let now = chrono::Utc::now();
-    let secs = (exp_dt - now).num_seconds() as f64;
-    Some(secs / (365.0 * 24.0 * 3600.0))
-}
-
-use chrono::TimeZone;
+/// 16:00 CT = 21:00 UTC settlement. Caches the parsed expiry
+/// datetime per-thread (see tte_cache module) to skip repeated
+/// chrono parsing on every tick.
+pub use crate::tte_cache::time_to_expiry_years;

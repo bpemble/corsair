@@ -18,6 +18,7 @@ mod jsonl;
 mod messages;
 mod pricing;
 mod state;
+mod tte_cache;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -300,8 +301,11 @@ fn process_event(
                 Ok(t) => t,
                 Err(_) => return,
             };
+            // Side comes as "C"/"P"; intern as char for the map key
+            // to avoid an allocation per lookup later.
+            let side_char = vs.side.chars().next().unwrap_or('C').to_ascii_uppercase();
             state.lock().unwrap().vol_surfaces.insert(
-                (vs.expiry.clone(), vs.side.clone()),
+                (vs.expiry, side_char),
                 crate::state::VolSurfaceEntry {
                     forward: vs.forward,
                     params: vs.params,
@@ -323,11 +327,17 @@ fn process_event(
                 Ok(t) => t,
                 Err(_) => return,
             };
+            let r_char = p.right.chars().next().unwrap_or('C').to_ascii_uppercase();
+            let s_char = match p.side.as_str() {
+                "BUY" => 'B',
+                "SELL" => 'S',
+                _ => return,
+            };
             let key = (
                 TraderState::strike_key(p.strike),
-                p.expiry.clone(),
-                p.right.clone(),
-                p.side.clone(),
+                p.expiry,
+                r_char,
+                s_char,
             );
             let mut s = state.lock().unwrap();
             if let Some(o) = s.our_orders.get_mut(&key) {
@@ -427,9 +437,22 @@ fn on_tick(
     let (decisions, forward) = {
         let mut s = state.lock().unwrap();
         let mut c = counters.lock().unwrap();
-        let key = (TraderState::strike_key(tick.strike),
-                   tick.expiry.clone(), tick.right.clone());
-        s.options.insert(key, tick.clone());
+        let r_char = tick.right.chars().next().unwrap_or('C').to_ascii_uppercase();
+        // Slim option-state insert. NO TickMsg clone (saves 2 String
+        // allocs); key built with right-as-char (saves 1 alloc); value
+        // is OptionState (8 fields, all stack/Copy types).
+        let opt_state = crate::state::OptionState {
+            strike: tick.strike,
+            bid: tick.bid,
+            ask: tick.ask,
+            bid_size: tick.bid_size,
+            ask_size: tick.ask_size,
+            ts_ns: tick.ts_ns,
+        };
+        s.options.insert(
+            (TraderState::strike_key(tick.strike), tick.expiry.clone(), r_char),
+            opt_state,
+        );
         let forward = s.underlying_price;
         let decisions = decide_on_tick(&mut s, &mut c, tick, now_mono);
 
@@ -478,8 +501,9 @@ fn on_tick(
     // Then take the locks just once each at the end. Reduces contention
     // with staleness/telemetry tasks.
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(decisions.len() * 2);
-    let mut places_to_track: Vec<((u64, String, String, String), OurOrder, Option<i64>)> =
+    let mut places_to_track: Vec<((u64, String, char, char), OurOrder, Option<i64>)> =
         Vec::with_capacity(decisions.len());
+    let r_char_for_track = tick.right.chars().next().unwrap_or('C').to_ascii_uppercase();
     for d in decisions {
         if let Decision::Place { side, price, cancel_old_oid } = d {
             if let Some(oid) = cancel_old_oid {
@@ -507,8 +531,8 @@ fn on_tick(
                 frames.push(ipc::protocol::pack_frame(&body));
             }
             let okey = (TraderState::strike_key(tick.strike),
-                        tick.expiry.clone(), tick.right.clone(),
-                        side.as_str().to_string());
+                        tick.expiry.clone(), r_char_for_track,
+                        side.as_char());
             places_to_track.push((
                 okey,
                 OurOrder {
@@ -558,7 +582,7 @@ fn staleness_check(
     // forward + vol_surface. Cancel if order is too far off.
     struct ToCancel {
         order_id: i64,
-        key: (u64, String, String, String),
+        key: (u64, String, char, char),
         reason_dark: bool,
     }
     let mut cancels: Vec<ToCancel> = Vec::new();
@@ -574,20 +598,19 @@ fn staleness_check(
             };
             let strike = f64::from_bits(key.0);
             let expiry = &key.1;
-            let right = &key.2;
-            let side = &key.3;
+            let r_char = key.2;
+            let s_char = key.3;
 
             // Look up vol surface for this option.
             let vp = s
                 .vol_surfaces
-                .get(&(expiry.clone(), right.clone()))
-                .or_else(|| s.vol_surfaces.get(&(expiry.clone(), "C".to_string())))
-                .or_else(|| s.vol_surfaces.get(&(expiry.clone(), "P".to_string())));
+                .get(&(expiry.clone(), r_char))
+                .or_else(|| s.vol_surfaces.get(&(expiry.clone(), 'C')))
+                .or_else(|| s.vol_surfaces.get(&(expiry.clone(), 'P')));
             let vp = match vp {
                 Some(v) => v,
                 None => continue,
             };
-            let r_char = right.chars().next().unwrap_or('C').to_ascii_uppercase();
             let tte = match time_to_expiry_years(expiry) {
                 Some(t) if t > 0.0 => t,
                 _ => continue,
@@ -602,7 +625,7 @@ fn staleness_check(
             // Stale if our price is too unfavorable vs current theo.
             // BUY: bad when we'd pay above theo (price > theo).
             // SELL: bad when we'd sell below theo (price < theo).
-            let drift = if side == "BUY" {
+            let drift = if s_char == 'B' {
                 order.price - theo
             } else {
                 theo - order.price
@@ -618,7 +641,7 @@ fn staleness_check(
 
             // Dark-book ON-REST guard (mirror Python). Cancel if
             // latest tick state for this contract has gone dark.
-            let opt_key = (key.0, expiry.clone(), right.clone());
+            let opt_key = (key.0, expiry.clone(), r_char);
             if let Some(latest) = s.options.get(&opt_key) {
                 let bid_alive = matches!(latest.bid, Some(b) if b > 0.0);
                 let ask_alive = matches!(latest.ask, Some(a) if a > 0.0);

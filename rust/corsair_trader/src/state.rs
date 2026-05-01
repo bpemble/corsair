@@ -1,9 +1,23 @@
 //! Trader state. Mirrors src/trader/main.py's TraderState dataclass.
 //! Lives entirely in one struct so the hot-path can pass &mut self.
 
-use crate::messages::{TickMsg, VolParams};
+use crate::messages::VolParams;
 use ahash::AHashMap;
 use std::collections::VecDeque;
+
+/// Slim option state cached per (strike, expiry, right). Drops the
+/// expiry/right strings that the TickMsg carries (they're already in
+/// the key tuple); avoids one heap allocation per tick. Also avoids
+/// pulling the message-type string into the hot path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OptionState {
+    pub strike: f64,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub bid_size: Option<i32>,
+    pub ask_size: Option<i32>,
+    pub ts_ns: Option<u64>,
+}
 
 #[derive(Debug, Clone)]
 pub struct VolSurfaceEntry {
@@ -21,20 +35,24 @@ pub struct OurOrder {
 }
 
 pub struct TraderState {
-    /// Latest tick per (strike, expiry, right). Bounded by quoted strikes.
-    pub options: AHashMap<(u64, String, String), TickMsg>,
+    /// Latest tick per (strike-bits, expiry, right-char). Stores the
+    /// slim OptionState (no redundant strings). Bounded by quoted
+    /// strikes (≤60 in production).
+    pub options: AHashMap<(u64, String, char), OptionState>,
 
-    /// Vol surface params per (expiry, side). Bounded by ~4 entries.
-    pub vol_surfaces: AHashMap<(String, String), VolSurfaceEntry>,
+    /// Vol surface params per (expiry, right-char). Bounded by ~4 entries.
+    pub vol_surfaces: AHashMap<(String, char), VolSurfaceEntry>,
 
     /// Underlying spot. Updated from underlying_tick.
     pub underlying_price: f64,
 
-    /// Resting orders we've placed, keyed by (strike, expiry, right, side).
-    pub our_orders: AHashMap<(u64, String, String, String), OurOrder>,
+    /// Resting orders we've placed, keyed by
+    /// (strike-bits, expiry, right-char, side-char).
+    /// side-char: 'B' for BUY, 'S' for SELL.
+    pub our_orders: AHashMap<(u64, String, char, char), OurOrder>,
 
     /// orderId → key reverse map, for terminal-status cleanup.
-    pub orderid_to_key: AHashMap<i64, (u64, String, String, String)>,
+    pub orderid_to_key: AHashMap<i64, (u64, String, char, char)>,
 
     /// Trader-side risk state from broker (1Hz publish).
     pub risk_effective_delta: Option<f64>,
