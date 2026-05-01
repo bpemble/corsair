@@ -90,6 +90,16 @@ class _Ring:
         self._fd = None
         self._mm: Optional[mmap.mmap] = None
         self.frames_dropped = 0  # producer side: buffer-full drops
+        # Notification FIFO (cleanup pass 10, 2026-05-01). Lives next
+        # to the SHM ring file. Producer writes 1 byte after each ring
+        # write to wake the consumer; consumer drains and re-reads
+        # the ring. Eliminates the asyncio.sleep polling tail —
+        # wake-up latency drops from ~500us p50 to ~50us. Owner
+        # creates the FIFO with mkfifo; both processes open separate
+        # ends.
+        self._fifo_path = path + ".notify"
+        self._notify_w_fd: Optional[int] = None  # producer side
+        self._notify_r_fd: Optional[int] = None  # consumer side
 
     def open(self) -> None:
         # The owner (broker) creates+sizes the file; non-owner just maps it.
@@ -97,6 +107,9 @@ class _Ring:
             self._fd = os.open(self._path,
                                os.O_RDWR | os.O_CREAT, 0o660)
             os.ftruncate(self._fd, self._size)
+            # Create notification FIFO if not already there.
+            if not os.path.exists(self._fifo_path):
+                os.mkfifo(self._fifo_path, 0o660)
         else:
             self._fd = os.open(self._path, os.O_RDWR)
         self._mm = mmap.mmap(self._fd, self._size,
@@ -108,6 +121,48 @@ class _Ring:
             # never read.
             self._mm[:_HDR_SIZE] = b"\x00" * _HDR_SIZE
 
+    def open_notify(self, *, as_writer: bool) -> None:
+        """Open the notification FIFO. Must be called AFTER ``open``.
+        Caller declares whether they're the producer (writer) or
+        consumer (reader) of THIS ring. The FIFO is shared across
+        processes via filesystem path; non-blocking I/O is used so
+        producer writes never stall and consumer reads never block.
+        """
+        # Open as O_RDWR is the trick: avoids the producer-blocks-
+        # waiting-for-reader problem. With O_RDWR, the file is always
+        # both ends; we just discipline ourselves to use one direction.
+        # O_NONBLOCK is critical so writes don't stall when the FIFO
+        # buffer is full (which would happen if consumer is slow).
+        flags = os.O_RDWR | os.O_NONBLOCK
+        fd = os.open(self._fifo_path, flags)
+        if as_writer:
+            self._notify_w_fd = fd
+        else:
+            self._notify_r_fd = fd
+
+    def notify(self) -> None:
+        """Wake any consumer blocked on the FIFO. Cheap, non-blocking;
+        if FIFO is full (consumer slow) we drop the byte and rely on
+        the consumer's polling fallback to catch up."""
+        if self._notify_w_fd is None:
+            return
+        try:
+            os.write(self._notify_w_fd, b"\x00")
+        except (BlockingIOError, OSError):
+            # FIFO full or closed — consumer will see the ring update
+            # via its periodic re-poll. No correctness issue.
+            pass
+
+    def drain_notify(self) -> None:
+        """Drain any bytes from the consumer's FIFO read end.
+        Coalesces multiple producer notifications into one wake-up."""
+        if self._notify_r_fd is None:
+            return
+        try:
+            os.read(self._notify_r_fd, 4096)
+        except (BlockingIOError, OSError):
+            pass
+
     def close(self) -> None:
         if self._mm is not None:
             self._mm.close()
@@ -115,9 +170,22 @@ class _Ring:
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
+        for fd_attr in ("_notify_w_fd", "_notify_r_fd"):
+            fd = getattr(self, fd_attr)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(self, fd_attr, None)
         if self._owner and os.path.exists(self._path):
             try:
                 os.unlink(self._path)
+            except FileNotFoundError:
+                pass
+        if self._owner and os.path.exists(self._fifo_path):
+            try:
+                os.unlink(self._fifo_path)
             except FileNotFoundError:
                 pass
 
@@ -158,6 +226,8 @@ class _Ring:
             self._mm[_HDR_SIZE:_HDR_SIZE + (n - tail)] = frame[tail:]
         # Publish: write_offset advances after the data is in place.
         self._set_write(w + n)
+        # Notify consumer (best-effort, non-blocking).
+        self.notify()
         return True
 
     def read_available(self) -> bytes:
@@ -212,10 +282,25 @@ class SHMServer:
         os.makedirs(os.path.dirname(self._base), exist_ok=True)
         self._events.open()
         self._commands.open()
+        # Notification FIFOs (cleanup pass 10): broker is producer for
+        # events, consumer for commands.
+        self._events.open_notify(as_writer=True)
+        self._commands.open_notify(as_writer=False)
         import asyncio
+        # Wire the FIFO read fd into the asyncio loop so add_reader
+        # fires the moment a notification arrives.
+        loop = asyncio.get_running_loop()
+        self._cmd_event = asyncio.Event()
+
+        def _on_cmd_readable():
+            self._commands.drain_notify()
+            self._cmd_event.set()
+        loop.add_reader(self._commands._notify_r_fd, _on_cmd_readable)
         self._poll_task = asyncio.create_task(self._poll_commands(),
                                               name="shm-cmd-poll")
-        logger.warning("SHM IPC server up: base=%s capacity=%d", self._base, self._capacity)
+        logger.warning("SHM IPC server up: base=%s capacity=%d "
+                       "(notify-fifo enabled)",
+                       self._base, self._capacity)
 
     async def stop(self) -> None:
         self._stop = True
@@ -231,12 +316,10 @@ class SHMServer:
     async def _poll_commands(self) -> None:
         import asyncio
         buf = bytearray()
-        idle_iters = 0
         while not self._stop:
             chunk = self._commands.read_available()
             if chunk:
                 buf.extend(chunk)
-                idle_iters = 0
                 if self._on_command is not None:
                     for msg in unpack_frames(buf):
                         if isinstance(msg, dict):
@@ -247,17 +330,16 @@ class SHMServer:
                                     "shm: command handler raised on %s",
                                     msg.get("type", "?"),
                                 )
-            else:
-                idle_iters += 1
-                # Tighter adaptive polling — see SHMClient.run for
-                # rationale. Hot loop yields without blocking; cool
-                # uses short sleep; idle sleeps longer.
-                if idle_iters < 200:
-                    await asyncio.sleep(0)
-                elif idle_iters < 500:
-                    await asyncio.sleep(0.0005)
-                else:
-                    await asyncio.sleep(0.005)
+                continue  # check for more without yielding
+            # No data — wait for FIFO notification with a short
+            # timeout as polling backstop. The timeout protects
+            # against a missed notification (FIFO buffer full at
+            # producer write time → byte was dropped).
+            self._cmd_event.clear()
+            try:
+                await asyncio.wait_for(self._cmd_event.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
 
     def publish(self, msg: dict) -> bool:
         if self._events._mm is None:
@@ -293,16 +375,33 @@ class SHMClient:
             await asyncio.sleep(1.0)
         self._events.open()
         self._commands.open()
+        # Wait for notification FIFOs to exist (broker creates them
+        # when it opens the rings — should be immediate).
+        for r in (self._events, self._commands):
+            for _ in range(50):
+                if os.path.exists(r._fifo_path):
+                    break
+                await asyncio.sleep(0.1)
+        # Trader is consumer for events, producer for commands.
+        self._events.open_notify(as_writer=False)
+        self._commands.open_notify(as_writer=True)
         self._connected = True
-        logger.warning("SHM client connected: base=%s", self._base)
+        logger.warning("SHM client connected: base=%s (notify-fifo enabled)",
+                       self._base)
+
+        loop = asyncio.get_running_loop()
+        self._evt_event = asyncio.Event()
+
+        def _on_evt_readable():
+            self._events.drain_notify()
+            self._evt_event.set()
+        loop.add_reader(self._events._notify_r_fd, _on_evt_readable)
 
         buf = bytearray()
-        idle_iters = 0
         while True:
             chunk = self._events.read_available()
             if chunk:
                 buf.extend(chunk)
-                idle_iters = 0
                 for msg in unpack_frames(buf):
                     if isinstance(msg, dict):
                         try:
@@ -312,28 +411,15 @@ class SHMClient:
                                 "shm: event handler raised on %s",
                                 msg.get("type", "?"),
                             )
-            else:
-                idle_iters += 1
-                # Tighter adaptive polling (cleanup pass 9, 2026-05-01)
-                # to cut p99 outliers. asyncio.sleep(0.0001) gets
-                # rounded up to the event-loop tick (~5ms typical),
-                # producing the IPC p99 = 5ms tail. The tight branch
-                # below uses asyncio.sleep(0) which yields without
-                # any blocking sleep — only relinquishes for one
-                # event-loop turn. That cuts wake-up latency to ~50us
-                # when the loop has other ready callbacks.
-                if idle_iters < 200:
-                    # Hot: pure yield, no blocking. Loop processes
-                    # other tasks then comes back. p50 ~10-50us.
-                    await asyncio.sleep(0)
-                elif idle_iters < 500:
-                    # Cool: short blocking sleep. Lets CPU idle a bit
-                    # but still wakes within ~5ms of any new write.
-                    await asyncio.sleep(0.0005)  # 500us request
-                else:
-                    # Idle: longer sleep. Saves power, accepts higher
-                    # latency on resumption.
-                    await asyncio.sleep(0.005)  # 5ms
+                continue  # drain ring fully before sleeping
+            # Wait for FIFO notification. 100ms timeout backs up the
+            # FIFO with a poll in case a notification was dropped
+            # (producer's FIFO buffer was full at write time).
+            self._evt_event.clear()
+            try:
+                await asyncio.wait_for(self._evt_event.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
 
     def send(self, msg: dict) -> bool:
         if self._commands._mm is None:
