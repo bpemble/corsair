@@ -11,6 +11,8 @@
 // quadratic interpolation, with the standard mflag five-condition
 // fallback to bisection).
 
+mod calibrate;
+
 use pyo3::prelude::*;
 use statrs::distribution::{ContinuousCDF, Normal};
 
@@ -155,7 +157,7 @@ fn brent<F: Fn(f64) -> f64>(f: &F, mut a: f64, mut b: f64, xtol: f64, max_iter: 
 /// SVI raw total variance: w(k) = a + b * (rho * (k - m) + sqrt((k - m)^2 + sigma^2))
 /// where k = log(K/F). Mirrors src/sabr.py:svi_total_variance for parity.
 #[inline(always)]
-fn svi_total_variance_inner(k: f64, a: f64, b: f64, rho: f64, m: f64, sigma: f64) -> f64 {
+pub(crate) fn svi_total_variance_inner(k: f64, a: f64, b: f64, rho: f64, m: f64, sigma: f64) -> f64 {
     let dk = k - m;
     a + b * (rho * dk + (dk * dk + sigma * sigma).sqrt())
 }
@@ -183,7 +185,7 @@ fn svi_implied_vol(
 
 /// |F-K| < 1e-7 * F (matches the Python `eps = 1e-7` branch).
 #[pyfunction]
-fn sabr_implied_vol(
+pub(crate) fn sabr_implied_vol(
     f: f64, k: f64, t: f64,
     alpha: f64, beta: f64, rho: f64, nu: f64,
 ) -> f64 {
@@ -381,6 +383,75 @@ fn decide_quote(
     Ok(dict.into())
 }
 
+/// Calibrate SABR (alpha, rho, nu) given fixed beta. Mirrors
+/// src/sabr.py:calibrate_sabr.
+///
+/// Returns a dict with keys (alpha, beta, rho, nu, rmse, n_points)
+/// on success, None when n < 3, T/F invalid, all initial guesses
+/// diverge, or the best RMSE exceeds max_rmse.
+#[pyfunction]
+#[pyo3(signature = (forward, tte, strikes, market_ivs,
+                    beta=0.5, max_rmse=0.03, weights=None))]
+fn calibrate_sabr(
+    py: Python<'_>,
+    forward: f64,
+    tte: f64,
+    strikes: Vec<f64>,
+    market_ivs: Vec<f64>,
+    beta: f64,
+    max_rmse: f64,
+    weights: Option<Vec<f64>>,
+) -> PyResult<Option<PyObject>> {
+    let w_ref = weights.as_deref();
+    let fit = calibrate::calibrate_sabr(
+        forward, tte, &strikes, &market_ivs, w_ref, beta, max_rmse,
+    );
+    match fit {
+        None => Ok(None),
+        Some(p) => {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("alpha", p.alpha)?;
+            dict.set_item("beta", p.beta)?;
+            dict.set_item("rho", p.rho)?;
+            dict.set_item("nu", p.nu)?;
+            dict.set_item("rmse", p.rmse)?;
+            dict.set_item("n_points", p.n_points)?;
+            Ok(Some(dict.into()))
+        }
+    }
+}
+
+/// Calibrate SVI (a, b, rho, m, sigma). Mirrors src/sabr.py:calibrate_svi.
+#[pyfunction]
+#[pyo3(signature = (forward, tte, strikes, market_ivs,
+                    max_rmse=0.03, weights=None))]
+fn calibrate_svi(
+    py: Python<'_>,
+    forward: f64,
+    tte: f64,
+    strikes: Vec<f64>,
+    market_ivs: Vec<f64>,
+    max_rmse: f64,
+    weights: Option<Vec<f64>>,
+) -> PyResult<Option<PyObject>> {
+    let w_ref = weights.as_deref();
+    let fit = calibrate::calibrate_svi(forward, tte, &strikes, &market_ivs, w_ref, max_rmse);
+    match fit {
+        None => Ok(None),
+        Some(p) => {
+            let dict = pyo3::types::PyDict::new_bound(py);
+            dict.set_item("a", p.a)?;
+            dict.set_item("b", p.b)?;
+            dict.set_item("rho", p.rho)?;
+            dict.set_item("m", p.m)?;
+            dict.set_item("sigma", p.sigma)?;
+            dict.set_item("rmse", p.rmse)?;
+            dict.set_item("n_points", p.n_points)?;
+            Ok(Some(dict.into()))
+        }
+    }
+}
+
 #[pymodule]
 fn corsair_pricing(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(black76_price, m)?)?;
@@ -388,5 +459,7 @@ fn corsair_pricing(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sabr_implied_vol, m)?)?;
     m.add_function(wrap_pyfunction!(svi_implied_vol, m)?)?;
     m.add_function(wrap_pyfunction!(decide_quote, m)?)?;
+    m.add_function(wrap_pyfunction!(calibrate_sabr, m)?)?;
+    m.add_function(wrap_pyfunction!(calibrate_svi, m)?)?;
     Ok(())
 }
