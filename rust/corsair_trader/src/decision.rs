@@ -392,3 +392,173 @@ pub fn compute_theo(
 /// datetime per-thread (see tte_cache module) to skip repeated
 /// chrono parsing on every tick.
 pub use crate::tte_cache::time_to_expiry_years;
+
+#[cfg(test)]
+mod tests {
+    //! Decision-flow tests. Mirror inputs from
+    //! `tests/test_decide_quote.py` so behavioral parity is
+    //! verifiable across Rust and Python.
+
+    use super::*;
+    use crate::messages::{TickMsg, VolParams};
+    use crate::state::{DecisionCounters, TraderState, VolSurfaceEntry};
+
+    fn fresh_state(forward: f64) -> TraderState {
+        let mut s = TraderState::new();
+        s.underlying_price = forward;
+        // Pretend risk_state has arrived (otherwise gate fail-closes).
+        s.risk_effective_delta = Some(0.0);
+        s.risk_margin_pct = Some(0.0);
+        s.risk_state_age_monotonic_ns = 1;
+        s
+    }
+
+    fn install_svi_surface(state: &mut TraderState, expiry: &str, side: char) {
+        state.vol_surfaces.insert(
+            (expiry.to_string(), side),
+            VolSurfaceEntry {
+                forward: 6.0,
+                params: VolParams {
+                    model: "svi".to_string(),
+                    a: Some(0.005),
+                    b: Some(0.05),
+                    rho: Some(-0.3),
+                    m: Some(0.0),
+                    sigma: Some(0.1),
+                    alpha: None,
+                    beta: None,
+                    nu: None,
+                },
+            },
+        );
+    }
+
+    fn make_tick(strike: f64, expiry: &str, right: &str,
+                 bid: f64, ask: f64) -> TickMsg {
+        TickMsg {
+            strike,
+            expiry: expiry.to_string(),
+            right: right.to_string(),
+            bid: Some(bid),
+            ask: Some(ask),
+            bid_size: Some(10),
+            ask_size: Some(10),
+            ts_ns: Some(1),
+        }
+    }
+
+    #[test]
+    fn no_vol_surface_skips() {
+        let mut state = fresh_state(6.0);
+        let mut counters = DecisionCounters::default();
+        let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert!(counters.skip_no_vol_surface > 0);
+    }
+
+    #[test]
+    fn off_atm_skips() {
+        let mut state = fresh_state(6.0);
+        install_svi_surface(&mut state, "20260526", 'C');
+        let mut counters = DecisionCounters::default();
+        let tick = make_tick(7.0, "20260526", "C", 0.01, 0.02);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert_eq!(counters.skip_off_atm, 1);
+    }
+
+    #[test]
+    fn itm_call_skips() {
+        let mut state = fresh_state(6.0);
+        install_svi_surface(&mut state, "20260526", 'C');
+        let mut counters = DecisionCounters::default();
+        let tick = make_tick(5.85, "20260526", "C", 0.20, 0.22);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert_eq!(counters.skip_itm, 1);
+    }
+
+    #[test]
+    fn itm_put_skips() {
+        let mut state = fresh_state(6.0);
+        install_svi_surface(&mut state, "20260526", 'P');
+        let mut counters = DecisionCounters::default();
+        let tick = make_tick(6.15, "20260526", "P", 0.20, 0.22);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert_eq!(counters.skip_itm, 1);
+    }
+
+    #[test]
+    fn dark_book_skips_both_sides() {
+        let mut state = fresh_state(6.0);
+        install_svi_surface(&mut state, "20260526", 'C');
+        let mut counters = DecisionCounters::default();
+        let mut tick = make_tick(6.0, "20260526", "C", 0.0, 0.10);
+        tick.bid = Some(0.0);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert_eq!(counters.skip_one_sided_or_dark, 2);
+    }
+
+    #[test]
+    fn thin_book_skips() {
+        let mut state = fresh_state(6.0);
+        install_svi_surface(&mut state, "20260526", 'C');
+        let mut counters = DecisionCounters::default();
+        let mut tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
+        tick.bid_size = Some(0);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert_eq!(counters.skip_thin_book, 2);
+    }
+
+    #[test]
+    fn risk_state_unknown_blocks_all() {
+        let mut state = TraderState::new();
+        state.underlying_price = 6.0;
+        // risk_effective_delta is None → fail-closed.
+        install_svi_surface(&mut state, "20260526", 'C');
+        let mut counters = DecisionCounters::default();
+        let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert_eq!(counters.risk_block, 2);
+    }
+
+    #[test]
+    fn delta_kill_blocks_all() {
+        let mut state = fresh_state(6.0);
+        state.delta_kill = 5.0;
+        state.risk_effective_delta = Some(5.0);
+        install_svi_surface(&mut state, "20260526", 'C');
+        let mut counters = DecisionCounters::default();
+        let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert_eq!(counters.risk_block, 2);
+    }
+
+    #[test]
+    fn weekend_pause_blocks() {
+        let mut state = fresh_state(6.0);
+        state.weekend_paused = true;
+        install_svi_surface(&mut state, "20260526", 'C');
+        let mut counters = DecisionCounters::default();
+        let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn kill_state_blocks() {
+        let mut state = fresh_state(6.0);
+        state.kills.insert("daily_halt".to_string(), "test".to_string());
+        install_svi_surface(&mut state, "20260526", 'C');
+        let mut counters = DecisionCounters::default();
+        let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        assert!(decisions.is_empty());
+    }
+}
