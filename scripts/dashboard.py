@@ -196,13 +196,31 @@ if snapshot is not None:
     # it's not surfaced on the dashboard — places happen rarely (only on
     # GTD expiry or after a fill) and have a structurally higher floor
     # because IBKR runs full validation/routing on a fresh order.
-    rtt = (lat.get("amend_us") or {})
+    # RTT preference: amend (modify→ack) is the steady-state metric in
+    # broker-quoting mode. During cut-over (CORSAIR_TRADER_PLACES_ORDERS=1)
+    # the broker doesn't amend its own orders, so amend_us is empty; in
+    # that case fall back to place_rtt_us (placeOrder→ack), which is
+    # what's actually exercised when the trader is sending orders.
+    amend = (lat.get("amend_us") or {})
+    place_rtt = (lat.get("place_rtt_us") or {})
+    if (amend.get("n") or 0) > 0:
+        rtt = amend
+        rtt_label = "RTT"
+        rtt_kind = "modify→ack"
+    elif (place_rtt.get("n") or 0) > 0:
+        rtt = place_rtt
+        rtt_label = "RTT"
+        rtt_kind = "place→ack (cut-over)"
+    else:
+        rtt = {}
+        rtt_label = "RTT"
+        rtt_kind = "no samples"
     ttt_p50 = _fmt_us(ttt.get("p50")); ttt_p99 = _fmt_us(ttt.get("p99"))
     rtt_p50 = _fmt_us(rtt.get("p50")); rtt_p99 = _fmt_us(rtt.get("p99"))
     latency_pill = (
-        f'<span class="latency-pill" title="rolling p50/p99 — TTT (tick→placeOrder) samples: {ttt.get("n",0)}, RTT (modify→ack) samples: {rtt.get("n",0)}">'
+        f'<span class="latency-pill" title="rolling p50/p99 — TTT (tick→placeOrder) samples: {ttt.get("n",0)}, RTT ({rtt_kind}) samples: {rtt.get("n",0)}">'
         f'<span class="lat-row"><span class="lat-key">TTT</span>{ttt_p50} / {ttt_p99}</span>'
-        f'<span class="lat-row"><span class="lat-key">RTT</span>{rtt_p50} / {rtt_p99}</span>'
+        f'<span class="lat-row"><span class="lat-key">{rtt_label}</span>{rtt_p50} / {rtt_p99}</span>'
         f'</span>'
     )
 

@@ -1324,6 +1324,19 @@ class MarketDataManager:
         # visible non-self market on that side).
         bid = self._last_clean_bid.get(key, 0.0)
         ask = self._last_clean_ask.get(key, 0.0)
+        # Cut-over fallback (cleanup pass 5, 2026-05-01): broker's
+        # find_incumbent never runs when the trader owns order flow,
+        # so the clean cache stays empty forever and fills/snapshots
+        # always show bid=0/ask=0 — the user-visible "no BBO data in
+        # Discord" complaint. When the cache misses, fall back to the
+        # raw L1 from the option object. There's no self-order to
+        # subtract because broker isn't placing; trader's orders are
+        # accounted in chains.our_orders separately.
+        if bid <= 0 and ask <= 0:
+            raw_bid = float(getattr(opt, "bid", 0) or 0)
+            raw_ask = float(getattr(opt, "ask", 0) or 0)
+            if raw_bid > 0 and raw_ask > 0:
+                return (raw_bid, raw_ask)
         return (bid, ask)
 
     def get_quotable_strikes(self, expiry: str = None) -> list[tuple[float, str]]:
