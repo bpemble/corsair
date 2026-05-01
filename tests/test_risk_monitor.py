@@ -205,3 +205,231 @@ def test_sentinel_remove_failure_aborts_without_firing(cfg, tmp_path, caplog):
         # Clean up — the mocked os.remove prevented the internal cleanup
         if os.path.exists(sentinel_path):
             os.remove(sentinel_path)
+
+
+# ── Margin / theta kills ────────────────────────────────────────────
+
+
+def test_margin_kill_fires_above_threshold(cfg):
+    """SPAN margin > kill_pct × capital → halt (cancel quotes, no flatten)."""
+    portfolio = PortfolioState(cfg)
+    quotes = _StubQuoteManager()
+    # margin_kill_pct = 0.70, capital = 200_000 → 140_000
+    risk = RiskMonitor(portfolio, _StubMargin(current=150_000), quotes,
+                       _StubCSVLogger(), cfg)
+    risk.check(_state())
+    assert risk.killed
+    assert "MARGIN KILL" in risk.kill_reason
+    assert risk.kill_type == "halt"  # halt, not flatten (operator override)
+    assert risk.kill_source == "risk"  # sticky
+    assert quotes.cancelled >= 1
+
+
+def test_margin_kill_does_not_fire_below_threshold(cfg):
+    """Margin at ceiling but below kill should warn-only (constraint
+    checker handles the gate; this just monitors)."""
+    portfolio = PortfolioState(cfg)
+    risk = RiskMonitor(portfolio, _StubMargin(current=120_000),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg)
+    risk.check(_state())
+    assert not risk.killed
+
+
+def test_theta_kill_fires_when_below_floor(cfg):
+    """net_theta below theta_kill (most-negative) triggers halt."""
+    cfg.kill_switch.theta_kill = -200.0  # halt if theta < -$200
+    portfolio = PortfolioState(cfg)
+    _add(portfolio, qty=1, theta=-250)  # short premium drift
+    risk = RiskMonitor(portfolio, _StubMargin(current=10_000),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg)
+    risk.check(_state())
+    assert risk.killed
+    assert "THETA HALT" in risk.kill_reason
+
+
+def test_theta_kill_disabled_when_unconfigured(cfg):
+    """theta_kill = 0 (the default disable sentinel) means no theta
+    kill regardless of how negative net_theta gets."""
+    cfg.kill_switch.theta_kill = 0
+    portfolio = PortfolioState(cfg)
+    _add(portfolio, qty=1, theta=-99999)
+    risk = RiskMonitor(portfolio, _StubMargin(current=10_000),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg)
+    risk.check(_state())
+    assert not risk.killed
+
+
+# ── Daily P&L halt — fill-path firing + auto-clear ──────────────────
+
+
+def test_check_daily_pnl_only_fires_on_breach(cfg):
+    """check_daily_pnl_only is the per-fill path. It must fire the
+    halt when realized + MTM < threshold even though the periodic
+    risk.check() hasn't run yet."""
+    portfolio = PortfolioState(cfg)
+    portfolio.realized_pnl_persisted = -3000.0  # past max_daily_loss=-2500
+    quotes = _StubQuoteManager()
+    risk = RiskMonitor(portfolio, _StubMargin(current=0), quotes,
+                       _StubCSVLogger(), cfg)
+    fired = risk.check_daily_pnl_only()
+    assert fired is True
+    assert risk.killed
+    assert risk.kill_source == "daily_halt"
+    assert risk.kill_type == "halt"
+    assert quotes.cancelled >= 1
+
+
+def test_clear_daily_halt_clears_daily_halt_kill(cfg):
+    """Session rollover (17:00 CT) should auto-clear daily_halt source."""
+    portfolio = PortfolioState(cfg)
+    portfolio.realized_pnl_persisted = -3000.0
+    risk = RiskMonitor(portfolio, _StubMargin(current=0),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg)
+    risk.check_daily_pnl_only()
+    assert risk.killed and risk.kill_source == "daily_halt"
+    cleared = risk.clear_daily_halt()
+    assert cleared is True
+    assert not risk.killed
+    assert risk.kill_source == ""
+
+
+def test_clear_daily_halt_does_not_clear_risk_kill(cfg):
+    """A risk-source kill (margin, delta) must remain sticky across
+    rollover. Only daily_halt and induced_daily_halt auto-clear."""
+    portfolio = PortfolioState(cfg)
+    _add(portfolio, qty=1, vega=2000)
+    risk = RiskMonitor(portfolio, _StubMargin(current=10_000),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg)
+    risk.check(_state())
+    assert risk.killed and risk.kill_source == "risk"
+    assert risk.clear_daily_halt() is False
+    assert risk.killed  # still sticky
+
+
+def test_clear_disconnect_kill_clears_only_disconnect(cfg):
+    """clear_disconnect_kill is the watchdog's reconnect path. Must not
+    clear risk-source kills."""
+    portfolio = PortfolioState(cfg)
+    risk = RiskMonitor(portfolio, _StubMargin(current=0),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg)
+    risk.kill("connection lost", source="disconnect", kill_type="halt")
+    assert risk.killed
+    assert risk.clear_disconnect_kill() is True
+    assert not risk.killed
+    # Now fire a risk kill — clear_disconnect should NOT clear it.
+    risk.kill("BAD", source="risk", kill_type="halt")
+    assert risk.clear_disconnect_kill() is False
+    assert risk.killed
+
+
+# ── kill() dispatch — flatten_callback and hedge_manager wiring ──────
+
+
+def test_kill_flatten_invokes_callback(cfg):
+    """kill_type=flatten must call flatten_callback when wired."""
+    portfolio = PortfolioState(cfg)
+    flatten_calls = []
+    risk = RiskMonitor(
+        portfolio, _StubMargin(current=0),
+        _StubQuoteManager(), _StubCSVLogger(), cfg,
+        flatten_callback=lambda r: flatten_calls.append(r),
+    )
+    risk.kill("test_flatten", source="risk", kill_type="flatten")
+    assert flatten_calls == ["test_flatten"]
+    assert risk.killed
+
+
+def test_kill_flatten_warns_when_callback_unwired(cfg, caplog):
+    """kill_type=flatten without a callback should warn (degraded
+    behavior — quotes still cancelled, but positions stay)."""
+    portfolio = PortfolioState(cfg)
+    risk = RiskMonitor(portfolio, _StubMargin(current=0),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg)
+    with caplog.at_level(logging.WARNING, logger="src.risk_monitor"):
+        risk.kill("test", source="risk", kill_type="flatten")
+    assert risk.killed
+    assert any("no flatten_callback wired" in rec.message
+               for rec in caplog.records)
+
+
+def test_kill_hedge_flat_calls_force_flat(cfg):
+    """kill_type=hedge_flat must invoke hedge_manager.force_flat.
+    Used by delta kill (CLAUDE.md §6.2)."""
+    from unittest.mock import MagicMock
+    portfolio = PortfolioState(cfg)
+    hedge = MagicMock()
+    risk = RiskMonitor(portfolio, _StubMargin(current=0),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg,
+                       hedge_manager=hedge)
+    risk.kill("test", source="risk", kill_type="hedge_flat")
+    hedge.force_flat.assert_called_once()
+
+
+def test_kill_hedge_flat_warns_when_hedge_unwired(cfg, caplog):
+    """kill_type=hedge_flat without hedge_manager — degrade to halt
+    with a warning."""
+    portfolio = PortfolioState(cfg)
+    risk = RiskMonitor(portfolio, _StubMargin(current=0),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg)
+    with caplog.at_level(logging.WARNING, logger="src.risk_monitor"):
+        risk.kill("test", source="risk", kill_type="hedge_flat")
+    assert risk.killed
+    assert any("no hedge_manager wired" in rec.message
+               for rec in caplog.records)
+
+
+# ── _hedge_mtm_usd graceful degradation ─────────────────────────────
+
+
+def test_hedge_mtm_returns_zero_when_hedge_raises(cfg, caplog):
+    """If hedge_manager.mtm_usd() raises, _hedge_mtm_usd must return 0
+    (not propagate). The halt must keep running with under-reported
+    hedge MTM rather than crash."""
+    from unittest.mock import MagicMock
+    portfolio = PortfolioState(cfg)
+    hedge = MagicMock()
+    hedge.mtm_usd.side_effect = RuntimeError("synthetic hedge failure")
+    risk = RiskMonitor(portfolio, _StubMargin(current=0),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg,
+                       hedge_manager=hedge)
+    with caplog.at_level(logging.WARNING, logger="src.risk_monitor"):
+        result = risk._hedge_mtm_usd()
+    assert result == 0.0
+    # Warning fired once
+    assert any("hedge mtm_usd() raised" in rec.message
+               for rec in caplog.records)
+    # Second call must NOT log the warning again (one-time gate)
+    caplog.clear()
+    risk._hedge_mtm_usd()
+    assert not any("hedge mtm_usd() raised" in rec.message
+                   for rec in caplog.records)
+
+
+def test_hedge_mtm_zero_when_no_hedge_wired(cfg):
+    """No hedge_manager wired (single-product path or hedge disabled) —
+    return 0 cleanly."""
+    portfolio = PortfolioState(cfg)
+    risk = RiskMonitor(portfolio, _StubMargin(current=0),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg)
+    assert risk._hedge_mtm_usd() == 0.0
+
+
+# ── Effective-delta gating toggle ───────────────────────────────────
+
+
+def test_effective_delta_gating_off_uses_options_only(cfg):
+    """When effective_delta_gating=False, delta kill ignores hedge_qty."""
+    from unittest.mock import MagicMock
+    cfg.constraints.effective_delta_gating = False
+    portfolio = PortfolioState(cfg)
+    _add(portfolio, qty=1, delta=5.5)  # options-only delta = 5.5
+    hedge = MagicMock()
+    hedge.hedge_qty_for_product.return_value = -10  # would offset
+    risk = RiskMonitor(portfolio, _StubMargin(current=10_000),
+                       _StubQuoteManager(), _StubCSVLogger(), cfg,
+                       hedge_manager=hedge)
+    risk.check(_state())
+    # With gating OFF, the hedge offset is ignored — delta kill fires
+    # because options_delta > 5.0
+    assert risk.killed
+    assert "DELTA KILL" in risk.kill_reason

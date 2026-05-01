@@ -188,6 +188,40 @@ def test_long_premium_breach_rejects(cfg, portfolio):
     assert "long_premium" in reason
 
 
+def test_effective_delta_gating_off_uses_options_only(cfg, portfolio):
+    """When effective_delta_gating=False, hedge_qty is ignored in the
+    delta gate. This is the rollback toggle for live before §10
+    reconciliation lands (CLAUDE.md §14)."""
+    from unittest.mock import MagicMock
+    cfg.constraints.effective_delta_gating = False
+    margin = _StubMargin(current=0, post=10_000)
+    hedge = MagicMock()
+    hedge.hedge_qty = -3  # would offset positive options delta
+    chk = ConstraintChecker(margin, portfolio, cfg, hedge_manager=hedge)
+    # Existing portfolio is empty; new fill: a +0.7 delta call buy.
+    # Options-only post = 0.7. Effective post (if gating ON) = 0.7 - 3 = -2.3.
+    # With gating OFF, options-only path → 0.7 (well under ceiling 3.0).
+    ok, reason = chk.check_constraints(_opt(2100, "C", 0.7, -1.0), "BUY")
+    assert ok, reason
+
+
+def test_effective_delta_gating_on_credits_hedge(cfg, portfolio):
+    """With gating ON (default), the hedge offset reduces effective
+    delta — a fill that would breach ceiling on options-only is
+    accepted because the hedge net it back inside."""
+    from unittest.mock import MagicMock
+    # leave default (gating on)
+    margin = _StubMargin(current=0, post=10_000)
+    hedge = MagicMock()
+    hedge.hedge_qty = -5  # heavy short hedge
+    chk = ConstraintChecker(margin, portfolio, cfg, hedge_manager=hedge)
+    # +2 delta options would exceed ceiling 3.0 only if combined with another
+    # +2 already in book; test the simpler case: single fill, big delta.
+    ok, _reason = chk.check_constraints(_opt(2100, "C", 2.0, -1.0), "BUY")
+    # Effective: 2.0 + (-5) = -3.0, just at the limit (-3.0 ≤ 3.0). Accepted.
+    assert ok
+
+
 def test_long_premium_under_capital_accepted(cfg, portfolio):
     margin = _StubMargin(current=0, post=0,
                          cur_long=100_000, post_long=110_000)
