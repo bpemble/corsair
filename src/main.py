@@ -808,7 +808,18 @@ async def main():
                             account=config.account.account_id,
                             orderRef=msg.get("orderRef") or "corsair_trader",
                         )
-                        quotes_obj._try_place_order(contract, order)
+                        trade = quotes_obj._try_place_order(contract, order)
+                        # Cleanup #2: register the order in broker's
+                        # active_orders so snapshot.json reflects
+                        # trader-placed orders. Without this the
+                        # dashboard appears empty during cut-over even
+                        # though orders are real at IBKR.
+                        if trade is not None:
+                            try:
+                                key = (strike, expiry, right, side)
+                                quotes_obj.active_orders[key] = trade.order.orderId
+                            except Exception:
+                                pass
                     except Exception:
                         logger.exception("dispatch_place_order failed")
 
@@ -1073,6 +1084,38 @@ async def main():
                 list(fills._seen_exec_ids),  # copy under our control
             )
             last_daily_state_save = mono
+
+            # Cleanup #8: forward risk aggregates to the trader on the
+            # same 1Hz cadence. Lets the trader self-gate new orders
+            # against margin / delta / position-count limits without
+            # reaching back to broker for every decision. Only fires
+            # when broker IPC is up — no-op otherwise.
+            if broker_ipc is not None:
+                try:
+                    primary = engines[0]
+                    cur_margin = margin_coord.get_current_margin()
+                    cap = float(config.constraints.capital)
+                    margin_pct = cur_margin / cap if cap > 0 else 0.0
+                    od = float(getattr(portfolio, "options_delta", 0.0)
+                               or portfolio.delta_for_product(
+                                   config.product.underlying_symbol))
+                    hq = (primary.get("hedge").hedge_qty
+                          if primary.get("hedge") is not None else 0)
+                    broker_ipc.publish_risk_state(
+                        margin_usd=cur_margin,
+                        margin_pct=margin_pct,
+                        options_delta=od,
+                        hedge_delta=int(hq),
+                        effective_delta=od + int(hq),
+                        theta=float(getattr(portfolio, "net_theta", 0.0)),
+                        vega=float(getattr(portfolio, "net_vega", 0.0)),
+                        gamma=float(getattr(portfolio, "net_gamma", 0.0)),
+                        total_contracts=int(getattr(
+                            portfolio, "total_contracts", 0)),
+                        n_positions=len(portfolio.positions),
+                    )
+                except Exception:
+                    logger.debug("publish_risk_state failed", exc_info=True)
 
         # v1.4 §9.5: margin_snapshots.jsonl (default 60s cadence).
         if (mono - last_margin_snap) >= margin_snap_cadence:

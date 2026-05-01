@@ -476,3 +476,81 @@ the spec consistently as "all directional gates use the same combined
 metric the hedge subsystem already targets." Per
 `feedback_spec_deviation`, the change is documented at each call site
 and here.
+
+## 15. Broker/trader split (mm_service_split, 2026-05-01 — colo prep)
+
+Phased architectural split designed in
+`docs/architecture/mm_service_split.md`. Two processes share a single
+IBKR clientId via a Unix-socket IPC layer (msgpack frames). Built as
+prep for an eventual FIX-direct colo system; the trader process is
+intended to migrate with minimal change while the broker becomes a
+FIX adapter.
+
+### Topology
+
+```
+   broker (current corsair)              trader (new MM service)
+   ─────────────────────────              ──────────────────────
+   ib_insync IB(clientId=0)               (no gateway connection)
+   risk monitor, hedge, snapshot          price book, decision logic
+   slow workloads in worker threads       SABR theo via Rust
+   forwards events → IPC →                receives, decides, places
+   dispatches commands ← IPC ←            sends place_order back
+```
+
+### Phase status (as of 2026-05-01)
+
+| Phase | What | Status |
+|---|---|---|
+| 1 | IPC plumbing (Unix socket, msgpack) | done |
+| 2 | Broker forwards events; trader logs decisions | done |
+| 3 | Trader places orders via IPC; broker dispatches | **shipped, default DISABLED** |
+| 4 | Slow workloads off broker's loop (snapshot build, daily_state.save) | done — TTT p99 5ms → 2.4ms |
+| 5 | SHM ring-buffer transport | code exists, untested in production |
+| 6 | Rust port of trader's decide_quote + SABR | done |
+
+### Env flags
+
+- `CORSAIR_BROKER_MODE=1` — broker starts the IPC server. Default off → no behavior change.
+- `CORSAIR_TRADER_PLACES_ORDERS=1` — broker dispatches trader commands to `ib.placeOrder`; broker's own quote engine is gated off. **DO NOT enable in production until further notice — see "Cut-over disabled" below.**
+- `CORSAIR_IPC_TRANSPORT=socket|shm` — default `socket`. SHM is implemented but not yet exercised end-to-end.
+- `CORSAIR_TRADER_BACKEND=python` — forces the Python `decide_quote` path on the trader. Default uses Rust for SABR.
+- All four are wired through `docker-compose.yml`'s `environment:` blocks for both services. Adding a new flag requires updating the compose file too — host-shell exports alone don't reach containers.
+
+### Cut-over disabled
+
+`CORSAIR_TRADER_PLACES_ORDERS=1` was tested twice on 2026-05-01 (cut-over windows ~01:26 and ~01:43) and produced ~21 adverse fills with negative edge totaling several thousand dollars. Two contributing bugs:
+
+1. **One-sided market quoting** — trader placed orders into thin/dark books at SABR theo, becoming the sole price on a side and getting filled when MMs dumped. **Fixed** in `src/trader/quote_decision.py` and `rust/corsair_pricing/src/lib.rs:decide_quote` — both now skip with reason `one_sided_or_dark` unless BOTH bid AND ask are live.
+2. **No risk feedback** — trader had no view of position deltas / margin / Greeks, so it kept placing orders that built up an options_delta of -14.48 and tripped delta_kill. **Fixed** in 712593d-followup: broker publishes a periodic `risk_state` event (1Hz) carrying margin / effective_delta / theta / vega / position counts; trader self-gates new placements against `delta_ceiling` / `delta_kill` / `margin_ceiling_pct` thresholds (delivered in hello config snapshot).
+
+After both fixes are validated end-to-end (next session), cut-over should be re-enabled cautiously — short window first, monitor `trader_decisions-*.jsonl` for risk_block reasons, ensure no buildup of imbalanced positions.
+
+### Operational gotchas
+
+- **Compose env propagation**: each `docker compose stop` + `up` must include the env vars inline (`CORSAIR_BROKER_MODE=1 docker compose up -d --force-recreate corsair`). Each Bash session is a fresh shell — exports don't persist.
+- **Sticky risk kills survive restarts** for `source=risk` (delta, margin, etc.). To clear: `docker compose restart corsair` AND verify `kill_switch-*.jsonl` shows no recent risk-source kills. Trader-driven cut-over has caused these — restart corsair WITHOUT the trader flag to recover.
+- **`scripts/flatten.py`** is the sanctioned way to clear positions when the broker can't auto-recover (post-cut-over delta blow-out, etc.). Stop corsair first, then run with `--product HG --order-type limit` (HG is thin, market orders give bad fills).
+- **TTT histogram**: cap is 500ms in `quote_engine.py:_record_send_latency`. Empty histogram (`n=0`) post-cutover means broker isn't placing orders (either killed, or trader-driven cut-over with the metric not yet rewired through the cut-over path — it's captured in `_try_place_order`, but TTT lookup needs `_decision_tick_ns` populated by the broker's quote engine which is gated off during cut-over).
+
+### Trader command-line workflow
+
+```bash
+# Default (no broker mode, no trader): identical to pre-split
+docker compose up -d
+
+# Broker mode only — broker quotes, trader logs decisions for parity
+CORSAIR_BROKER_MODE=1 docker compose up -d --force-recreate corsair
+docker compose --profile broker-split up -d trader
+
+# Full cut-over (CURRENTLY UNSAFE — see above)
+CORSAIR_BROKER_MODE=1 CORSAIR_TRADER_PLACES_ORDERS=1 \
+    docker compose up -d --force-recreate corsair
+CORSAIR_BROKER_MODE=1 CORSAIR_TRADER_PLACES_ORDERS=1 \
+    docker compose --profile broker-split up -d --force-recreate trader
+
+# Rollback from cut-over: drop the trader flag, restart corsair
+unset CORSAIR_TRADER_PLACES_ORDERS
+CORSAIR_BROKER_MODE=1 docker compose up -d --force-recreate corsair
+docker compose stop trader
+```

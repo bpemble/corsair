@@ -35,6 +35,9 @@ EVENT_TYPES = frozenset({
     "resume",           # kill cleared (e.g. daily_halt at session rollover)
     "weekend_pause",    # paused: bool — Friday close / Sunday reopen
     "snapshot",         # full state seed sent on (re)connect
+    "risk_state",       # periodic broker → trader risk aggregates
+                        # (cleanup #8): margin, Greeks, position counts
+                        # — gates trader's new-order placement
 })
 
 # Trader → broker.

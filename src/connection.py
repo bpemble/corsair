@@ -156,6 +156,28 @@ class IBKRConnection:
             # the cache — closes the per-orderId slow walk (see above).
             ib._fa_register_order = _fa_orderid_idx.__setitem__
 
+            # Also wrap ib.placeOrder so every caller (quote_engine,
+            # hedge_manager, flatten scripts, future trader-driven
+            # path) auto-registers without needing to know about the
+            # _fa_register_order hook. Observed 2026-05-01: hedge
+            # orders weren't being pre-registered, so each hedge IOC
+            # (every 30s) triggered the slow walk. Cumulative effect:
+            # TTT p50 +0.06ms/min drift over 14min monitor.
+            _orig_placeOrder = ib.placeOrder
+            _client_id_self = ib.client.clientId
+
+            def _wrapped_placeOrder(contract, order):
+                trade = _orig_placeOrder(contract, order)
+                try:
+                    oid = trade.order.orderId
+                    if oid > 0:
+                        _fa_orderid_idx[oid] = (_client_id_self, oid)
+                except Exception:
+                    pass
+                return trade
+
+            ib.placeOrder = _wrapped_placeOrder
+
             # 2-4. Minimal initializing requests, run concurrently. Each gets
             #      its own timeout so a single slow one doesn't block the rest.
             reqs = {

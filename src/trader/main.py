@@ -26,6 +26,7 @@ import sys
 import time
 from collections import Counter, deque
 from datetime import date, datetime, timezone
+from typing import Optional
 
 from ..ipc import make_client
 from .quote_decision import decide as decide_quote
@@ -74,6 +75,20 @@ class TraderState:
         # cover the brief window between connect and hello arrival.
         self.min_edge_ticks: int = DEFAULT_MIN_EDGE_TICKS
         self.tick_size: float = DEFAULT_TICK_SIZE
+        # Risk limits from broker hello (cleanup #8). Conservative
+        # defaults so trader self-gates even before hello arrives.
+        self.delta_ceiling: float = 3.0
+        self.delta_kill: float = 5.0
+        self.margin_ceiling_pct: float = 0.50
+        # Live risk aggregates from periodic risk_state events.
+        # None until the first event arrives — trader treats that as
+        # "no info, don't quote" rather than "all clear".
+        self.risk_options_delta: Optional[float] = None
+        self.risk_hedge_delta: Optional[int] = None
+        self.risk_effective_delta: Optional[float] = None
+        self.risk_margin_pct: Optional[float] = None
+        self.risk_total_contracts: Optional[int] = None
+        self.risk_state_age_ts: float = 0.0
         # Telemetry
         self.event_counts: Counter = Counter()
         self.ipc_latency_us: deque[int] = deque(maxlen=2000)
@@ -205,6 +220,38 @@ class Trader:
             return
         if self.state.weekend_paused:
             return
+
+        # Cleanup #8: risk gates. Block new placements when broker's
+        # risk aggregates indicate we're at or near hard limits.
+        # Without this, trader-driven cut-over can rebuild adverse
+        # positions silently (the 2026-05-01 -14.48 delta_kill
+        # incident). Only gates new placements; trader still RECEIVES
+        # ticks and runs decision logic for the JSONL parity log.
+        risk_blocks_buy = False
+        risk_blocks_sell = False
+        risk_blocks_all = False
+        eff = self.state.risk_effective_delta
+        if eff is None:
+            # No risk_state seen yet — refuse to place orders. Decision
+            # log will show a "skip" with reason "risk_state_unknown"
+            # so the operator can see how often this fires during boot.
+            risk_blocks_all = True
+        else:
+            # Within delta_ceiling: a BUY would push delta up by ~1
+            # contract-delta; if that would breach ceiling, block buys.
+            # Similarly for sells. Use a 1.0-delta safety margin so we
+            # don't dance right at the limit.
+            if eff + 1.0 >= self.state.delta_ceiling:
+                risk_blocks_buy = True
+            if eff - 1.0 <= -self.state.delta_ceiling:
+                risk_blocks_sell = True
+            # Hard kill: anywhere near the kill threshold, stop placing.
+            if abs(eff) >= self.state.delta_kill - 1.0:
+                risk_blocks_all = True
+            # Margin ceiling.
+            if (self.state.risk_margin_pct is not None
+                    and self.state.risk_margin_pct >= self.state.margin_ceiling_pct):
+                risk_blocks_all = True
         # Vol surface lookup: prefer the side matching the option's
         # right (broker fits per (expiry, side); call options use the
         # call surface, puts use the put surface). Fall back to whichever
@@ -245,6 +292,16 @@ class Trader:
             # order. Phase 3b will add incumbency tracking so we amend
             # rather than churn.
             if PLACES_ORDERS and d.get("action") == "place" and d.get("price"):
+                # Cleanup #8 risk gate.
+                if risk_blocks_all:
+                    self.decisions_made["risk_block"] += 1
+                    continue
+                if side == "BUY" and risk_blocks_buy:
+                    self.decisions_made["risk_block_buy"] += 1
+                    continue
+                if side == "SELL" and risk_blocks_sell:
+                    self.decisions_made["risk_block_sell"] += 1
+                    continue
                 key = (float(strike), expiry, right, side)
                 # Skip if we already have an order at exactly this price
                 # for this key (prevents amend churn). Strict equality
@@ -322,6 +379,15 @@ class Trader:
             # don't clobber each other.
             key = (msg.get("expiry"), msg.get("side"))
             self.state.vol_surface[key] = msg
+        elif t == "risk_state":
+            # Cleanup #8: ingest broker's risk aggregates so
+            # _decide_on_tick can gate new orders.
+            self.state.risk_options_delta = float(msg.get("options_delta", 0.0))
+            self.state.risk_hedge_delta = int(msg.get("hedge_delta", 0))
+            self.state.risk_effective_delta = float(msg.get("effective_delta", 0.0))
+            self.state.risk_margin_pct = float(msg.get("margin_pct", 0.0))
+            self.state.risk_total_contracts = int(msg.get("total_contracts", 0))
+            self.state.risk_state_age_ts = time.monotonic()
         elif t == "kill":
             self.state.kills[msg.get("source", "?")] = msg.get("reason", "?")
         elif t == "resume":
@@ -340,9 +406,19 @@ class Trader:
                 self.state.min_edge_ticks = int(cfg["min_edge_ticks"])
             if "tick_size" in cfg:
                 self.state.tick_size = float(cfg["tick_size"])
+            # Cleanup #8: risk limits.
+            if "delta_ceiling" in cfg:
+                self.state.delta_ceiling = float(cfg["delta_ceiling"])
+            if "delta_kill" in cfg:
+                self.state.delta_kill = float(cfg["delta_kill"])
+            if "margin_ceiling_pct" in cfg:
+                self.state.margin_ceiling_pct = float(cfg["margin_ceiling_pct"])
             logger.warning(
-                "trader config from broker: min_edge_ticks=%d tick_size=%g",
+                "trader config from broker: min_edge_ticks=%d tick_size=%g "
+                "delta_ceiling=%.1f delta_kill=%.1f margin_ceiling_pct=%.2f",
                 self.state.min_edge_ticks, self.state.tick_size,
+                self.state.delta_ceiling, self.state.delta_kill,
+                self.state.margin_ceiling_pct,
             )
         else:
             logger.debug("unknown event type: %s", t)

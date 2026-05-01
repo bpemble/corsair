@@ -150,6 +150,35 @@ class BrokerIPC:
             "paused": paused,
         })
 
+    def publish_risk_state(self, *, margin_usd: float, margin_pct: float,
+                           options_delta: float, hedge_delta: int,
+                           effective_delta: float,
+                           theta: float, vega: float, gamma: float,
+                           total_contracts: int, n_positions: int) -> None:
+        """Cleanup #8: forward broker's risk aggregates to the trader.
+
+        Called periodically from the main loop (~1s cadence) so the
+        trader can gate new-order placement on margin / delta /
+        position-count limits without needing to compute them
+        independently. Without this, trader-driven cut-over has no
+        risk feedback and rebuilds adverse positions whenever broker
+        is silent (the 2026-05-01 -14.48 delta_kill incident).
+        """
+        self.server.publish({
+            "type": "risk_state",
+            "ts_ns": _ts_ns(),
+            "margin_usd": margin_usd,
+            "margin_pct": margin_pct,
+            "options_delta": options_delta,
+            "hedge_delta": hedge_delta,
+            "effective_delta": effective_delta,
+            "theta": theta,
+            "vega": vega,
+            "gamma": gamma,
+            "total_contracts": total_contracts,
+            "n_positions": n_positions,
+        })
+
     # ── Internal callbacks ─────────────────────────────────────────────
 
     def _make_tick_callback(self, strike: float, expiry: str, right: str):
@@ -275,12 +304,20 @@ class BrokerIPC:
             return {}
         try:
             quoting = getattr(cfg, "quoting", object())
+            constraints = getattr(cfg, "constraints", object())
+            kill_switch = getattr(cfg, "kill_switch", object())
             return {
                 "min_edge_ticks": int(getattr(quoting, "min_edge_ticks", 2)),
                 "tick_size": float(getattr(quoting, "tick_size", 0.0005)),
                 "underlying_symbol": str(getattr(
                     cfg.product, "underlying_symbol", "HG")),
                 "multiplier": int(getattr(cfg.product, "multiplier", 25000)),
+                # Risk limits — trader uses these to self-gate (cleanup #8).
+                "delta_ceiling": float(getattr(constraints, "delta_ceiling", 3.0)),
+                "delta_kill": float(getattr(kill_switch, "delta_kill", 5.0)),
+                "margin_ceiling_pct": float(getattr(
+                    constraints, "margin_ceiling_pct", 0.50)),
+                "capital_usd": float(getattr(cfg, "capital", 500_000)),
             }
         except Exception:
             logger.debug("config snapshot build failed", exc_info=True)
