@@ -165,30 +165,35 @@ def _latency_with_trader_overlay(quotes, broker_ipc):
     tel = getattr(broker_ipc, "last_trader_telemetry", None)
     if not tel:
         return base
+    # Always surface trader_ipc_us when telemetry is available — IPC
+    # latency is populated by the trader's run loop independent of
+    # whether places are actually firing. This is the dashboard's
+    # primary latency signal during cut-over states where places are
+    # blocked (margin/delta/etc.) but the system is still healthy.
+    trader_ipc_n = tel.get("ipc_n") or 0
+    if trader_ipc_n > 0:
+        base["trader_ipc_us"] = {
+            "n": trader_ipc_n,
+            "p50": tel.get("ipc_p50_us"),
+            "p99": tel.get("ipc_p99_us"),
+            "source": "trader",
+        }
+    # TTT overlay only when trader has place samples. If no places
+    # have happened (e.g. risk gate blocking 100%), keep broker's
+    # block as-is so the dashboard shows a recognizable empty state
+    # rather than stale samples.
     trader_ttt_n = tel.get("ttt_n") or 0
-    if trader_ttt_n <= 0:
-        return base
-    trader_block = {
-        "n": trader_ttt_n,
-        "p50": tel.get("ttt_p50_us"),
-        "p99": tel.get("ttt_p99_us"),
-        # No min/max/p10/p25/p75/p90 from trader telemetry — fill with None
-        # so the dashboard's expected schema doesn't break.
-        "min": None, "max": None,
-        "p10": None, "p25": None, "p75": None, "p90": None,
-        "source": "trader",
-    }
-    # If broker's TTT histogram is empty (typical during cut-over),
-    # replace with trader's. Keep place_rtt_us / amend_us as-is —
-    # broker still has those even when its quote engine is gated off.
-    if base.get("ttt_us", {}).get("n", 0) == 0:
-        base["ttt_us"] = trader_block
-    base["trader_ipc_us"] = {
-        "n": tel.get("ipc_n") or 0,
-        "p50": tel.get("ipc_p50_us"),
-        "p99": tel.get("ipc_p99_us"),
-        "source": "trader",
-    }
+    if trader_ttt_n > 0 and base.get("ttt_us", {}).get("n", 0) == 0:
+        base["ttt_us"] = {
+            "n": trader_ttt_n,
+            "p50": tel.get("ttt_p50_us"),
+            "p99": tel.get("ttt_p99_us"),
+            # No min/max/p10/p25/p75/p90 from trader telemetry — fill
+            # with None so the dashboard's schema doesn't break.
+            "min": None, "max": None,
+            "p10": None, "p25": None, "p75": None, "p90": None,
+            "source": "trader",
+        }
     return base
 
 
