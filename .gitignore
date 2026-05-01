@@ -26,3 +26,6 @@ scripts/_*.py
 
 # IDE/agent local state
 .claude/
+
+# Rust build artifacts
+rust/target/
