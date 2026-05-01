@@ -29,7 +29,8 @@ from datetime import date, datetime, timezone
 from typing import Optional
 
 from ..ipc import make_client
-from .quote_decision import decide as decide_quote
+from .quote_decision import decide as decide_quote, compute_theo
+from ..sabr import time_to_expiry_years
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -52,6 +53,15 @@ DEFAULT_TICK_SIZE = 0.0005
 # actually sends place_order/cancel_order commands to the broker.
 # Toggle via env so we can A/B vs broker-quoting.
 PLACES_ORDERS = os.environ.get("CORSAIR_TRADER_PLACES_ORDERS", "").strip() == "1"
+
+# Staleness check cadence + threshold. Resting orders whose price is
+# more than STALENESS_TICKS off current theo get cancelled. This is
+# the trader-side equivalent of broker's quote_engine.is_quote_stale.
+# Without it, theo drift between order placement and the GTD-30s
+# expiry can adversely fill us (2026-05-01: 20 such fills, ~$2.4K
+# negative edge, before this guard landed).
+STALENESS_INTERVAL_S = 0.10       # 10Hz scan
+STALENESS_TICKS = 1               # cancel when off-by-more-than 1 tick vs theo
 
 
 class TraderState:
@@ -398,6 +408,29 @@ class Trader:
             # don't clobber each other.
             key = (msg.get("expiry"), msg.get("side"))
             self.state.vol_surface[key] = msg
+        elif t == "place_ack":
+            # Broker confirms ib.placeOrder dispatched with this
+            # orderId. Populate _orderid_to_key + _our_orders_by_key
+            # immediately so the staleness loop can cancel even
+            # fast-fill orders that go PendingSubmit → Filled with no
+            # intermediate Submitted ack.
+            try:
+                oid = int(msg["orderId"])
+                key = (
+                    float(msg["strike"]), msg["expiry"],
+                    msg["right"], msg["side"],
+                )
+                self._orderid_to_key[oid] = key
+                if key in self._our_orders_by_key:
+                    self._our_orders_by_key[key]["orderId"] = oid
+                else:
+                    self._our_orders_by_key[key] = {
+                        "price": float(msg.get("price", 0.0)),
+                        "ts_ns": time.time_ns(),
+                        "orderId": oid,
+                    }
+            except Exception:
+                pass
         elif t == "risk_state":
             # Cleanup #8: ingest broker's risk aggregates so
             # _decide_on_tick can gate new orders.
@@ -441,6 +474,97 @@ class Trader:
             )
         else:
             logger.debug("unknown event type: %s", t)
+
+    async def staleness_loop(self) -> None:
+        """Periodically cancel resting orders whose price has drifted
+        too far from current theo. Mirrors broker's is_quote_stale.
+
+        Without this, an order placed at ``theo - edge`` and left to
+        rest 30s (GTD) can be matched adversely when theo drifts and
+        our limit becomes the wrong-side-of-fair price. The guard fires
+        at STALENESS_INTERVAL_S cadence and uses STALENESS_TICKS as the
+        absolute-distance-from-theo threshold.
+        """
+        while True:
+            await asyncio.sleep(STALENESS_INTERVAL_S)
+            if not PLACES_ORDERS:
+                continue
+            if not self._our_orders_by_key:
+                continue
+            forward = self.state.underlying_price
+            if forward <= 0:
+                continue
+            threshold = STALENESS_TICKS * self.state.tick_size
+
+            # Snapshot keys to avoid mutating-during-iteration. Cancels
+            # mutate _our_orders_by_key in _cancel_stale_order.
+            for key, order_info in list(self._our_orders_by_key.items()):
+                strike, expiry, right, side = key
+                order_price = order_info.get("price")
+                order_id = order_info.get("orderId")
+                if order_price is None or order_id is None:
+                    # Either no price set (shouldn't happen) or order
+                    # not yet acked — can't cancel something the broker
+                    # doesn't know about yet. Wait for next cycle.
+                    continue
+                # Pick vol surface for this option's right; fall back to
+                # the other side during bootstrap.
+                vp_msg = (
+                    self.state.vol_surface.get((expiry, right))
+                    or self.state.vol_surface.get((expiry, "C"))
+                    or self.state.vol_surface.get((expiry, "P"))
+                )
+                if not vp_msg:
+                    continue
+                vol_params = vp_msg.get("params")
+                if not vol_params:
+                    continue
+                try:
+                    tte = time_to_expiry_years(expiry)
+                    res = compute_theo(forward, strike, tte, right, vol_params)
+                except Exception:
+                    continue
+                if res is None:
+                    continue
+                _iv, theo = res
+                # Stale if our price is too unfavorable vs current theo.
+                # BUY: bad when we'd pay above theo (price > theo).
+                # SELL: bad when we'd sell below theo (price < theo).
+                if side == "BUY":
+                    drift = order_price - theo
+                else:
+                    drift = theo - order_price
+                if drift > threshold:
+                    self._cancel_stale_order(
+                        order_id, key, order_price, theo, drift,
+                    )
+
+    def _cancel_stale_order(self, order_id: int, key: tuple,
+                            order_price: float, theo: float,
+                            drift: float) -> None:
+        """Send cancel_order to broker; drop from local maps."""
+        if not self.client.connected:
+            return
+        self.client.send({
+            "type": "cancel_order",
+            "ts_ns": time.time_ns(),
+            "orderId": order_id,
+        })
+        # Optimistic local cleanup. The order_ack with terminal status
+        # would do the same, but doing it here means the next tick on
+        # this key won't re-place against a stale dedupe entry.
+        self._our_orders_by_key.pop(key, None)
+        self._orderid_to_key.pop(order_id, None)
+        self.decisions_made["staleness_cancel"] += 1
+        if self.decisions_made["staleness_cancel"] % 10 == 1:
+            logger.info(
+                "staleness cancel: oid=%d %.2f%s %s @ %.4f vs theo %.4f "
+                "(drift %.4f, threshold %.4f); total cancels=%d",
+                order_id, key[0], key[2], key[3],
+                order_price, theo, drift,
+                STALENESS_TICKS * self.state.tick_size,
+                self.decisions_made["staleness_cancel"],
+            )
 
     async def telemetry_loop(self) -> None:
         """Send periodic stats back to the broker."""
@@ -507,9 +631,11 @@ class Trader:
         client_task = asyncio.create_task(self.client.run(_on_event))
         welcome_task = asyncio.create_task(_send_welcome_when_connected())
         telemetry_task = asyncio.create_task(self.telemetry_loop())
+        staleness_task = asyncio.create_task(self.staleness_loop())
 
         try:
-            await asyncio.gather(client_task, telemetry_task, welcome_task)
+            await asyncio.gather(client_task, telemetry_task, welcome_task,
+                                 staleness_task)
         finally:
             self.event_log.close()
             self.decision_log.close()

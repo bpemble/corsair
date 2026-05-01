@@ -794,12 +794,13 @@ async def main():
                             return
                         from ib_insync import LimitOrder
                         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-                        # Match broker quote engine's GTD-30s pattern.
-                        # IBKR's "yyyymmdd-hh:mm:ss" UTC format. Without
-                        # a goodTillDate, GTD orders are rejected with
-                        # Error 391 (observed during initial Phase 3
-                        # cut-over deploy).
-                        gtd = (_dt.now(_tz.utc) + _td(seconds=30)).strftime(
+                        # GTD-5s for trader-driven orders. Broker's quote
+                        # engine uses GTD-30s, but the trader has weaker
+                        # safety machinery (no Greeks, no peer-cap), so a
+                        # tighter exposure window bounds adverse-fill
+                        # damage when staleness check misses something.
+                        # IBKR's "yyyymmdd-hh:mm:ss" UTC format.
+                        gtd = (_dt.now(_tz.utc) + _td(seconds=5)).strftime(
                             "%Y%m%d-%H:%M:%S")
                         order = LimitOrder(
                             action=side,
@@ -818,10 +819,33 @@ async def main():
                         # though orders are real at IBKR.
                         if trade is not None:
                             try:
-                                key = (strike, expiry, right, side)
-                                quotes_obj.active_orders[key] = trade.order.orderId
+                                quotes_obj.active_orders[(strike, expiry, right, side)] = trade.order.orderId
                             except Exception:
                                 pass
+                            # IMMEDIATELY tell trader the orderId via
+                            # place_ack so its staleness check can
+                            # cancel this order if needed. Without
+                            # this, fast-fill orders (PendingSubmit →
+                            # Filled with no Submitted in between)
+                            # never give the trader an orderId, and
+                            # the staleness loop can't cancel them.
+                            # Live evidence 2026-05-01 ~03:21: 14
+                            # adverse fills made it through despite
+                            # staleness firing 11 times — the offending
+                            # orders had orderId=None on trader side.
+                            try:
+                                broker_ipc.server.publish({
+                                    "type": "place_ack",
+                                    "ts_ns": int(__import__("time").time_ns()),
+                                    "orderId": trade.order.orderId,
+                                    "strike": strike,
+                                    "expiry": expiry,
+                                    "right": right,
+                                    "side": side,
+                                    "price": price,
+                                })
+                            except Exception:
+                                logger.debug("place_ack publish failed", exc_info=True)
                     except Exception:
                         logger.exception("dispatch_place_order failed")
 

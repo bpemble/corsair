@@ -38,6 +38,10 @@ EVENT_TYPES = frozenset({
     "risk_state",       # periodic broker → trader risk aggregates
                         # (cleanup #8): margin, Greeks, position counts
                         # — gates trader's new-order placement
+    "place_ack",        # broker confirms placeOrder dispatched, with
+                        # orderId. Sent IMMEDIATELY after ib.placeOrder
+                        # returns so trader can populate _orderid_to_key
+                        # before any fast-fill order_ack arrives.
 })
 
 # Trader → broker.
