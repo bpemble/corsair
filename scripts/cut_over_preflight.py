@@ -4,9 +4,14 @@ Validates EVERY safety condition before allowing CORSAIR_TRADER_PLACES_ORDERS=1.
 Returns nonzero if any check fails — operators should treat green here as
 the gate to flipping cut-over on.
 
-Usage:
-    docker compose exec corsair python3 /app/scripts/cut_over_preflight.py
-    # Exits 0 on all-green, 1 on any failure.
+Usage (recommended — from host so docker compose calls work):
+    cd ~/corsair && python3 scripts/cut_over_preflight.py
+
+The script auto-detects whether it's running on the host (has access to
+docker compose and /home/ethereal/corsair) or inside the container, and
+adjusts paths/commands accordingly.
+
+Exits 0 on all-green, 1 on any failure.
 
 Checks (in order):
   1. Broker container is up and healthy
@@ -266,10 +271,22 @@ def check_trader_decisions_active(log_dir: str) -> CheckResult:
                       f"only {n} decisions in last 60s")
 
 
+def _autodetect_paths():
+    """Pick container or host paths based on what exists."""
+    host_root = "/home/ethereal/corsair"
+    if os.path.isdir(host_root):
+        return (
+            os.path.join(host_root, "data", "hg_chain_snapshot.json"),
+            os.path.join(host_root, "logs-paper"),
+        )
+    return ("/app/data/hg_chain_snapshot.json", "/app/logs-paper")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--snapshot", default="/app/data/hg_chain_snapshot.json")
-    p.add_argument("--logs-dir", default="/app/logs-paper")
+    default_snap, default_logs = _autodetect_paths()
+    p.add_argument("--snapshot", default=default_snap)
+    p.add_argument("--logs-dir", default=default_logs)
     args = p.parse_args()
 
     print("=" * 60)

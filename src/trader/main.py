@@ -158,20 +158,33 @@ class JSONLWriter:
     and ``log_dir``; rotated path is ``{log_dir}/{prefix}-YYYY-MM-DD.jsonl``.
     """
 
-    def __init__(self, log_dir: str, prefix: str) -> None:
+    def __init__(self, log_dir: str, prefix: str,
+                 max_bytes: int = 256 * 1024 * 1024) -> None:
         self._log_dir = log_dir
         self._prefix = prefix
         self._fp = None
         self._date = None
+        self._max_bytes = max_bytes
+        self._bytes_written = 0
+        self._part = 0
 
     def write(self, rec: dict) -> None:
         today = date.today().strftime("%Y-%m-%d")
         if today != self._date:
             self._roll(today)
+        # Size-based rotation backstop. trader_decisions/events write
+        # at ~30Hz which produces 500+MB/day at v1.4 cadences. Without
+        # size rotation a multi-day session fills the disk. Roll to
+        # .1, .2, .3, ... when hot file exceeds max_bytes.
+        if self._fp is not None and self._bytes_written >= self._max_bytes:
+            self._part += 1
+            self._roll(today)
         if self._fp is None:
             return
         try:
-            self._fp.write(json.dumps(rec, default=str) + "\n")
+            line = json.dumps(rec, default=str) + "\n"
+            self._fp.write(line)
+            self._bytes_written += len(line)
         except Exception:
             logger.exception("%s log write failed", self._prefix)
 
@@ -181,12 +194,18 @@ class JSONLWriter:
                 self._fp.close()
             except Exception:
                 pass
+        if day != self._date:
+            self._part = 0  # new day starts fresh part numbering
         self._date = day
         try:
             os.makedirs(self._log_dir, exist_ok=True)
-            path = os.path.join(self._log_dir, f"{self._prefix}-{day}.jsonl")
+            suffix = f".{self._part}" if self._part > 0 else ""
+            path = os.path.join(
+                self._log_dir, f"{self._prefix}-{day}.jsonl{suffix}")
             self._fp = open(path, "a", buffering=1)
-            logger.info("%s log opened: %s", self._prefix, path)
+            self._bytes_written = os.path.getsize(path) if os.path.exists(path) else 0
+            logger.info("%s log opened: %s (existing %d bytes)",
+                        self._prefix, path, self._bytes_written)
         except Exception:
             logger.exception("%s log open failed", self._prefix)
             self._fp = None
@@ -474,6 +493,32 @@ class Trader:
                             bsz <= 0 or asz <= 0):
                         self.decisions_made["skip_dark_at_place"] += 1
                         continue
+                # Cancel-before-replace (cleanup pass 6, 2026-05-01).
+                # Without this, every re-place leaves the OLD orderId
+                # at IBKR pending GTD-expiry (5s). Multiple stale orders
+                # at the same key churn IBKR's order book and bloat
+                # place_rtt_us (1+s p50). Sending an explicit cancel
+                # immediately before the new place tells IBKR to drop
+                # the stale order, freeing the slot.
+                #
+                # Skip cancel if old orderId unknown (place_ack hasn't
+                # arrived yet) — the old order will GTD-expire on its
+                # own. Skip if existing entry was already an unacked
+                # request (orderId=None) since we have nothing to
+                # cancel yet anyway.
+                old_oid = existing.get("orderId") if existing else None
+                if old_oid is not None:
+                    self.client.send({
+                        "type": "cancel_order",
+                        "ts_ns": time.time_ns(),
+                        "orderId": old_oid,
+                    })
+                    # Drop the orderId→key mapping; the cancel ack
+                    # would do this too but we want to short-circuit
+                    # the staleness loop from trying to re-cancel.
+                    self._orderid_to_key.pop(old_oid, None)
+                    self.decisions_made["replace_cancel"] += 1
+
                 # Cleanup gap #2 — trader-side TTT instrumentation.
                 # Measure broker-tick-emit (wall clock) → trader-place-
                 # order-send (wall clock). Cross-process delta captures

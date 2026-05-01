@@ -25,6 +25,23 @@ Key v1.4 differences from v1.3 (see §9 below for details):
   >0.05, quote latency median >2s for 60s, abnormal fill rate >10× baseline.
 - 8 JSONL streams in `logs-paper/` per spec §9.5.
 
+## Spec deviations summary (current state vs v1.4 spec)
+
+This is the cumulative drift table. Each is documented elsewhere; this is
+the index. **Stage 1 acceptance evaluation** must use the spec, not the
+current operational config.
+
+| Item | Spec | Live | Section |
+|---|---|---|---|
+| Capital | $75K (Stage 1) | $500K | §7 |
+| Strike scope | sym_5 (11 strikes × 2) | asymmetric OTM-only | §12 |
+| Daily P&L halt action | flatten + halt | halt only (positions preserved) | §8 |
+| Margin kill action | flatten | halt only | §7 |
+| vega_kill | $500 | 0 (disabled) | §13 |
+| Effective-delta gating | unspecified | combined options+hedge | §14 |
+| Architecture | single process | broker/trader split (cut-over default ON post-2026-05-01) | §15 |
+| Hedge near-expiry lockout | 7 days (shared with options engine) | 30 days (hedge-specific knob added 2026-05-01) | §10 |
+
 ETH is tabled (config products list is HG-only) but the multi-product
 architecture is preserved — re-enabling ETH is a matter of un-commenting
 its product block and wiring market data.
@@ -554,3 +571,119 @@ unset CORSAIR_TRADER_PLACES_ORDERS
 CORSAIR_BROKER_MODE=1 docker compose up -d --force-recreate corsair
 docker compose stop trader
 ```
+
+## 16. Cut-over safety stack (cleanup passes 3-6, 2026-05-01)
+
+The cut-over path produced ~$25K of paper losses on 2026-05-01 across
+multiple incidents. Root cause was the trader passing **current spot**
+to SVI's compute_theo when the surface is anchored on **fit-time
+forward** (commit `e6486f6`). Six layers of defense now sit on top of
+that fix to prevent recurrence:
+
+### Layer 1 — Fit-time forward (THE root-cause fix, e6486f6)
+
+`compute_theo` in `src/trader/quote_decision.py` requires the fit-time
+forward (which broker emits in every `vol_surface` IPC event), NOT the
+current underlying spot. SVI's `m` parameter is anchored on
+log-moneyness relative to that specific F; using a different F at
+evaluation silently re-anchors the wing flex point. Reproduction:
+HXEK6 P560 with F_fit=6.021 returned theo=0.0275 (matches broker);
+same params with F=5.96 (current spot) returned theo=0.0337 — a 23%
+gap on a deep wing put. That gap drove BUY at theo-1tick=0.033
+into ask=0.033 = picked-off-every-time.
+
+### Layer 2 — Risk-feedback gate (#8)
+
+Broker publishes `risk_state` event at 1Hz with margin/Greeks/effective
+delta. Trader self-gates new placements:
+- `effective_delta + 1.0 >= delta_ceiling` → block BUYs
+- `effective_delta - 1.0 <= -delta_ceiling` → block SELLs
+- `|effective_delta| >= delta_kill - 1.0` → block ALL
+- `margin_pct >= margin_ceiling_pct` → block ALL
+- risk_state stale >5s OR not yet seen → block ALL (fail-closed)
+
+### Layer 3 — Strike-window restrictions
+
+ATM-window: skip strikes more than `MAX_STRIKE_OFFSET_USD` ($0.30) from
+current spot. OTM-only: skip ITM calls (K < F − $0.025) and ITM puts
+(K > F + $0.025). Spec §3.3 / CLAUDE.md §12.
+
+### Layer 4 — Dark-book and thin-book guards (decision time + on-rest)
+
+Decide-time check: refuse if bid <= 0, ask <= 0, bid_size < 1, or
+ask_size < 1. ON-REST check (10Hz staleness loop): cancel any
+resting order whose latest tick shows the market has gone dark (any
+of the same conditions). 2026-05-01 burst: 17 fills in 11s at
+bid=0/ask=0 — root cause is paper-IBKR matching against ghost flow
+when displayed BBO is one-sided. ON-REST cancellation closes that
+attack vector.
+
+### Layer 5 — Forward-drift guard
+
+Refuse to quote when `|current_spot - fit_forward| > 200 ticks`
+($0.10). SVI extrapolation becomes unreliable when underlying moves
+far from the anchor; broker's fit cadence (~60s) usually catches
+this, but the guard covers the gap.
+
+### Layer 6 — Throttling: dead-band + GTD-refresh + cancel-before-replace
+
+Mirrors broker's `_send_or_update`. Three-rule chain:
+
+1. **Dead-band**: skip if |new_price - rest_price| < `DEAD_BAND_TICKS`
+   (1 tick) AND age < `GTD_LIFETIME_S - GTD_REFRESH_LEAD_S` (3.5s).
+2. **GTD-refresh override**: bypass dead-band when ≥3.5s has elapsed
+   since the last place — keeps the quote alive before GTD-5s expiry.
+3. **Cooldown floor**: 250ms hard minimum between sends per key
+   (defensive backstop).
+
+Cancel-before-replace: when re-placing at a key with a known orderId,
+send `cancel_order` for the old orderId immediately before sending
+the new `place_order`. Without this, every re-place leaves the OLD
+order at IBKR pending GTD-expiry (5s), bloating IBKR's order book and
+pushing place_rtt_us above 1s. Skip cancel if old orderId unknown
+(place_ack hasn't arrived yet) — falls back to GTD-expiry.
+
+### Pre-flip checklist + monitoring
+
+Before flipping `CORSAIR_TRADER_PLACES_ORDERS=1`, run the preflight:
+
+```bash
+docker run --rm --network host \
+    -v $PWD/scripts:/app/scripts:ro \
+    -v $PWD/data:/app/data:ro \
+    -v $PWD/logs-paper:/app/logs-paper:ro \
+    corsair-corsair python3 /app/scripts/cut_over_preflight.py
+```
+
+Returns nonzero if any of 9 checks fail (containers up, position flat,
+no kills, daily P&L healthy, SABR fits fresh, risk_state flowing, hedge
+resolved, trader decisions active, no recent adverse fills). Treat
+green as the gate to enabling cut-over.
+
+While running cut-over, leave `scripts/live_monitor.py` open in a
+shell — it polls snapshot every 5s and alerts on adverse fills,
+position drift, concentration, or P&L approaching halt.
+
+### Decision counters in trader telemetry
+
+The trader emits a counter dict in its 10s telemetry log line. Useful
+for tuning:
+
+| Counter | Means |
+|---|---|
+| `place` | decide_quote returned "place" |
+| `skip` (with reason) | decide_quote returned "skip" + reason |
+| `skip_off_atm` | trader-level ATM-window block |
+| `skip_itm` | OTM-only restriction |
+| `skip_in_band` | dead-band gate (price hasn't moved enough) |
+| `skip_cooldown` | per-key cooldown floor |
+| `skip_dark_at_place` | dark-book guard at place time |
+| `staleness_cancel` | resting order cancelled — too far from theo |
+| `staleness_cancel_dark` | resting order cancelled — market went dark |
+| `replace_cancel` | cancel-before-replace fired |
+| `risk_block` / `_buy` / `_sell` | risk gate engaged |
+
+`skip_in_band` should dominate skip reasons in calm markets. High
+`risk_block` rate means margin or delta is near a limit — operator
+should investigate. High `staleness_cancel_dark` rate means liquidity
+is thin; consider tightening `MIN_BBO_SIZE`.

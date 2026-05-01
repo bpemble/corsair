@@ -66,12 +66,13 @@ kill_switch:
   # Either max_daily_loss (absolute) or daily_pnl_halt_pct (fraction of
   # capital) can be set; code prefers _pct when present and derives the
   # absolute threshold. Both here for explicitness.
-  # TEMPORARY widen 2026-05-01: today's IBKR-tracked realized = -$38K
-  # from cut-over incidents. Threshold raised to -$50K to allow cut-over
-  # validation today; reverts at 22:00 UTC session rollover when IBKR's
-  # realized P&L resets. Restore to -25000 / 0.05 next session.
-  max_daily_loss: -50000       # was -25000
-  daily_pnl_halt_pct: 0.10     # was 0.05; doubled temporarily
+  # Reverted to spec 2026-05-01 after cut-over validation. The temporary
+  # widening (-$50K / 10%) was used to allow today's cut-over to operate
+  # despite the -$38K realized P&L from earlier cut-over incidents. With
+  # IBKR session rollover at 22:00 UTC clearing realized P&L, the spec-
+  # aligned thresholds below take effect on the next broker restart.
+  max_daily_loss: -25000       # 5% × $500K
+  daily_pnl_halt_pct: 0.05     # spec §6.1 PRIMARY defense
   # Per-product thresholds.
   delta_kill: 5.0              # |net_delta| kill (v1.4 §6.2 unchanged)
   vega_kill: 0                 # disabled 2026-04-23 — was $500 per §6.2.
@@ -166,6 +167,15 @@ hedging:
   # rollback (commit 470d09f). hedge_manager picks the FIRST contract
   # whose expiry is >= today + this window. Set to 0 to disable.
   near_expiry_lockout_days: 7
+  # Hedge-specific lockout: how many days from expiry the HEDGE
+  # subsystem refuses to use a futures contract. Separate from
+  # near_expiry_lockout_days (which also gates options-engine
+  # underlying selection) so we can roll the hedge to the next month
+  # earlier without breaking the options chain. 2026-05-01: HGK6 was
+  # rejecting hedge orders with Error 201 ("near-expiration physical
+  # delivery risk") at 26 days from expiry — IBKR's policy is more
+  # aggressive than the previous 7-day default.
+  hedge_lockout_days: 30
   # IOC limit aggression in ticks past F. Bumped 1 → 2 on 2026-04-27
   # after periodic BUY-4 IOCs systematically died because F+1 tick
   # landed inside the bid-ask spread (late-RTH thin-liquidity regime,

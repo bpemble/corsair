@@ -243,6 +243,40 @@ async def main():
     log.info("Submitted: %d  Filled: %d  Other: %d",
              len(submitted), filled, len(submitted) - filled)
 
+    # Cancel any orders we placed that didn't fill in the per-order
+    # window. Without this, stale orders accumulate at IBKR across
+    # multiple flatten runs and all match at once when liquidity
+    # returns (2026-05-01 11:25 incident: 3 orphan SELL orders from
+    # earlier runs all matched simultaneously, causing 22-vs-11 over-
+    # flatten and ~$2.5K of slippage). Cancellation is best-effort —
+    # IBKR may already have filled them in the window between status
+    # check and cancel.
+    unfilled = [t for t in submitted
+                if t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")]
+    if unfilled:
+        log.info("Cancelling %d unfilled order(s) we placed...", len(unfilled))
+        for t in unfilled:
+            try:
+                ib.cancelOrder(t.order)
+            except Exception as e:
+                log.warning("  cancel %d failed: %s", t.order.orderId, e)
+        await asyncio.sleep(3)
+        # Verify cancels landed; log any that didn't.
+        still_open = [t for t in unfilled
+                      if t.orderStatus.status in
+                      ("Submitted", "PreSubmitted", "PendingSubmit")]
+        if still_open:
+            log.warning(
+                "%d order(s) still open after cancel attempt — "
+                "IBKR may not have processed; reqGlobalCancel as last resort",
+                len(still_open),
+            )
+            try:
+                ib.reqGlobalCancel()
+            except Exception as e:
+                log.warning("reqGlobalCancel failed: %s", e)
+            await asyncio.sleep(3)
+
     await asyncio.sleep(2)
     remaining = [
         p for p in ib.positions(account)
@@ -255,8 +289,27 @@ async def main():
         c = p.contract
         log.info("  %s qty=%+d", c.localSymbol, int(p.position))
 
+    # Final orphan check: anything still open on this product?
+    open_now = [
+        t for t in ib.openTrades()
+        if t.contract.symbol == args.product
+        and t.contract.secType == "FOP"
+        and t.orderStatus.status in ("Submitted", "PreSubmitted", "PendingSubmit")
+    ]
+    if open_now:
+        log.warning(
+            "%d %s working order(s) still resting at exit — "
+            "ORPHANS that may match later. List:",
+            len(open_now), args.product,
+        )
+        for t in open_now:
+            log.warning("  oid=%d %s %d %s @ %.4f",
+                        t.order.orderId, t.order.action,
+                        int(t.order.totalQuantity),
+                        t.contract.localSymbol, t.order.lmtPrice or 0)
+
     ib.disconnect()
-    return 0 if not remaining else 1
+    return 0 if not remaining and not open_now else 1
 
 
 if __name__ == "__main__":

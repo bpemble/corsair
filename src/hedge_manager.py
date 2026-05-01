@@ -180,8 +180,18 @@ class HedgeManager:
         # observe rollback 2026-04-22 on HGJ6, 6 days from expiry). When
         # set to 0, the lockout skip is disabled and we reuse the
         # options engine's underlying contract (legacy behavior).
-        self._lockout_days: int = int(getattr(
+        # 2026-05-01: split into two distinct config knobs to avoid
+        # the cascade where bumping one forces the options engine to
+        # also roll its underlying (which breaks SABR fits + chain
+        # subs). hedge_lockout_days is the AGGRESSIVE roll for the
+        # hedge subsystem only; near_expiry_lockout_days remains the
+        # SHARED-with-market_data knob (still controls underlying
+        # selection for options). When hedge_lockout_days is unset,
+        # fall back to near_expiry_lockout_days for backward compat.
+        shared_default = int(getattr(
             h, "near_expiry_lockout_days", 7))
+        self._lockout_days: int = int(getattr(
+            h, "hedge_lockout_days", shared_default))
         # Resolved hedge contract (post-lockout-skip). Populated by
         # ``resolve_hedge_contract`` at startup; falls back to
         # ``market_data._underlying_contract`` if resolution fails.
