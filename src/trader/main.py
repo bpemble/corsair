@@ -155,6 +155,12 @@ class Trader:
         # Counters for the telemetry payload — parity gap surfaces in
         # logs but operator should also see it on the broker dashboard.
         self.decisions_made: Counter = Counter()
+        # Trader-side TTT histogram (cleanup gap #2). During cut-over,
+        # broker's _decision_tick_ns isn't populated, so the broker's
+        # TTT histogram is empty. Trader measures its own
+        # tick-arrive → place_order-emit latency instead, reports via
+        # telemetry. Bounded ring of recent samples.
+        self.ttt_us: deque[int] = deque(maxlen=500)
         # Phase 3: track our just-sent place_order requests so the
         # next tick on the same key doesn't churn-amend if the price
         # didn't change. Cleared on terminal order_ack so a Cancelled
@@ -309,9 +315,22 @@ class Trader:
                 existing = self._our_orders_by_key.get(key)
                 if existing is not None and existing.get("price") == d["price"]:
                     continue
+                # Cleanup gap #2 — trader-side TTT instrumentation.
+                # Measure broker-tick-emit (wall clock) → trader-place-
+                # order-send (wall clock). Cross-process delta captures
+                # full IPC + trader decision compute. Report via
+                # telemetry; broker's TTT histogram stays empty during
+                # cut-over because broker's _decision_tick_ns isn't
+                # populated when its quote engine is gated off.
+                send_ns = time.time_ns()
+                tick_ns = tick_msg.get("ts_ns")
+                if isinstance(tick_ns, int) and tick_ns > 0:
+                    ttt_us = max(0, (send_ns - tick_ns) // 1000)
+                    if 0 <= ttt_us < 5_000_000:  # cap at 5s sanity
+                        self.ttt_us.append(ttt_us)
                 self.client.send({
                     "type": "place_order",
-                    "ts_ns": time.time_ns(),
+                    "ts_ns": send_ns,
                     "strike": float(strike),
                     "expiry": expiry,
                     "right": right,
@@ -321,7 +340,7 @@ class Trader:
                     "orderRef": "corsair_trader",
                 })
                 self._our_orders_by_key[key] = {
-                    "price": d["price"], "ts_ns": time.time_ns(),
+                    "price": d["price"], "ts_ns": send_ns,
                     "orderId": None,  # filled in by first non-terminal order_ack
                 }
 
@@ -433,6 +452,11 @@ class Trader:
             n = len(lats)
             p50 = lats[n // 2] if n else None
             p99 = lats[int(n * 0.99)] if n else None
+            # Trader-side TTT histogram (gap #2 fix).
+            ttt = sorted(self.ttt_us)
+            ttt_n = len(ttt)
+            ttt_p50 = ttt[ttt_n // 2] if ttt_n else None
+            ttt_p99 = ttt[int(ttt_n * 0.99)] if ttt_n else None
             payload = {
                 "type": "telemetry",
                 "ts_ns": time.time_ns(),
@@ -441,6 +465,9 @@ class Trader:
                 "ipc_p50_us": p50,
                 "ipc_p99_us": p99,
                 "ipc_n": n,
+                "ttt_p50_us": ttt_p50,
+                "ttt_p99_us": ttt_p99,
+                "ttt_n": ttt_n,
                 "n_options": len(self.state.options),
                 "n_active_orders": len(self.state.active_orders),
                 "n_vol_expiries": len(self.state.vol_surface),
@@ -449,10 +476,11 @@ class Trader:
             }
             self.client.send(payload)
             logger.info(
-                "telemetry: events=%d ipc_p50=%sus ipc_p99=%sus opts=%d "
+                "telemetry: events=%d ipc_p50=%sus ipc_p99=%sus "
+                "ttt_p50=%sus ttt_p99=%sus opts=%d "
                 "orders=%d decisions=%s vol_expiries=%d",
                 sum(self.state.event_counts.values()),
-                p50, p99,
+                p50, p99, ttt_p50, ttt_p99,
                 len(self.state.options),
                 len(self.state.active_orders),
                 dict(self.decisions_made),

@@ -383,7 +383,16 @@ class FillHandler:
         # For replayed fills (trade=None), the quote loop is not yet running
         # — skip this to avoid running update_quotes before the main loop has
         # initialized the per-cycle canonical trade index.
+        # Phase 3 cut-over: when CORSAIR_TRADER_PLACES_ORDERS=1, the
+        # trader owns the option order book. The broker's update_quotes
+        # would race with the trader (amending orders trader just placed,
+        # causing churn + stale TTT samples ~400ms p50). Skip this call
+        # in cut-over mode; trader sees the same fill via IPC and reacts
+        # itself.
         if trade is not None:
+            import os as _os
+            if _os.environ.get("CORSAIR_TRADER_PLACES_ORDERS", "").strip() == "1":
+                return
             # Clear margin rejection suppression — the fill changed margin
             # conditions so previously-rejected keys may now be acceptable.
             self.quotes._margin_rejected.clear()

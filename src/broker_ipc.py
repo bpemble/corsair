@@ -254,9 +254,11 @@ class BrokerIPC:
         t = msg.get("type")
         if t == "telemetry":
             logger.info(
-                "trader telemetry: events=%s ipc_p50=%sus ipc_p99=%sus opts=%s orders=%s",
+                "trader telemetry: events=%s ipc_p50=%sus ipc_p99=%sus "
+                "ttt_p50=%sus ttt_p99=%sus opts=%s orders=%s",
                 sum((msg.get("events") or {}).values()),
                 msg.get("ipc_p50_us"), msg.get("ipc_p99_us"),
+                msg.get("ttt_p50_us"), msg.get("ttt_p99_us"),
                 msg.get("n_options"), msg.get("n_active_orders"),
             )
         elif t == "welcome":
