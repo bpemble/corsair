@@ -63,6 +63,24 @@ PLACES_ORDERS = os.environ.get("CORSAIR_TRADER_PLACES_ORDERS", "").strip() == "1
 STALENESS_INTERVAL_S = 0.10       # 10Hz scan
 STALENESS_TICKS = 1               # cancel when off-by-more-than 1 tick vs theo
 
+# Cleanup pass 3 (2026-05-01) defensive constants. Trader will refuse
+# to quote outside this band of ATM strikes — wing extrapolation of
+# the SVI surface is least reliable there, and that's where the
+# fit-forward bug bit hardest. ATM is computed from current spot;
+# strikes whose offset from spot exceeds MAX_STRIKE_OFFSET_USD are
+# silently skipped.
+MAX_STRIKE_OFFSET_USD = 0.30      # ±30 ticks at 0.0005 = ±$0.30, ~5% of HG underlying
+
+# Risk-state freshness. If broker stops sending risk_state events for
+# this long, treat the cached values as suspect and gate ALL placements.
+# Broker sends at 1Hz; threshold is generous to absorb transient lag.
+RISK_STATE_STALE_S = 5.0
+
+# BBO size requirement — paper IBKR matches against displayed depth
+# even when size is 1; refusing to quote into thin books eliminates
+# that vector. Override-able by env if a thinner-book product needs it.
+MIN_BBO_SIZE = int(os.environ.get("CORSAIR_TRADER_MIN_BBO_SIZE", "5"))
+
 
 class TraderState:
     """Trader's local view of the world, populated from broker events."""
@@ -247,10 +265,17 @@ class Trader:
         risk_blocks_sell = False
         risk_blocks_all = False
         eff = self.state.risk_effective_delta
-        if eff is None:
-            # No risk_state seen yet — refuse to place orders. Decision
-            # log will show a "skip" with reason "risk_state_unknown"
-            # so the operator can see how often this fires during boot.
+        # NEW: risk_state freshness. Once seen, treat stale data as
+        # if not seen at all — broker may have crashed or stopped
+        # publishing. Fail closed.
+        risk_age_s = (time.monotonic() - self.state.risk_state_age_ts
+                      if self.state.risk_state_age_ts > 0
+                      else float('inf'))
+        if eff is None or risk_age_s > RISK_STATE_STALE_S:
+            # No risk_state seen yet OR stale — refuse to place orders.
+            # Decision log will show a "skip" with reason "risk_state_unknown"
+            # / "risk_state_stale" so the operator can see how often this
+            # fires.
             risk_blocks_all = True
         else:
             # Within delta_ceiling: a BUY would push delta up by ~1
@@ -288,6 +313,18 @@ class Trader:
         fit_forward = (vp_msg or {}).get("forward")
         decision_forward = float(fit_forward) if fit_forward else forward
 
+        # NEW: ATM-window restriction. Don't quote deep wings where SVI
+        # extrapolation is least reliable — that's where 2026-05-01
+        # adverse fills concentrated. Use current spot (not fit_F) for
+        # the ATM anchor; we want recently-tracked strikes.
+        if abs(float(strike) - forward) > MAX_STRIKE_OFFSET_USD:
+            self.decisions_made["skip_off_atm"] += 1
+            return
+
+        # NEW: extract bid/ask sizes for the thin-book guard.
+        bid_size = tick_msg.get("bid_size")
+        ask_size = tick_msg.get("ask_size")
+
         for side in ("BUY", "SELL"):
             d = decide_quote(
                 forward=decision_forward,
@@ -298,6 +335,11 @@ class Trader:
                 vol_params=vol_params,
                 market_bid=bid,
                 market_ask=ask,
+                market_bid_size=bid_size,
+                market_ask_size=ask_size,
+                min_bbo_size=MIN_BBO_SIZE,
+                fit_forward=decision_forward,
+                current_forward=forward,
                 min_edge_ticks=self.state.min_edge_ticks,
                 tick_size=self.state.tick_size,
             )

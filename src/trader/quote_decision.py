@@ -119,6 +119,14 @@ def decide(
     min_edge_ticks: int,
     tick_size: float,
     tte: Optional[float] = None,
+    # New defensive params (cleanup pass 3, 2026-05-01). All optional so
+    # parity tests still work; trader sets them via state.
+    market_bid_size: Optional[int] = None,
+    market_ask_size: Optional[int] = None,
+    min_bbo_size: int = 5,
+    fit_forward: Optional[float] = None,
+    current_forward: Optional[float] = None,
+    max_forward_drift_ticks: int = 20,
 ) -> dict:
     """Make a single (strike, expiry, right, side) quote decision.
 
@@ -181,6 +189,34 @@ def decide(
     ask_live = market_ask is not None and market_ask > 0
     if not bid_live or not ask_live:
         return {**base, "action": "skip", "reason": "one_sided_or_dark"}
+
+    # NEW: require minimum displayed size on both sides. The 2026-05-01
+    # daytime incident showed that paper IBKR matches resting orders
+    # against ghost flow when displayed size is tiny (1@bid 1@ask), even
+    # if the BBO LOOKED alive at decision time. Refusing to quote when
+    # either side has < min_bbo_size eliminates that vector.
+    if market_bid_size is not None and market_ask_size is not None:
+        if market_bid_size < min_bbo_size or market_ask_size < min_bbo_size:
+            return {**base, "action": "skip", "reason": "thin_book"}
+
+    # NEW: forward-drift guard. SVI/SABR fits are anchored on the fit-
+    # time forward; if the underlying has drifted far from that anchor,
+    # the surface extrapolation is unreliable and our wing-strike theos
+    # become meaningless. Refuse to quote when |spot - fit_F| exceeds
+    # max_forward_drift_ticks. This is a safety net BELOW the fit-cadence
+    # — broker should refit before this triggers, but if it doesn't we
+    # don't want to keep quoting on stale params.
+    if fit_forward is not None and current_forward is not None:
+        drift = abs(current_forward - fit_forward)
+        max_drift = max_forward_drift_ticks * tick_size
+        # Underlying tick is much bigger than option tick (HG: $0.0005
+        # option vs $0.0005 future, but futures move in dollars — so
+        # use 20 ticks ~ $0.01 default). Override at call site if needed.
+        # Actually for HG futures the tick is $0.0005, same as options.
+        # 20 ticks = $0.01 drift on underlying — generous.
+        if drift > max_drift:
+            return {**base, "action": "skip", "reason": "forward_drift",
+                    "drift": drift, "fit_forward": fit_forward}
 
     edge = min_edge_ticks * tick_size
 
