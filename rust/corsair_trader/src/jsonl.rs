@@ -65,6 +65,8 @@ async fn writer_task(
     let mut current_part: u32 = 0;
     let mut current_size: u64 = 0;
     let mut last_dropped_logged: u64 = 0;
+    let mut writes_since_flush: u32 = 0;
+    const WRITES_PER_FLUSH: u32 = 100;
 
     while let Some(value) = rx.recv().await {
         let today = Utc::now();
@@ -126,16 +128,16 @@ async fn writer_task(
             } else {
                 current_size += line.len() as u64;
             }
-            // Periodically log drops if any.
             let d = dropped.load(Ordering::Relaxed);
             if d > last_dropped_logged + 100 {
                 log::warn!("jsonl({}): dropped {} messages cumulative", prefix, d);
                 last_dropped_logged = d;
             }
-            // Flush every event for now (small write rate, helps tail
-            // visibility for live debugging). If volume grows we can
-            // batch-flush.
-            let _ = w.flush();
+            writes_since_flush += 1;
+            if writes_since_flush >= WRITES_PER_FLUSH {
+                let _ = w.flush();
+                writes_since_flush = 0;
+            }
         }
     }
 }
