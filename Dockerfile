@@ -70,4 +70,7 @@ COPY tests/ tests/
 
 RUN mkdir -p logs data span_data
 
-CMD ["python3", "-m", "src.main"]
+# Default CMD points at the Rust broker daemon — Phase 6.7 cutover
+# retired the Python entry point. Compose services override this for
+# trader / dashboard / etc.
+CMD ["/usr/local/bin/corsair_broker_rust"]

@@ -1,10 +1,20 @@
-ib_insync>=0.9.86
+# ib_insync retired 2026-05-02 by Phase 6.7 cutover (NativeBroker).
+# uvloop retired same day — Python trader replaced by Rust binary.
+
+# Math + parity tests
 scipy>=1.10
 numpy>=1.24
+
+# Config + serialization
 pyyaml>=6.0
+msgpack>=1.0
+
+# Dashboard (Streamlit)
 streamlit>=1.37
 streamlit-autorefresh>=1.0
-uvloop>=0.19
-msgpack>=1.0
+
+# Test runner
 pytest>=8.0
+
+# Ops scripts (live_monitor, parity_compare, etc.)
 docker>=7.0
