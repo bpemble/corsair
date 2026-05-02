@@ -22,7 +22,7 @@ WORKDIR /build/rust/corsair_pricing
 # (opt-level=3, thin LTO, codegen-units=1) — we want max perf at the
 # cost of compile time, since this stage is cached when the Rust code
 # doesn't change.
-RUN maturin build --release --out /wheels --interpreter python3
+RUN maturin build --release --features extension-module --out /wheels --interpreter python3
 
 # Build the corsair_trader binary (Rust port of src/trader/main.py).
 # Cleanup pass 11, 2026-05-01: replaces the Python trader binary;

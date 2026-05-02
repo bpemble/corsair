@@ -1,5 +1,5 @@
 [workspace]
-members = ["corsair_broker_api", "corsair_pricing", "corsair_trader"]
+members = ["corsair_broker_api", "corsair_broker_ibkr", "corsair_pricing", "corsair_trader"]
 resolver = "2"
 
 [profile.release]

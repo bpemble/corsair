@@ -5,10 +5,18 @@ edition = "2021"
 
 [lib]
 name = "corsair_pricing"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# `extension-module` is gated behind a feature so the workspace as a
+# whole can be `cargo test`-ed without conflicting with crates that
+# embed Python (e.g. corsair_broker_ibkr, which links libpython).
+# Maturin opts into this feature when building the wheel.
+default = []
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22" }
 statrs = "0.17"
 
 [profile.release]

@@ -194,6 +194,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "corsair_broker_ibkr"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "corsair_broker_api",
+ "env_logger",
+ "log",
+ "pyo3",
+ "serde",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "corsair_pricing"
 version = "0.1.0"
 dependencies = [
