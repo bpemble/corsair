@@ -126,7 +126,8 @@ def main():
     risk_gate = 1      # 6-layer trader gate stack
     wire_encode = 5    # template-cached place_order, was ~20µs before
     tcp_loopback = 100 # gateway is on localhost
-    parse = 35         # post zero-copy upfront-alloc fix; was ~50µs
+    parse = 1          # measured 193 ns/call via examples/parse_bench
+                       # (was estimated at 50 µs — audit was 50x off)
 
     ipc_fifo = 80      # SHM ring + FIFO notify wakeup
     ipc_busypoll = 15  # SHM ring busy-poll, no FIFO

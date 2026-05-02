@@ -268,6 +268,22 @@ pub trait Broker: Send + Sync + 'static {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Install a fast-path tick publisher closure. NativeBroker calls
+    /// this in its tick dispatcher to forward ticks directly to a
+    /// downstream consumer (typically the SHM IPC server's events
+    /// ring), bypassing the broadcast channel + forward task pump.
+    ///
+    /// Default impl: no-op — broadcast channel remains the primary
+    /// tick path. Adapters that want the fast-path optimization
+    /// override this. Returns true if the publisher was actually
+    /// installed; caller falls back to the broadcast pump on false.
+    async fn set_tick_publisher(
+        &self,
+        _publisher: std::sync::Arc<dyn for<'a> Fn(&'a Tick) + Send + Sync + 'static>,
+    ) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@
 
 use std::sync::OnceLock;
 
-use crate::codec::{encode_bool, encode_f64, encode_int, encode_unset};
+use crate::codec::{encode_bool, encode_f64, encode_int, encode_unset, write_f64, write_int};
 use crate::messages::OUT_PLACE_ORDER;
 use crate::requests::{ContractRequest, PlaceOrderParams};
 
@@ -184,26 +184,31 @@ pub fn place_order_fast(
     params: &PlaceOrderParams,
 ) -> Vec<u8> {
     // Estimate capacity: type+order_id (~12) + template (~80) +
-    // body (~80) + trailing (~256) = ~430 bytes. One alloc.
+    // body (~100) + trailing (~256) = ~450 bytes. One alloc.
     let trailing = trailing_bytes();
     let est = 4 + 16 + template.bytes.len() + 200 + trailing.len();
     let mut payload = Vec::with_capacity(est);
 
-    // Header: type_id, order_id
-    push_field(&mut payload, OUT_PLACE_ORDER.to_string().as_bytes());
-    push_field(&mut payload, order_id.to_string().as_bytes());
+    // Header: type_id, order_id — both ints, encoded with itoa
+    // (no String alloc).
+    write_int(&mut payload, crate::messages::OUT_PLACE_ORDER);
+    payload.push(0);
+    write_int(&mut payload, order_id);
+    payload.push(0);
 
     // Pre-encoded contract section (14 fields)
     payload.extend_from_slice(&template.bytes);
 
-    // Order body — 14 dynamic fields. Stack-allocated buffers via
-    // ryu-equivalent are overkill; small heap allocations here are
-    // 100ns-scale and dwarfed by syscall.
+    // Order body — 14 dynamic fields. Floats use ryu directly to
+    // the destination buffer (no String allocation per call).
     push_field(&mut payload, params.action.as_bytes());
-    push_field(&mut payload, encode_f64(params.total_quantity).as_bytes());
+    write_f64(&mut payload, params.total_quantity);
+    payload.push(0);
     push_field(&mut payload, params.order_type.as_bytes());
-    push_field(&mut payload, encode_f64(params.lmt_price).as_bytes());
-    push_field(&mut payload, encode_f64(params.aux_price).as_bytes());
+    write_f64(&mut payload, params.lmt_price);
+    payload.push(0);
+    write_f64(&mut payload, params.aux_price);
+    payload.push(0);
     push_field(&mut payload, params.tif.as_bytes());
     push_field(&mut payload, b""); // ocaGroup
     push_field(&mut payload, params.account.as_bytes());
@@ -219,7 +224,9 @@ pub fn place_order_fast(
     push_field(&mut payload, if params.outside_rth { b"1" } else { b"0" });
     push_field(&mut payload, b"0"); // hidden
     push_field(&mut payload, b""); // sharesAllocation
-    push_field(&mut payload, b"0"); // discretionaryAmt
+    write_f64(&mut payload, 0.0); // discretionaryAmt — must use float
+    payload.push(0);               //   format ("0.0") to match the legacy
+                                   //   encoder's encode_f64(0.0).
     push_field(&mut payload, params.good_till_date.as_bytes());
     push_field(&mut payload, b""); // goodAfterTime
     push_field(&mut payload, b""); // faGroup

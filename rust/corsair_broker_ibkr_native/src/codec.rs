@@ -120,20 +120,55 @@ pub fn encode_handshake(min_version: i32, max_version: i32) -> Vec<u8> {
 }
 
 // ─── Field encoding helpers ───────────────────────────────────────
+//
+// String-returning variants for the legacy slow-path encoder. The hot
+// path (place_template::place_order_fast) uses the `write_*` family
+// below which writes directly into a Vec<u8> with zero allocation per
+// field, via itoa (~5x faster than i32::to_string) and ryu (~6x
+// faster than f64::to_string).
 
 pub fn encode_int(v: i32) -> String {
-    v.to_string()
+    let mut buf = itoa::Buffer::new();
+    buf.format(v).to_string()
 }
 
 pub fn encode_int64(v: i64) -> String {
-    v.to_string()
+    let mut buf = itoa::Buffer::new();
+    buf.format(v).to_string()
 }
 
 pub fn encode_f64(v: f64) -> String {
     if v.is_infinite() {
         "Infinite".into()
     } else {
-        v.to_string()
+        let mut buf = ryu::Buffer::new();
+        buf.format(v).to_string()
+    }
+}
+
+/// Write an i32 directly to `buf` (no String allocation).
+#[inline]
+pub fn write_int(buf: &mut Vec<u8>, v: i32) {
+    let mut itoa_buf = itoa::Buffer::new();
+    buf.extend_from_slice(itoa_buf.format(v).as_bytes());
+}
+
+/// Write an i64 directly to `buf`.
+#[inline]
+pub fn write_int64(buf: &mut Vec<u8>, v: i64) {
+    let mut itoa_buf = itoa::Buffer::new();
+    buf.extend_from_slice(itoa_buf.format(v).as_bytes());
+}
+
+/// Write an f64 directly to `buf`. Mirrors `encode_f64` — emits
+/// "Infinite" for `f64::INFINITY`, ryu shortest-round-trip otherwise.
+#[inline]
+pub fn write_f64(buf: &mut Vec<u8>, v: f64) {
+    if v.is_infinite() {
+        buf.extend_from_slice(b"Infinite");
+    } else {
+        let mut ryu_buf = ryu::Buffer::new();
+        buf.extend_from_slice(ryu_buf.format(v).as_bytes());
     }
 }
 

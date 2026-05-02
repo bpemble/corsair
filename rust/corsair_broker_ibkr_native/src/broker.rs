@@ -158,6 +158,17 @@ impl BrokerChannels {
     }
 }
 
+/// Fast-path tick publisher closure type. NativeBroker calls this in
+/// the dispatcher's TickPrice/TickSize arms to publish ticks
+/// directly to a downstream consumer (typically the SHM IPC server's
+/// events ring), bypassing the broadcast channel + forward_ticks
+/// pump. The closure owns its encoding (msgpack/serde/etc.) so we
+/// don't tie the wire-client crate to a transport library.
+///
+/// The in-process broadcast channel still fires for other consumers
+/// (market_data state, etc.) so this is purely an additional write.
+pub type TickPublisher = Arc<dyn for<'a> Fn(&'a Tick) + Send + Sync + 'static>;
+
 pub struct NativeBroker {
     cfg: NativeBrokerConfig,
     client: Arc<NativeClient>,
@@ -168,6 +179,11 @@ pub struct NativeBroker {
     next_handle: Arc<AtomicI32>,
     connected: Arc<AtomicBool>,
     rx_holder: Mutex<Option<mpsc::Receiver<Vec<String>>>>,
+    /// Optional fast-path tick publisher. When set, the dispatcher
+    /// writes tick events directly to the underlying SHM ring AS WELL
+    /// AS broadcasting on the in-process channel. corsair_broker
+    /// daemon wires this on boot via `set_tick_publisher`.
+    tick_publisher: Arc<Mutex<Option<TickPublisher>>>,
 }
 
 impl NativeBroker {
@@ -183,7 +199,19 @@ impl NativeBroker {
             next_handle: Arc::new(AtomicI32::new(1)),
             connected: Arc::new(AtomicBool::new(false)),
             rx_holder: Mutex::new(Some(rx)),
+            tick_publisher: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Wire a fast-path tick publisher. The closure runs synchronously
+    /// inside the dispatcher's TickPrice/TickSize handlers. It MUST
+    /// be cheap (target: <5 µs). corsair_broker daemon installs this
+    /// on boot to forward ticks directly to the SHM events ring.
+    ///
+    /// Once set, the in-process broadcast channel still fires for
+    /// other consumers (market_data state) — fast-path is additive.
+    pub async fn set_tick_publisher(&self, publisher: TickPublisher) {
+        *self.tick_publisher.lock().await = Some(publisher);
     }
 
     /// Snapshot the current bootstrap-seeding progress.
@@ -250,6 +278,7 @@ impl NativeBroker {
         let state = Arc::clone(&self.state);
         let channels = self.channels.clone();
         let connected = Arc::clone(&self.connected);
+        let tick_publisher_arc = Arc::clone(&self.tick_publisher);
         tokio::spawn(async move {
             while let Some(fields) = rx.recv().await {
                 let parsed = match crate::parse_inbound(&fields) {
@@ -259,7 +288,11 @@ impl NativeBroker {
                         continue;
                     }
                 };
-                Self::route(&state, &channels, parsed).await;
+                // Snapshot the tick publisher Arc (cheap clone).
+                // None until `set_tick_publisher` is called by the
+                // corsair_broker daemon during boot.
+                let tp = tick_publisher_arc.lock().await.clone();
+                Self::route(&state, &channels, parsed, tp.as_deref()).await;
             }
             connected.store(false, Ordering::SeqCst);
             let _ = channels.connection.send(ConnectionEvent {
@@ -274,6 +307,7 @@ impl NativeBroker {
         state: &Arc<Mutex<BrokerState>>,
         channels: &BrokerChannels,
         msg: InboundMsg,
+        tick_publisher: Option<&(dyn Fn(&Tick) + Send + Sync)>,
     ) {
         match msg {
             InboundMsg::Position(p) => {
@@ -429,18 +463,24 @@ impl NativeBroker {
                     _ => None,
                 };
                 if let Some(kind) = kind {
-                    // Read the route, drop the lock, THEN broadcast.
-                    // Keeps tick fast-path independent of slow
-                    // broadcast consumers (P0-5).
                     let iid_opt = state.lock().await.tick_routes.get(&t.req_id).copied();
                     if let Some(iid) = iid_opt {
-                        let _ = channels.ticks.send(Tick {
+                        let tick = Tick {
                             instrument_id: iid,
                             kind,
                             price: Some(t.price),
                             size: None,
                             timestamp_ns: now_ns(),
-                        });
+                        };
+                        // Fast path: write directly to SHM via the
+                        // tick publisher closure. Bypasses the
+                        // broadcast → forward_ticks pump (~20 µs/tick).
+                        if let Some(publish) = tick_publisher {
+                            publish(&tick);
+                        }
+                        // Broadcast for in-process consumers
+                        // (market_data state, etc.).
+                        let _ = channels.ticks.send(tick);
                     }
                 }
             }
@@ -454,13 +494,17 @@ impl NativeBroker {
                 if let Some(kind) = kind {
                     let iid_opt = state.lock().await.tick_routes.get(&t.req_id).copied();
                     if let Some(iid) = iid_opt {
-                        let _ = channels.ticks.send(Tick {
+                        let tick = Tick {
                             instrument_id: iid,
                             kind,
                             price: None,
                             size: Some(t.size as u64),
                             timestamp_ns: now_ns(),
-                        });
+                        };
+                        if let Some(publish) = tick_publisher {
+                            publish(&tick);
+                        }
+                        let _ = channels.ticks.send(tick);
                     }
                 }
             }
@@ -1340,5 +1384,14 @@ impl Broker for NativeBroker {
             progress.account_done,
         );
         Ok(())
+    }
+
+    async fn set_tick_publisher(
+        &self,
+        publisher: Arc<dyn for<'a> Fn(&'a Tick) + Send + Sync + 'static>,
+    ) -> bool {
+        *self.tick_publisher.lock().await = Some(publisher);
+        log::warn!("NativeBroker: tick fast-path publisher installed");
+        true
     }
 }
