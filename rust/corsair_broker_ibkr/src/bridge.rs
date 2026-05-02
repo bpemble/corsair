@@ -318,15 +318,22 @@ def attach_ticker(ticker, queue):
                 let ib_insync = py.import_bound("ib_insync").map_err(|e| {
                     BridgeError::PythonInit(format!("import ib_insync: {e}"))
                 })?;
-                let util = py.import_bound("ib_insync.util").map_err(|e| {
-                    BridgeError::PythonInit(format!("import ib_insync.util: {e}"))
-                })?;
 
-                // Create a fresh asyncio loop on this thread. asyncio's
+                // Create a fresh asyncio loop on this thread and install
+                // it as the thread's current loop. asyncio's
                 // get_event_loop() only works on threads that already
                 // have a loop (the main thread by default); for our
-                // dedicated bridge thread we create one explicitly and
-                // install it.
+                // dedicated bridge thread we create one explicitly.
+                //
+                // We DON'T call ib_insync.util.startLoop() here. That
+                // function applies nest_asyncio to allow nested
+                // run_until_complete from inside async code (e.g. from
+                // a Jupyter cell). For our bridge — where Rust drives
+                // run_until_complete from a sync context — nest_asyncio
+                // creates a loop-binding mismatch (Future "attached to
+                // different loop" errors). The loop we create here is
+                // the only loop ib_insync ever sees; ib_insync's
+                // internal futures bind to it correctly.
                 let new_loop = asyncio
                     .call_method0("new_event_loop")
                     .map_err(|e| {
@@ -337,10 +344,6 @@ def attach_ticker(ticker, queue):
                     .map_err(|e| {
                         BridgeError::PythonInit(format!("set_event_loop: {e}"))
                     })?;
-
-                // ib_insync.util.startLoop() configures nested-loop
-                // support (nest_asyncio); idempotent. Best-effort.
-                let _ = util.call_method0("startLoop");
 
                 let asyncio_loop: PyObject = new_loop.into();
 
@@ -416,12 +419,16 @@ def attach_ticker(ticker, queue):
     fn cmd_connect(state: &PyState) -> Result<(), BrokerError> {
         Python::with_gil(|py| -> Result<(), BrokerError> {
             let ib = state.ib.bind(py);
-            let loop_obj = state.asyncio_loop.bind(py);
 
-            // Lean connect — mirror src/connection.py: only issue the
-            // four init requests we actually need. The full
-            // ib_insync.connectAsync() loads completed orders and
-            // multi-account updates which can take 60+s on FA paper.
+            // Use ib_insync's SYNC connect() rather than connectAsync.
+            // Sync version internally manages its own loop via
+            // ib.run() — works correctly when called from a non-async
+            // context like ours (Rust → with_gil → ib.connect).
+            //
+            // Lean bypass: ib.connect with readonly=False (default)
+            // does the four lean reqs; the v1.4 full bootstrap
+            // (positions + openOrders + accountUpdates) is what we
+            // want and ib_insync's connect handles automatically.
             let kwargs = PyDict::new_bound(py);
             kwargs
                 .set_item("host", &state.gateway_host)
@@ -437,35 +444,17 @@ def attach_ticker(ticker, queue):
                     .set_item("account", &state.account)
                     .map_err(|e| pyerr_to_broker(e, "set account"))?;
             }
-            let coro = ib
-                .call_method("connectAsync", (), Some(&kwargs))
-                .map_err(|e| pyerr_to_broker(e, "connectAsync"))?;
-            run_until_complete(&loop_obj, coro)
-                .map_err(|e| pyerr_to_broker(e, "run_until_complete connect"))?;
+            // Connection timeout (seconds) — IBKR docs recommend ≥30s.
+            kwargs
+                .set_item("timeout", 30)
+                .map_err(|e| pyerr_to_broker(e, "set timeout"))?;
+            ib.call_method("connect", (), Some(&kwargs))
+                .map_err(|e| pyerr_to_broker(e, "connect"))?;
 
             // FA accounts require reqAutoOpenOrders for clientId=0
-            // (CLAUDE.md §1).
+            // (CLAUDE.md §1). Sync version is fine.
             if state.client_id == 0 {
                 let _ = ib.call_method1("reqAutoOpenOrders", (true,));
-            }
-
-            // Seed positions / open orders / account state. ib_insync
-            // exposes async methods for each.
-            for (name, args_tuple) in [
-                ("reqPositionsAsync", PyTuple::empty_bound(py)),
-                ("reqOpenOrdersAsync", PyTuple::empty_bound(py)),
-            ] {
-                if let Ok(coro) = ib.call_method1(name, args_tuple) {
-                    let _ = run_until_complete(&loop_obj, coro);
-                }
-            }
-            // reqAccountUpdatesAsync needs (subscribe=True, account=...)
-            if !state.account.is_empty() {
-                if let Ok(coro) =
-                    ib.call_method1("reqAccountUpdatesAsync", (true, &state.account))
-                {
-                    let _ = run_until_complete(&loop_obj, coro);
-                }
             }
 
             log::warn!(
@@ -863,7 +852,6 @@ def attach_ticker(ticker, queue):
     ) -> Result<Vec<Fill>, BrokerError> {
         Python::with_gil(|py| -> Result<Vec<Fill>, BrokerError> {
             let ib = state.ib.bind(py);
-            let loop_obj = state.asyncio_loop.bind(py);
             let ib_insync = py
                 .import_bound("ib_insync")
                 .map_err(|e| pyerr_to_broker(e, "import ib_insync"))?;
@@ -873,11 +861,10 @@ def attach_ticker(ticker, queue):
             let exec_filter = exec_filter_cls
                 .call0()
                 .map_err(|e| pyerr_to_broker(e, "ExecutionFilter()"))?;
-            let coro = ib
-                .call_method1("reqExecutionsAsync", (exec_filter,))
-                .map_err(|e| pyerr_to_broker(e, "reqExecutionsAsync"))?;
-            let result = run_until_complete(&loop_obj, coro)
-                .map_err(|e| pyerr_to_broker(e, "run_until_complete recent_fills"))?;
+            // Sync version — ib.reqExecutions internally runs the loop.
+            let result = ib
+                .call_method1("reqExecutions", (exec_filter,))
+                .map_err(|e| pyerr_to_broker(e, "reqExecutions"))?;
             let mut out = Vec::new();
             let iter = result
                 .iter()
@@ -902,7 +889,6 @@ def attach_ticker(ticker, queue):
     ) -> Result<Contract, BrokerError> {
         Python::with_gil(|py| -> Result<Contract, BrokerError> {
             let ib = state.ib.bind(py);
-            let loop_obj = state.asyncio_loop.bind(py);
             let ib_insync = py
                 .import_bound("ib_insync")
                 .map_err(|e| pyerr_to_broker(e, "import ib_insync"))?;
@@ -928,16 +914,14 @@ def attach_ticker(ticker, queue):
             let unqualified = cls
                 .call((), Some(&kwargs))
                 .map_err(|e| pyerr_to_broker(e, "Future()"))?;
-            let coro = ib
-                .call_method1("qualifyContractsAsync", (&unqualified,))
-                .map_err(|e| pyerr_to_broker(e, "qualifyContractsAsync"))?;
-            let result = run_until_complete(&loop_obj, coro)
-                .map_err(|e| pyerr_to_broker(e, "run_until_complete qualify"))?;
+            // Sync version — ib.qualifyContracts internally runs the loop.
+            let result = ib
+                .call_method1("qualifyContracts", (&unqualified,))
+                .map_err(|e| pyerr_to_broker(e, "qualifyContracts"))?;
             let qualified_obj = result
                 .get_item(0)
                 .map_err(|_| BrokerError::ContractNotFound(format!("Future {}", q.symbol)))?;
             let parsed = conversion::contract_from_py(&qualified_obj)?;
-            // Cache for later orders.
             state
                 .contract_cache
                 .borrow_mut()
@@ -952,7 +936,6 @@ def attach_ticker(ticker, queue):
     ) -> Result<Contract, BrokerError> {
         Python::with_gil(|py| -> Result<Contract, BrokerError> {
             let ib = state.ib.bind(py);
-            let loop_obj = state.asyncio_loop.bind(py);
             let ib_insync = py
                 .import_bound("ib_insync")
                 .map_err(|e| pyerr_to_broker(e, "import ib_insync"))?;
@@ -987,11 +970,9 @@ def attach_ticker(ticker, queue):
             let unqualified = cls
                 .call((), Some(&kwargs))
                 .map_err(|e| pyerr_to_broker(e, "Option()"))?;
-            let coro = ib
-                .call_method1("qualifyContractsAsync", (&unqualified,))
-                .map_err(|e| pyerr_to_broker(e, "qualifyContractsAsync"))?;
-            let result = run_until_complete(&loop_obj, coro)
-                .map_err(|e| pyerr_to_broker(e, "run_until_complete qualify"))?;
+            let result = ib
+                .call_method1("qualifyContracts", (&unqualified,))
+                .map_err(|e| pyerr_to_broker(e, "qualifyContracts"))?;
             let qualified_obj = result
                 .get_item(0)
                 .map_err(|_| BrokerError::ContractNotFound(format!("Option {} {}", q.symbol, q.expiry)))?;
@@ -1010,7 +991,6 @@ def attach_ticker(ticker, queue):
     ) -> Result<Vec<Contract>, BrokerError> {
         Python::with_gil(|py| -> Result<Vec<Contract>, BrokerError> {
             let ib = state.ib.bind(py);
-            let loop_obj = state.asyncio_loop.bind(py);
             let ib_insync = py
                 .import_bound("ib_insync")
                 .map_err(|e| pyerr_to_broker(e, "import ib_insync"))?;
@@ -1030,11 +1010,10 @@ def attach_ticker(ticker, queue):
             let stub = cls
                 .call((), Some(&kwargs))
                 .map_err(|e| pyerr_to_broker(e, "Future() stub"))?;
-            let coro = ib
-                .call_method1("reqContractDetailsAsync", (stub,))
-                .map_err(|e| pyerr_to_broker(e, "reqContractDetailsAsync"))?;
-            let details_list = run_until_complete(&loop_obj, coro)
-                .map_err(|e| pyerr_to_broker(e, "run_until_complete chain"))?;
+            // Sync version — ib.reqContractDetails internally runs the loop.
+            let details_list = ib
+                .call_method1("reqContractDetails", (stub,))
+                .map_err(|e| pyerr_to_broker(e, "reqContractDetails"))?;
 
             let cutoff = q
                 .min_expiry

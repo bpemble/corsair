@@ -31,6 +31,12 @@ WORKDIR /build/rust
 RUN cargo build --release --bin corsair_trader \
     && cp target/release/corsair_trader /usr/local/bin/corsair_trader_rust
 
+# Build the corsair_broker binary (v3 Phase 4 — replaces the Python
+# corsair-corsair service). Phase 5A deploys this in shadow mode
+# alongside the live Python broker for latency measurement.
+RUN cargo build --release --bin corsair_broker \
+    && cp target/release/corsair_broker /usr/local/bin/corsair_broker_rust
+
 # ── Stage 2: runtime image ────────────────────────────────────────────
 FROM python:3.11-slim
 
@@ -53,6 +59,10 @@ RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 
 # Copy the corsair_trader Rust binary built in stage 1.
 COPY --from=rust-build /usr/local/bin/corsair_trader_rust /usr/local/bin/corsair_trader_rust
+
+# Copy the corsair_broker Rust binary (Phase 4 daemon). Runtime
+# selection is via separate compose service (see corsair-broker-rs).
+COPY --from=rust-build /usr/local/bin/corsair_broker_rust /usr/local/bin/corsair_broker_rust
 
 COPY config/ config/
 COPY src/ src/

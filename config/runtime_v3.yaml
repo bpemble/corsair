@@ -1,0 +1,84 @@
+# Corsair v3 Rust runtime config — Phase 5A SHADOW deployment.
+#
+# Maps the operational settings from config/hg_v1_4_paper.yaml into
+# the v3 schema. corsair_broker daemon (Rust) reads this; Python
+# broker continues to read hg_v1_4_paper.yaml.
+#
+# This config drives the Rust broker in SHADOW mode:
+#   - Connects to IBKR with clientId=10 (separate from Python's 0)
+#   - Ingests state independently
+#   - Publishes its own snapshot to a separate path
+#   - Does NOT place orders (CORSAIR_BROKER_SHADOW=1 default)
+#
+# Once Phase 5B lands (full IPC + cutover), flip CORSAIR_BROKER_SHADOW=0
+# to make this the live runtime.
+
+broker:
+  kind: ibkr
+  ibkr:
+    gateway:
+      # Service uses host networking (network_mode: host) so 127.0.0.1
+      # is the right address for the gateway.
+      host: 127.0.0.1
+      port: 4002
+    # NOTE: clientId=10 (not 0) so Rust broker doesn't conflict with the
+    # live Python broker on clientId=0. Caveat: clientId=0 is the FA
+    # master client (CLAUDE.md §1) — only the master sees order status
+    # for orders placed by ANY client. Since we're in SHADOW mode and
+    # NOT placing orders, this is fine. For Phase 5B cutover, the Rust
+    # broker becomes clientId=0 and Python broker stops.
+    client_id: 10
+    account: DUP553657
+
+risk:
+  daily_pnl_halt_pct: 0.05    # spec §6.1 PRIMARY defense
+  margin_kill_pct: 0.70
+  delta_kill: 5.0
+  vega_kill: 0                 # disabled 2026-04-23 (Alabaster)
+  theta_kill: -500
+
+constraints:
+  capital: 500000
+  margin_ceiling_pct: 0.50    # → $250K soft ceiling
+  delta_ceiling: 3.0
+  theta_floor: -500
+  effective_delta_gating: true
+  margin_escape_enabled: true
+
+products:
+  - name: HG
+    multiplier: 25000
+    default_iv: 0.30
+    quote_range_low: -5
+    quote_range_high: 5
+    strike_increment: 0.05
+    enabled: true
+
+quoting:
+  tick_size: 0.0005
+  min_edge_ticks: 2
+  max_strike_offset_usd: 0.30
+  gtd_lifetime_s: 30.0
+  gtd_refresh_lead_s: 3.5
+  dead_band_ticks: 2
+  min_send_interval_ms: 250
+
+hedging:
+  enabled: true
+  mode: observe                # SHADOW broker observes; doesn't place
+  tolerance_deltas: 0.5
+  rebalance_on_fill: true
+  rebalance_cadence_sec: 30
+  include_in_daily_pnl: true
+  flatten_on_halt: true
+  ioc_tick_offset: 2
+  hedge_tick_size: 0.0005
+  hedge_lockout_days: 30
+
+snapshot:
+  # Separate path so we don't clobber Python broker's snapshot.
+  path: /app/data/snapshot_rust.json
+  cadence_ms: 250
+
+runtime:
+  log_level: info

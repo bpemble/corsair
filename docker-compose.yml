@@ -163,5 +163,40 @@ services:
                fi"]
     restart: unless-stopped
 
+  # ── corsair_broker shadow (v3 Phase 5A) ─────────────────────────────
+  # Rust broker daemon running ALONGSIDE the live Python broker for
+  # validation + latency measurement. Profile-gated so it only starts
+  # when explicitly requested:
+  #   docker compose --profile rust-broker up -d corsair-broker-rs
+  #
+  # Connects to IBKR with clientId=10 (Python broker uses 0). Reads
+  # config/runtime_v3.yaml. Publishes its snapshot to
+  # data/snapshot_rust.json (separate from Python's hg_chain_snapshot).
+  #
+  # SHADOW mode (default): no orders placed. Set
+  # CORSAIR_BROKER_SHADOW=0 to flip to live (only after Phase 5B IPC
+  # work lands; otherwise the trader can't talk to it).
+  corsair-broker-rs:
+    image: corsair-corsair
+    profiles: ["rust-broker"]
+    depends_on:
+      ib-gateway:
+        condition: service_healthy
+    # Host networking — same as corsair + trader. ib-gateway binds the
+    # API socket to localhost only, so bridged containers can't reach it.
+    network_mode: host
+    env_file: .env
+    environment:
+      RUST_LOG: "${RUST_LOG:-info}"
+      CORSAIR_BROKER_CONFIG: "/app/config/runtime_v3.yaml"
+      CORSAIR_BROKER_SHADOW: "${CORSAIR_BROKER_SHADOW:-1}"
+    volumes:
+      - ./logs:/app/logs
+      - ./logs-paper:/app/logs-paper
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    command: ["/usr/local/bin/corsair_broker_rust"]
+    restart: unless-stopped
+
 volumes:
   ib-gateway-data:
