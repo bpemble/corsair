@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "corsair_broker",
     "corsair_broker_api",
     "corsair_broker_ibkr",
     "corsair_constraint",

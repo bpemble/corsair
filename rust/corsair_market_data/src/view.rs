@@ -1,5 +1,11 @@
 //! `MarketDataView` adapter — implements
 //! [`corsair_position::MarketView`] over [`MarketDataState`].
+//!
+//! Two impls of `MarketView`:
+//! 1. **Direct** on `&MarketDataState` — preferred; works under
+//!    `Mutex<MarketDataState>` lock.
+//! 2. **Wrapped** in `MarketDataView` for `Rc<RefCell<...>>` callers
+//!    (single-threaded test fixtures).
 
 use chrono::NaiveDate;
 use corsair_broker_api::Right;
@@ -9,8 +15,41 @@ use std::rc::Rc;
 
 use crate::state::MarketDataState;
 
-/// Wraps an `Rc<RefCell<MarketDataState>>` so the runtime can hand
-/// the same state to PortfolioState as a `&dyn MarketView`.
+// Direct impl — the runtime locks `Mutex<MarketDataState>`, gets
+// `&MarketDataState`, and passes it as `&dyn MarketView` without
+// extra allocation.
+impl MarketView for MarketDataState {
+    fn underlying_price(&self, product: &str) -> Option<f64> {
+        MarketDataState::underlying_price(self, product)
+    }
+
+    fn iv_for(
+        &self,
+        product: &str,
+        strike: f64,
+        expiry: NaiveDate,
+        right: Right,
+    ) -> Option<f64> {
+        let t = self.option(product, strike, expiry, right)?;
+        if t.iv > 0.0 { Some(t.iv) } else { None }
+    }
+
+    fn current_price(
+        &self,
+        product: &str,
+        strike: f64,
+        expiry: NaiveDate,
+        right: Right,
+    ) -> Option<f64> {
+        let t = self.option(product, strike, expiry, right)?;
+        let p = t.current_price();
+        if p > 0.0 { Some(p) } else { None }
+    }
+}
+
+/// Wraps an `Rc<RefCell<MarketDataState>>` for legacy callers that
+/// share state via interior mutability. Production runtime should
+/// use the direct impl on `&MarketDataState`.
 pub struct MarketDataView {
     state: Rc<RefCell<MarketDataState>>,
 }
@@ -33,13 +72,7 @@ impl MarketView for MarketDataView {
         expiry: NaiveDate,
         right: Right,
     ) -> Option<f64> {
-        let s = self.state.borrow();
-        let t = s.option(product, strike, expiry, right)?;
-        if t.iv > 0.0 {
-            Some(t.iv)
-        } else {
-            None
-        }
+        MarketView::iv_for(&*self.state.borrow(), product, strike, expiry, right)
     }
 
     fn current_price(
@@ -49,14 +82,7 @@ impl MarketView for MarketDataView {
         expiry: NaiveDate,
         right: Right,
     ) -> Option<f64> {
-        let s = self.state.borrow();
-        let t = s.option(product, strike, expiry, right)?;
-        let p = t.current_price();
-        if p > 0.0 {
-            Some(p)
-        } else {
-            None
-        }
+        MarketView::current_price(&*self.state.borrow(), product, strike, expiry, right)
     }
 }
 
