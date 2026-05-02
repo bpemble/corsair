@@ -155,11 +155,18 @@ impl NativeClient {
 
         // 4. Send startApi. After this, the server starts streaming
         //    nextValidId, managedAccounts, and any subscribed data.
+        //
+        // NOTE: the 4th field is "optionalCapabilities" (a string),
+        // NOT an account. Passing self.cfg.account here causes IBKR
+        // to reject with error 10106 ("Enabling 'DUP...' via login
+        // is not supported in TWS") and drop the connection. Account
+        // selection happens at the per-order level
+        // (PlaceOrderReq.account) and via reqAccountUpdates.
         let start_api = encode_fields(&[
             &OUT_START_API.to_string(),
             "2", // version
             &self.cfg.client_id.to_string(),
-            self.cfg.account.as_deref().unwrap_or(""),
+            "", // optionalCapabilities — empty
         ]);
         write_half.write_all(&start_api).await?;
         write_half.flush().await?;

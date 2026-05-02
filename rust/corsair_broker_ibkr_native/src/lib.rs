@@ -42,8 +42,23 @@
 
 pub mod client;
 pub mod codec;
+pub mod decoder;
 pub mod error;
 pub mod messages;
+pub mod requests;
+pub mod types;
 
 pub use client::{NativeClient, NativeClientConfig};
+pub use decoder::parse_inbound;
 pub use error::NativeError;
+pub use requests::{
+    cancel_mkt_data, cancel_order, cancel_positions, place_order, req_account_updates,
+    req_all_open_orders, req_auto_open_orders, req_contract_details, req_executions,
+    req_ids, req_managed_accounts, req_mkt_data, req_open_orders, req_positions,
+    ContractRequest, ExecutionFilter, PlaceOrderParams,
+};
+pub use types::{
+    AccountValueMsg, CommissionReportMsg, ContractDecoded, ContractDetailsMsg, ErrorMsg,
+    ExecutionMsg, InboundMsg, OpenOrderMsg, OrderStatusMsg, PositionMsg,
+    TickOptionComputationMsg, TickPriceMsg, TickSizeMsg,
+};
