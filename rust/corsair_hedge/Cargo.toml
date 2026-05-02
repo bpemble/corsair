@@ -1,0 +1,17 @@
+[package]
+name = "corsair_hedge"
+version = "0.1.0"
+edition = "2021"
+description = "Delta-hedge manager: tracks hedge_qty, rebalances against options delta drift, applies fills from broker drop-copy."
+
+[lib]
+name = "corsair_hedge"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+corsair_broker_api = { path = "../corsair_broker_api" }
+corsair_position = { path = "../corsair_position" }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]

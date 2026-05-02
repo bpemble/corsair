@@ -221,6 +221,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "corsair_hedge"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "corsair_broker_api",
+ "corsair_position",
+ "log",
+ "serde",
+]
+
+[[package]]
 name = "corsair_position"
 version = "0.1.0"
 dependencies = [
