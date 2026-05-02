@@ -36,15 +36,13 @@ use crate::runtime::Runtime;
 struct VolSurfaceEvent<'a> {
     #[serde(rename = "type")]
     ty: &'a str,
-    /// "sabr"
-    model: &'a str,
     /// YYYYMMDD string
     expiry: String,
     /// Side: "C", "P", or "BOTH" (combined fit).
     side: &'a str,
     /// Forward used for the fit (parity-implied if available, spot otherwise).
     forward: f64,
-    /// SABR params.
+    /// SABR params (carries `model` field for trader-side dispatch).
     params: SabrParams,
     /// Fit RMSE in IV space.
     rmse: f64,
@@ -56,6 +54,9 @@ struct VolSurfaceEvent<'a> {
 
 #[derive(Debug, Serialize)]
 struct SabrParams {
+    /// "sabr" — required by `corsair_trader::messages::VolParams::model`
+    /// (no default on that field, so deserialization fails without it).
+    model: &'static str,
     alpha: f64,
     beta: f64,
     rho: f64,
@@ -133,11 +134,11 @@ fn fit_and_publish(runtime: &Arc<Runtime>, server: &Arc<SHMServer>) {
                 Some(f) => {
                     let ev = VolSurfaceEvent {
                         ty: "vol_surface",
-                        model: "sabr",
                         expiry: expiry_str.clone(),
                         side: "BOTH",
                         forward,
                         params: SabrParams {
+                            model: "sabr",
                             alpha: f.alpha,
                             beta: f.beta,
                             rho: f.rho,

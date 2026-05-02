@@ -18,16 +18,12 @@
 //!   - [`ring::Ring`] — both client (open existing) AND server
 //!     (create + own) modes.
 //!   - [`server::SHMServer`] — broker-side wrapper that owns both
-//!     rings and the receive task.
-//!   - [`client::SHMClient`] — trader-side wrapper (Phase 5B.5
-//!     migration target — for now corsair_trader keeps its own
-//!     copy).
+//!     rings and the receive task. Trader-side, [`ring::Ring::open_client`]
+//!     is used directly from `corsair_trader` (no client wrapper crate).
 
-pub mod client;
 pub mod protocol;
 pub mod ring;
 pub mod server;
 
-pub use client::SHMClient;
 pub use ring::{Ring, DEFAULT_RING_CAPACITY, HDR_SIZE};
 pub use server::{ServerCommand, ServerConfig, SHMServer};

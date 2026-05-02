@@ -17,5 +17,5 @@ pub mod view;
 
 pub use atm::{AtmTracker, StrikeWindow};
 pub use option_state::OptionTick;
-pub use state::MarketDataState;
+pub use state::{MarketDataState, OptionMeta};
 pub use view::MarketDataView;

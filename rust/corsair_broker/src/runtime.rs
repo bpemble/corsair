@@ -11,7 +11,7 @@ use corsair_broker_ibkr_native::{
 use corsair_constraint::{ConstraintChecker, ConstraintConfig};
 use corsair_hedge::{HedgeConfig, HedgeFanout, HedgeManager, HedgeMode};
 use corsair_market_data::MarketDataState;
-use corsair_oms::{OrderBook, SendOrUpdateConfig};
+use corsair_oms::OrderBook;
 use corsair_position::{PortfolioState, ProductInfo, ProductRegistry};
 use corsair_risk::{RiskConfig, RiskMonitor};
 use corsair_snapshot::{SnapshotConfig, SnapshotPublisher};
@@ -89,9 +89,6 @@ pub struct Runtime {
     /// on (CLAUDE.md §7) and by `IBKRMarginChecker.update_cached_margin`
     /// equivalent to compute the synthetic-vs-IBKR scale (§3).
     pub account: Mutex<corsair_broker_api::AccountSnapshot>,
-
-    /// Send-or-update config snapshotted at construction.
-    pub send_or_update_cfg: SendOrUpdateConfig,
 }
 
 impl Runtime {
@@ -172,14 +169,6 @@ impl Runtime {
         };
         let snapshot = SnapshotPublisher::new(snapshot_cfg);
 
-        let send_or_update_cfg = SendOrUpdateConfig {
-            tick_size: cfg.quoting.tick_size,
-            dead_band_ticks: cfg.quoting.dead_band_ticks,
-            gtd_lifetime_s: cfg.quoting.gtd_lifetime_s,
-            gtd_refresh_lead_s: cfg.quoting.gtd_refresh_lead_s,
-            min_send_interval_ms: cfg.quoting.min_send_interval_ms,
-        };
-
         let runtime = Arc::new(Self {
             mode,
             config: cfg,
@@ -199,7 +188,6 @@ impl Runtime {
                 realized_pnl_today: 0.0,
                 timestamp_ns: 0,
             }),
-            send_or_update_cfg,
         });
 
         // ── Connect ───────────────────────────────────────────────

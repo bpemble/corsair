@@ -22,9 +22,16 @@ export DISPLAY=:1
 # still matches without edits here.
 _vmopts=$(ls /home/ibgateway/Jts/ibgateway/*/ibgateway.vmoptions 2>/dev/null | head -1)
 if [ -n "$_vmopts" ]; then
+    # Heap pin: from default 768m → 4g, or bump prior 2g → 4g.
+    # 2026-05-02 (Alabaster post-bare-metal): bumped 2g→4g while we
+    # had the bonnet open. We have 31GB RAM and the gateway is the
+    # only JVM; less GC frequency is free.
     if grep -q '^-Xmx768m$' "$_vmopts"; then
-        sed -i 's/^-Xmx768m$/-Xms2g\n-Xmx2g/' "$_vmopts"
-        echo ".> JVM heap pinned to 2g (Xms=Xmx)"
+        sed -i 's/^-Xmx768m$/-Xms4g\n-Xmx4g/' "$_vmopts"
+        echo ".> JVM heap pinned to 4g (Xms=Xmx)"
+    elif grep -q '^-Xms2g$' "$_vmopts" && ! grep -q '^-Xms4g$' "$_vmopts"; then
+        sed -i 's/^-Xms2g$/-Xms4g/; s/^-Xmx2g$/-Xmx4g/' "$_vmopts"
+        echo ".> JVM heap bumped 2g → 4g"
     fi
     if grep -q '^-XX:MaxGCPauseMillis=200$' "$_vmopts"; then
         sed -i 's/^-XX:MaxGCPauseMillis=200$/-XX:MaxGCPauseMillis=20/' "$_vmopts"
@@ -33,6 +40,23 @@ if [ -n "$_vmopts" ]; then
     if ! grep -q 'AlwaysPreTouch' "$_vmopts"; then
         echo '-XX:+AlwaysPreTouch' >> "$_vmopts"
         echo ".> JVM AlwaysPreTouch enabled"
+    fi
+    # 2026-05-02 latency experiment: G1 → ZGC. ZGC targets sub-ms
+    # GC pauses (G1 targets 20ms here). Helps p99/p99.9 of place_rtt_us
+    # when GC happens to fire during an order. Java 17 production ZGC.
+    # Revert: change UseZGC back to UseG1GC.
+    if grep -q '^-XX:+UseG1GC$' "$_vmopts"; then
+        sed -i 's/^-XX:+UseG1GC$/-XX:+UseZGC/' "$_vmopts"
+        echo ".> JVM GC: G1 → ZGC (latency experiment 2026-05-02)"
+    fi
+    # 2026-05-02 latency experiment: ParallelGCThreads 20 → 4. Default
+    # of 20 was sized for big servers; gateway runs in cpuset 0,1,6,7
+    # (4 logical cores), so 20 STW threads contend with itself. ZGC
+    # ignores this opt — harmless once UseZGC is on.
+    # Revert: change 4 back to 20.
+    if grep -q '^-XX:ParallelGCThreads=20$' "$_vmopts"; then
+        sed -i 's/^-XX:ParallelGCThreads=20$/-XX:ParallelGCThreads=4/' "$_vmopts"
+        echo ".> JVM ParallelGCThreads: 20 → 4 (matches cpuset)"
     fi
 fi
 

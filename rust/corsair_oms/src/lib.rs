@@ -27,9 +27,7 @@
 //!    between sends per key (defensive backstop).
 
 pub mod book;
-pub mod decision;
 pub mod key;
 
 pub use book::{OrderBook, OrderRecord, OrderState};
-pub use decision::{DecideContext, OrderAction, SendOrUpdateConfig};
 pub use key::OurKey;

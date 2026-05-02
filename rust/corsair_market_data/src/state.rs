@@ -31,6 +31,17 @@ struct OptionKey {
     right: Right,
 }
 
+/// Public read-only view of an option's contract metadata, returned
+/// by [`MarketDataState::option_meta`]. Owned so callers don't have
+/// to hold the state lock past the lookup.
+#[derive(Debug, Clone)]
+pub struct OptionMeta {
+    pub product: String,
+    pub strike: f64,
+    pub expiry: NaiveDate,
+    pub right: Right,
+}
+
 fn strike_key(s: f64) -> i64 {
     (s * 10_000.0).round() as i64
 }
@@ -166,6 +177,21 @@ impl MarketDataState {
 
     pub fn option_count(&self) -> usize {
         self.options.len()
+    }
+
+    /// Public accessor for tick-forwarding paths that need to enrich
+    /// per-instrument-id ticks with option metadata. Returns None for
+    /// unregistered ids (e.g. an underlying tick or a stream race
+    /// before `register_option` ran).
+    pub fn option_meta(&self, iid: InstrumentId) -> Option<OptionMeta> {
+        let key = self.by_instrument.get(&iid)?;
+        let tick = self.options.get(key)?;
+        Some(OptionMeta {
+            product: key.product.clone(),
+            strike: tick.strike,
+            expiry: tick.expiry,
+            right: tick.right,
+        })
     }
 }
 

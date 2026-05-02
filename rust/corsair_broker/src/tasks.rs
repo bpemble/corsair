@@ -60,22 +60,16 @@ async fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::F
     // instrument matches the hedge contract.)
     {
         let mut h = runtime.hedge.lock().unwrap();
-        for m in 0..h.managers().len() {
-            // Borrow checker: use for_product_mut keyed by symbol
-            // is awkward in a loop; use index-by-position via a
-            // helper. The Phase 3 fanout doesn't expose mut iter,
-            // so we walk the products manually.
-            let products: Vec<String> =
-                h.managers().iter().map(|x| x.config().product.clone()).collect();
-            let _ = m;
-            for prod in &products {
-                if let Some(mgr) = h.for_product_mut(prod) {
-                    if mgr.apply_broker_fill(&fill) {
-                        return;
-                    }
+        // HedgeFanout exposes `for_product_mut(name)` but no mut iter,
+        // so collect product names then dispatch each.
+        let products: Vec<String> =
+            h.managers().iter().map(|x| x.config().product.clone()).collect();
+        for prod in &products {
+            if let Some(mgr) = h.for_product_mut(prod) {
+                if mgr.apply_broker_fill(&fill) {
+                    return;
                 }
             }
-            break;
         }
     }
 
@@ -379,26 +373,37 @@ async fn periodic_risk_check(runtime: Arc<Runtime>) {
     }
 }
 
-/// Cancel every live OMS order via the broker. Called from any kill
-/// path (risk check, per-fill daily-halt). Mirrors
-/// `quote_engine.cancel_all_quotes` in Python broker. Best-effort:
-/// logs cancel failures but doesn't propagate (kill semantics need
-/// to fire even if a cancel races a fill).
+/// Cancel every live order at the broker. Called from any kill path
+/// (risk check, per-fill daily-halt). Mirrors `quote_engine.cancel_all_quotes`
+/// in Python broker. Best-effort: logs cancel failures but doesn't propagate
+/// (kill semantics need to fire even if a cancel races a fill).
+///
+/// Uses `Broker::open_orders()` (IBKR-authoritative) instead of the
+/// runtime OMS, which is not populated by the broker daemon — using
+/// the OMS would cancel zero orders and the kill would be cosmetic.
 async fn cancel_all_resting(runtime: &Arc<Runtime>, reason: &str) {
-    let order_ids: Vec<corsair_broker_api::OrderId> = {
-        let oms = runtime.oms.lock().unwrap();
-        oms.live_orders().filter_map(|r| r.order_id).collect()
+    let b = runtime.broker.lock().await;
+    let opens = match b.open_orders().await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("cancel_all_resting[{reason}]: open_orders query failed: {e}");
+            return;
+        }
     };
-    if order_ids.is_empty() {
-        log::warn!("cancel_all_resting[{reason}]: no live orders");
+    let actionable: Vec<corsair_broker_api::OrderId> = opens
+        .into_iter()
+        .filter(|o| o.remaining_qty > 0)
+        .map(|o| o.order_id)
+        .collect();
+    if actionable.is_empty() {
+        log::warn!("cancel_all_resting[{reason}]: no live orders at broker");
         return;
     }
     log::warn!(
         "cancel_all_resting[{reason}]: cancelling {} orders",
-        order_ids.len()
+        actionable.len()
     );
-    let b = runtime.broker.lock().await;
-    for oid in order_ids {
+    for oid in actionable {
         if let Err(e) = b.cancel_order(oid).await {
             log::warn!("cancel_all_resting[{reason}]: cancel {oid:?} failed: {e}");
         }
@@ -611,19 +616,30 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
     log::info!("periodic_snapshot: cadence {cadence}ms");
     loop {
         t.tick().await;
+        // Build the AccountSnapshot payload from `runtime.account` and
+        // the constraint checker's IBKR scale. Previously this passed
+        // `AccountSnapshot::default()` so the dashboard saw zero NLV /
+        // margin / buying_power even though periodic_account_poll was
+        // updating runtime.account every 5 min.
+        let acct_payload = {
+            let a = runtime.account.lock().unwrap();
+            let cc = runtime.constraint.lock().unwrap();
+            corsair_snapshot::payload::AccountSnapshot {
+                net_liquidation: a.net_liquidation,
+                maintenance_margin: a.maintenance_margin,
+                initial_margin: a.initial_margin,
+                buying_power: a.buying_power,
+                realized_pnl_today: a.realized_pnl_today,
+                ibkr_scale: cc.ibkr_scale(),
+            }
+        };
         let result = {
             let p = runtime.portfolio.lock().unwrap();
             let r = runtime.risk.lock().unwrap();
             let h = runtime.hedge.lock().unwrap();
             let md = runtime.market_data.lock().unwrap();
             let mut s = runtime.snapshot.lock().unwrap();
-            s.publish(
-                &p,
-                &r,
-                &h,
-                &*md,
-                corsair_snapshot::payload::AccountSnapshot::default(),
-            )
+            s.publish(&p, &r, &h, &*md, acct_payload)
         };
         if let Err(e) = result {
             log::warn!("snapshot publish failed: {e}");

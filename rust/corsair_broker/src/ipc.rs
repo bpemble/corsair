@@ -23,7 +23,7 @@
 
 use corsair_broker_api::{
     ContractKind, Currency, Exchange, ModifyOrderReq, OrderId,
-    OrderType, PlaceOrderReq, Side, TimeInForce,
+    OrderType, PlaceOrderReq, Right, Side, TickKind, TimeInForce,
 };
 use corsair_ipc::{ServerCommand, ServerConfig, SHMServer};
 use serde::{Deserialize, Serialize};
@@ -97,23 +97,59 @@ pub fn spawn_ipc(
 /// subscribed to the broadcast channel.
 async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
     let server_for_closure = Arc::clone(&server);
+    let runtime_for_closure = Arc::clone(runtime);
+    // Per-instrument bid/ask/size cache shared across publisher invocations.
+    // Mutex lock is brief (HashMap entry update + msgpack encode) and the
+    // tick rate is low enough that contention isn't a concern.
+    let cache: Arc<std::sync::Mutex<std::collections::HashMap<u64, ConsolidatedTick>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let publisher: std::sync::Arc<dyn for<'a> Fn(&'a corsair_broker_api::Tick) + Send + Sync + 'static> =
         std::sync::Arc::new(move |tick: &corsair_broker_api::Tick| {
-            let kind_str = match tick.kind {
-                corsair_broker_api::TickKind::Bid => "bid",
-                corsair_broker_api::TickKind::Ask => "ask",
-                corsair_broker_api::TickKind::Last => "last",
-                corsair_broker_api::TickKind::BidSize => "bid_size",
-                corsair_broker_api::TickKind::AskSize => "ask_size",
-                corsair_broker_api::TickKind::Volume => "volume",
+            // Trader only consumes bid/ask + sizes (consolidates them into
+            // OptionState). Skip last/volume.
+            if !matches!(
+                tick.kind,
+                TickKind::Bid | TickKind::Ask | TickKind::BidSize | TickKind::AskSize
+            ) {
+                return;
+            }
+            let meta = {
+                let md = runtime_for_closure.market_data.lock().unwrap();
+                md.option_meta(tick.instrument_id)
             };
+            let Some(meta) = meta else { return };
+            let mut cache_guard = cache.lock().unwrap();
+            let entry = cache_guard.entry(tick.instrument_id.0).or_insert_with(|| {
+                ConsolidatedTick {
+                    expiry: meta.expiry.format("%Y%m%d").to_string(),
+                    right: match meta.right {
+                        Right::Call => "C",
+                        Right::Put => "P",
+                    },
+                    strike: meta.strike,
+                    bid: None,
+                    ask: None,
+                    bid_size: None,
+                    ask_size: None,
+                }
+            });
+            match tick.kind {
+                TickKind::Bid => entry.bid = tick.price,
+                TickKind::Ask => entry.ask = tick.price,
+                TickKind::BidSize => entry.bid_size = tick.size.map(|s| s as i32),
+                TickKind::AskSize => entry.ask_size = tick.size.map(|s| s as i32),
+                _ => return,
+            }
             let ev = TickEvent {
                 ty: "tick",
-                instrument_id: tick.instrument_id.0,
-                kind: kind_str,
-                price: tick.price,
-                size: tick.size,
-                timestamp_ns: tick.timestamp_ns,
+                strike: entry.strike,
+                expiry: &entry.expiry,
+                right: entry.right,
+                bid: entry.bid,
+                ask: entry.ask,
+                bid_size: entry.bid_size,
+                ask_size: entry.ask_size,
+                ts_ns: tick.timestamp_ns,
             };
             if let Ok(body) = rmp_serde::to_vec_named(&ev) {
                 if !server_for_closure.publish(&body) {
@@ -221,18 +257,6 @@ struct ConnectionEventMsg<'a> {
     state: &'a str,
     reason: Option<&'a str>,
     timestamp_ns: u64,
-}
-
-#[derive(Debug, Serialize)]
-struct PlaceAckEvent<'a> {
-    #[serde(rename = "type")]
-    ty: &'a str,
-    /// Caller-side ref so trader can match this ack to its place call.
-    client_order_ref: &'a str,
-    /// Broker-assigned id (None on rejection).
-    order_id: Option<u64>,
-    rejected: bool,
-    reason: Option<&'a str>,
 }
 
 // ─── Command dispatch ────────────────────────────────────────────
@@ -509,30 +533,41 @@ async fn forward_connection(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
     }
 }
 
-// Suppress dead-code warning on unused PlaceAckEvent (Phase 5B.3+
-// will publish it once we add place_ack semantics to the broker
-// trait).
-#[allow(dead_code)]
-fn _suppress_dead_code(e: PlaceAckEvent<'_>) {
-    let _ = e.ty;
-    let _ = e.client_order_ref;
-    let _ = e.order_id;
-    let _ = e.rejected;
-    let _ = e.reason;
-}
-
 // ─── Tick forwarding ─────────────────────────────────────────────
 
+/// Trader-facing consolidated tick. Trader's `TickMsg`
+/// (`corsair_trader::messages::TickMsg`) requires `strike`, `expiry`,
+/// `right` (no defaults) and overwrites its OptionState entry on each
+/// tick — so we need consolidated bid/ask/sizes here, not single-side.
 #[derive(Debug, Serialize)]
 struct TickEvent<'a> {
     #[serde(rename = "type")]
     ty: &'a str,
-    instrument_id: u64,
-    /// "bid" / "ask" / "last" / "bid_size" / "ask_size" / "volume"
-    kind: &'a str,
-    price: Option<f64>,
-    size: Option<u64>,
-    timestamp_ns: u64,
+    strike: f64,
+    /// YYYYMMDD (matches what `vol_surface` emits, so trader's
+    /// `(expiry, side_char)` lookup hits).
+    expiry: &'a str,
+    /// "C" or "P".
+    right: &'a str,
+    bid: Option<f64>,
+    ask: Option<f64>,
+    bid_size: Option<i32>,
+    ask_size: Option<i32>,
+    ts_ns: u64,
+}
+
+/// Per-instrument bid/ask/size cache. Native ticks arrive per-kind
+/// (Bid OR Ask OR BidSize OR AskSize); we accumulate here and emit a
+/// consolidated frame on every update so the trader can overwrite
+/// OptionState without losing the other side.
+struct ConsolidatedTick {
+    expiry: String,
+    right: &'static str,
+    strike: f64,
+    bid: Option<f64>,
+    ask: Option<f64>,
+    bid_size: Option<i32>,
+    ask_size: Option<i32>,
 }
 
 async fn forward_ticks(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
@@ -541,29 +576,61 @@ async fn forward_ticks(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
         b.subscribe_ticks_stream()
     };
     log::info!("ipc forward_ticks: subscribed");
+    let mut cache: std::collections::HashMap<u64, ConsolidatedTick> =
+        std::collections::HashMap::new();
     loop {
         match rx.recv().await {
             Ok(tick) => {
-                let kind_str = match tick.kind {
-                    corsair_broker_api::TickKind::Bid => "bid",
-                    corsair_broker_api::TickKind::Ask => "ask",
-                    corsair_broker_api::TickKind::Last => "last",
-                    corsair_broker_api::TickKind::BidSize => "bid_size",
-                    corsair_broker_api::TickKind::AskSize => "ask_size",
-                    corsair_broker_api::TickKind::Volume => "volume",
+                // Skip tick kinds the trader doesn't consume.
+                let is_consumable = matches!(
+                    tick.kind,
+                    TickKind::Bid | TickKind::Ask | TickKind::BidSize | TickKind::AskSize
+                );
+                if !is_consumable {
+                    continue;
+                }
+                // Resolve instrument_id → option meta. Underlying ticks
+                // and unregistered ids return None — silently skipped
+                // (underlying flows over a different event type).
+                let meta = {
+                    let md = runtime.market_data.lock().unwrap();
+                    md.option_meta(tick.instrument_id)
                 };
+                let Some(meta) = meta else { continue };
+                let entry = cache.entry(tick.instrument_id.0).or_insert_with(|| {
+                    ConsolidatedTick {
+                        expiry: meta.expiry.format("%Y%m%d").to_string(),
+                        right: match meta.right {
+                            Right::Call => "C",
+                            Right::Put => "P",
+                        },
+                        strike: meta.strike,
+                        bid: None,
+                        ask: None,
+                        bid_size: None,
+                        ask_size: None,
+                    }
+                });
+                match tick.kind {
+                    TickKind::Bid => entry.bid = tick.price,
+                    TickKind::Ask => entry.ask = tick.price,
+                    TickKind::BidSize => entry.bid_size = tick.size.map(|s| s as i32),
+                    TickKind::AskSize => entry.ask_size = tick.size.map(|s| s as i32),
+                    _ => unreachable!(),
+                }
                 let ev = TickEvent {
                     ty: "tick",
-                    instrument_id: tick.instrument_id.0,
-                    kind: kind_str,
-                    price: tick.price,
-                    size: tick.size,
-                    timestamp_ns: tick.timestamp_ns,
+                    strike: entry.strike,
+                    expiry: &entry.expiry,
+                    right: entry.right,
+                    bid: entry.bid,
+                    ask: entry.ask,
+                    bid_size: entry.bid_size,
+                    ask_size: entry.ask_size,
+                    ts_ns: tick.timestamp_ns,
                 };
                 if let Ok(body) = rmp_serde::to_vec_named(&ev) {
                     if !server.publish(&body) {
-                        // Tick stream is high-volume; only log dropped
-                        // frames every now and then to avoid log flood.
                         log::debug!("ipc events ring full — dropped tick");
                     }
                 }

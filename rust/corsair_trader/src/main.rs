@@ -39,11 +39,10 @@ fn now_ns_wall() -> u64 {
 }
 
 fn now_ns_monotonic() -> u64 {
+    use std::sync::OnceLock;
     use std::time::Instant;
-    static mut START: Option<Instant> = None;
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| unsafe { START = Some(Instant::now()) });
-    let start = unsafe { START.unwrap() };
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = *START.get_or_init(Instant::now);
     Instant::now().duration_since(start).as_nanos() as u64
 }
 
@@ -187,10 +186,6 @@ async fn main() -> std::io::Result<()> {
 
     // Hot loop: tight read of events ring + decision dispatch.
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-    // event_count was a local debug counter; telemetry uses the
-    // shared `total_events` accumulator instead. Keep here only to
-    // avoid a Vec.is_empty()-style ambient zero in the loop.
-    let _event_count = 0u64;
 
     // Mode select: busy-poll (CORSAIR_TRADER_BUSY_POLL=1) trades 1
     // CPU core for ~50-100µs latency reduction by skipping the FIFO

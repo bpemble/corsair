@@ -11,12 +11,21 @@ services:
     restart: unless-stopped
     network_mode: host
     env_file: .env
+    # Bare-metal Phase 4 (2026-05-02, i7-10710U 6c/12t): SMT-aware pin to
+    # physical cores 0-1 (logical 0,1,6,7). Gateway is JVM, low-priority,
+    # shares cores with the OS. isolcpus reserves cores 2-5 for broker/
+    # trader so this constraint keeps the JVM out of their way.
+    cpuset: "0,1,6,7"
     command: ["/bin/bash", "/mnt/scripts/gateway_run.sh"]
     environment:
       TRADING_MODE: ${TRADING_MODE:-paper}
       TWS_ACCEPT_INCOMING: "accept"
       READ_ONLY_API: "no"
       TWS_PORT: "${TWS_PORT:-4002}"
+      # Bare-metal cutover 2026-05-02: this host claims the IBKR session,
+      # overriding any concurrent gateway. 'primaryoverride' lets the VPS
+      # reclaim it during the 7-day rollback window (CLAUDE.md Part 4.4).
+      EXISTING_SESSION_DETECTED_ACTION: "${EXISTING_SESSION_DETECTED_ACTION:-primaryoverride}"
     volumes:
       - ib-gateway-data:/opt/ibgateway
       - ./scripts/gateway_run.sh:/mnt/scripts/gateway_run.sh:ro
@@ -137,35 +146,31 @@ services:
   trader:
     image: corsair-corsair
     depends_on:
-      # Post-cutover (Phase 6.7): trader depends on the Rust broker, not
-      # the retired Python broker. Old behavior preserved by setting
-      # TRADER_BROKER_DEP=corsair via env if rollback is needed.
       corsair-broker-rs:
         condition: service_started
     network_mode: host
     env_file: .env
+    # Phase 4 SMT-aware pin: physical cores 4-5 (logical 4,5,10,11).
+    # Hot-loop (decision + place_order) lives on these isolated cores.
+    cpuset: "4,5,10,11"
+    mem_reservation: 1g
+    cap_add:
+      - SYS_NICE
     environment:
       LOG_LEVEL: "${TRADER_LOG_LEVEL:-INFO}"
-      CORSAIR_IPC_SOCKET: "${CORSAIR_IPC_SOCKET:-/app/data/corsair_ipc.sock}"
-      # Post-cutover default: SHM transport (Rust broker uses SHM rings).
-      CORSAIR_IPC_TRANSPORT: "${CORSAIR_IPC_TRANSPORT:-shm}"
-      CORSAIR_CONFIG: "${CORSAIR_CONFIG:-config/hg_v1_4_paper.yaml}"
-      # Live placement now default-on after Phase 6.7 cutover. Set to
-      # empty string to disable (trader logs decisions only).
+      # Rust trader requires the SHM transport — no socket fallback
+      # (the Python trader's Unix-socket path was retired Phase 6.8a).
+      CORSAIR_IPC_TRANSPORT: "shm"
+      # Live placement default-on. Set to empty string to disable
+      # (trader logs decisions only).
       CORSAIR_TRADER_PLACES_ORDERS: "${CORSAIR_TRADER_PLACES_ORDERS:-1}"
-      CORSAIR_TRADER_BACKEND: "${CORSAIR_TRADER_BACKEND:-}"
-      # Post-cutover default: Rust trader binary (10x lower TTT than
-      # Python trader). Requires CORSAIR_IPC_TRANSPORT=shm.
-      CORSAIR_TRADER_LANG: "${CORSAIR_TRADER_LANG:-rust}"
+      # Busy-poll the SHM events ring instead of FIFO-wake. Trades 1
+      # isolated core hot for ~13 µs IPC latency reduction (CLAUDE.md §17).
+      CORSAIR_TRADER_BUSY_POLL: "${CORSAIR_TRADER_BUSY_POLL:-1}"
     volumes:
       - ./logs-paper:/app/logs-paper      # event JSONL output
-      - ./data:/app/data                  # IPC socket lives here
-    command: ["sh", "-c",
-              "if [ \"$$CORSAIR_TRADER_LANG\" = rust ]; then \
-                  exec /usr/local/bin/corsair_trader_rust; \
-               else \
-                  exec python3 -m src.trader.main; \
-               fi"]
+      - ./data:/app/data                  # IPC ring files live here
+    command: ["/usr/local/bin/corsair_trader_rust"]
     restart: unless-stopped
 
   # ── corsair_broker shadow (v3 Phase 5A) ─────────────────────────────
@@ -190,6 +195,12 @@ services:
     # API socket to localhost only, so bridged containers can't reach it.
     network_mode: host
     env_file: .env
+    # Phase 4 SMT-aware pin: physical cores 2-3 (logical 2,3,8,9).
+    # Owns gateway TCP, IPC server, snapshot writer, vol surface, hedge.
+    cpuset: "2,3,8,9"
+    mem_reservation: 2g
+    cap_add:
+      - SYS_NICE
     environment:
       RUST_LOG: "${RUST_LOG:-info}"
       CORSAIR_BROKER_CONFIG: "/app/config/runtime_v3.yaml"
@@ -201,6 +212,17 @@ services:
       - ./data:/app/data
       - ./config:/app/config:ro
     command: ["/usr/local/bin/corsair_broker_rust"]
+    # Snapshot freshness as a liveness signal — broker writes
+    # /app/data/hg_chain_snapshot.json every 250ms in steady state.
+    # If it's >60s old, the periodic_snapshot loop is hung even if
+    # the process is still alive. `restart: unless-stopped` will
+    # recreate after 3 failures.
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /app/data/hg_chain_snapshot.json && test $$(( $$(date +%s) - $$(stat -c %Y /app/data/hg_chain_snapshot.json) )) -lt 60"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
     restart: unless-stopped
 
 volumes:
