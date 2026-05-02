@@ -6,6 +6,9 @@
 
 use corsair_broker_api::Broker;
 use corsair_broker_ibkr::{BridgeConfig, IbkrAdapter};
+use corsair_broker_ibkr_native::{
+    client::NativeClientConfig, NativeBroker, NativeBrokerConfig,
+};
 use corsair_constraint::{ConstraintChecker, ConstraintConfig};
 use corsair_hedge::{HedgeConfig, HedgeFanout, HedgeManager, HedgeMode};
 use corsair_market_data::MarketDataState;
@@ -289,7 +292,10 @@ impl Runtime {
 
 fn build_broker(cfg: &BrokerDaemonConfig) -> Result<Box<dyn Broker>, RuntimeError> {
     match cfg.broker.kind.as_str() {
-        "ibkr" => {
+        // PyO3-bridged adapter — uses ib_insync. Retired path; kept for
+        // emergency rollback only. Set CORSAIR_BROKER_KIND=ibkr_pyo3 (or
+        // broker.kind=ibkr_pyo3 in config) to use this.
+        "ibkr_pyo3" => {
             let ibkr = cfg
                 .broker
                 .ibkr
@@ -302,9 +308,30 @@ fn build_broker(cfg: &BrokerDaemonConfig) -> Result<Box<dyn Broker>, RuntimeErro
                 account: ibkr.account.clone(),
                 poll_interval_ms: 1,
             };
-            // Initialize embedded Python before constructing the bridge.
             corsair_broker_ibkr::init_python();
             let adapter = IbkrAdapter::new(bridge_cfg)?;
+            Ok(Box::new(adapter))
+        }
+        // Native Rust IBKR client — Phase 6 default. Direct TCP wire
+        // protocol, no Python in the loop.
+        "ibkr" | "ibkr_native" => {
+            let ibkr = cfg
+                .broker
+                .ibkr
+                .as_ref()
+                .ok_or_else(|| RuntimeError::Internal("missing broker.ibkr".into()))?;
+            let nb_cfg = NativeBrokerConfig {
+                client: NativeClientConfig {
+                    host: ibkr.gateway.host.clone(),
+                    port: ibkr.gateway.port,
+                    client_id: ibkr.client_id,
+                    account: None,
+                    connect_timeout: std::time::Duration::from_secs(10),
+                    handshake_timeout: std::time::Duration::from_secs(10),
+                },
+                account: ibkr.account.clone(),
+            };
+            let adapter = NativeBroker::new(nb_cfg);
             Ok(Box::new(adapter))
         }
         "ilink" => Err(RuntimeError::Internal(

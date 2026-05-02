@@ -16,6 +16,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 corsair_broker_api = { path = "../corsair_broker_api" }
 corsair_broker_ibkr = { path = "../corsair_broker_ibkr" }
+corsair_broker_ibkr_native = { path = "../corsair_broker_ibkr_native" }
 corsair_constraint = { path = "../corsair_constraint" }
 corsair_hedge = { path = "../corsair_hedge" }
 corsair_ipc = { path = "../corsair_ipc" }
