@@ -9,6 +9,11 @@ use std::collections::VecDeque;
 /// expiry/right strings that the TickMsg carries (they're already in
 /// the key tuple); avoids one heap allocation per tick. Also avoids
 /// pulling the message-type string into the hot path.
+///
+/// `strike` and `ts_ns` are read by `staleness_check` (in main.rs)
+/// and the JSONL writers; the warning about them being "never read"
+/// is a false positive when the struct is matched generically.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OptionState {
     pub strike: f64,
@@ -26,6 +31,9 @@ pub struct VolSurfaceEntry {
 }
 
 /// Per-resting-order metadata; keyed by (strike, expiry, right, side).
+/// `send_ns` is for log fidelity only; the hot path uses
+/// `place_monotonic_ns` for cooldown / GTD tracking.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OurOrder {
     pub price: f64,

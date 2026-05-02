@@ -19,7 +19,7 @@ extension-module = ["pyo3/extension-module"]
 pyo3 = { version = "0.22" }
 statrs = "0.17"
 
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
+# [profile.release] removed — workspace root owns release profile.
+# (Per-crate profile.release is silently ignored by cargo and emits
+# a build warning. Workspace root rust/Cargo.toml has the canonical
+# values: opt-level=3, lto=thin, codegen-units=1.)

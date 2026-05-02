@@ -19,7 +19,7 @@
 //!     wire when corsair_market_data is integrated)
 //!   ⏸ Forward vol_surface events (needs SABR fitter orchestration
 //!     in Rust — Phase 6 work)
-//!   ⏸ Forward risk_state at 1Hz (straightforward — TODO)
+//!   ✓ Forward risk_state at 1Hz (Phase 5B.6, see periodic_risk_state)
 
 use corsair_broker_api::{
     ContractKind, Currency, Exchange, ModifyOrderReq, OrderId,

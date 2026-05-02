@@ -25,8 +25,4 @@ ahash = "0.8"
 # and trader use one source of truth for the wire format.
 corsair_ipc = { path = "../corsair_ipc" }
 
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-debug = "line-tables-only"
+# [profile.release] removed — workspace root owns release profile.

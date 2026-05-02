@@ -73,6 +73,10 @@ pub struct VolParams {
     pub nu: Option<f64>,
 }
 
+/// Underlying-tick wire message. `ts_ns` is parsed but not read by
+/// hot-path code (trader uses its own monotonic clock for timing);
+/// kept on the struct so deserialization stays canonical.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnderlyingTickMsg {
     pub price: f64,
@@ -80,6 +84,10 @@ pub struct UnderlyingTickMsg {
     pub ts_ns: Option<u64>,
 }
 
+/// Risk state from broker. Hot path reads only the gating-relevant
+/// subset (effective_delta, margin_pct); the others are parsed for
+/// telemetry / future use.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskStateMsg {
     pub margin_usd: f64,
@@ -94,6 +102,10 @@ pub struct RiskStateMsg {
     pub n_positions: i64,
 }
 
+/// place_ack message from broker. The trader uses order_id to map
+/// place commands back to keys (see state.rs::OurOrder); the other
+/// fields are parsed for completeness/log fidelity.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderAckMsg {
     #[serde(rename = "orderId", default)]

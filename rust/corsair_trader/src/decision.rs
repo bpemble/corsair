@@ -6,11 +6,14 @@
 
 use crate::messages::{TickMsg, VolParams};
 use crate::pricing::{black76_price, sabr_implied_vol, svi_implied_vol};
-use crate::state::{DecisionCounters, OurOrder, TraderState};
+use crate::state::{DecisionCounters, TraderState};
 
 // Constants matching Python's src/trader/main.py.
 pub const MAX_STRIKE_OFFSET_USD: f64 = 0.30;
-pub const STALENESS_INTERVAL_SECS: f64 = 0.10;
+// STALENESS_INTERVAL_SECS used to gate the staleness loop cadence;
+// the loop now uses tokio::sleep(100ms) directly so the constant is
+// retired. Kept commented for reference if we re-introduce config.
+// pub const STALENESS_INTERVAL_SECS: f64 = 0.10;
 pub const STALENESS_TICKS: i32 = 1;
 pub const COOLDOWN_NS: u64 = 250_000_000; // 250ms
 pub const DEAD_BAND_TICKS: i32 = 1;
@@ -25,6 +28,10 @@ pub const CANCEL_THRESHOLD_S: f64 = 1.0; // skip cancel-before-replace if GTD im
 #[derive(Debug)]
 pub enum Decision {
     /// No action; reason already counted in DecisionCounters.
+    /// Today decide_on_tick early-returns by incrementing counters
+    /// and falling through; this variant exists for API symmetry
+    /// (callers can match on the full enum) but isn't constructed.
+    #[allow(dead_code)]
     Skip,
     /// Send place_order at this price for this side. If `cancel_old_oid`
     /// is Some, send a cancel_order first.
@@ -143,7 +150,7 @@ pub fn decide_on_tick(
     // BUT theo IS right-dependent (calls and puts have different prices
     // even at the same iv). Pass the option's right (already computed
     // above as r_char for the vol_surfaces key).
-    let (iv, theo) = match compute_theo(fit_forward, strike, tte, r_char, &vp_msg.params) {
+    let (_iv, theo) = match compute_theo(fit_forward, strike, tte, r_char, &vp_msg.params) {
         Some(v) => v,
         None => {
             counters.skip_other += 1;

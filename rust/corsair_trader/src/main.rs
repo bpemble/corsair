@@ -187,7 +187,10 @@ async fn main() -> std::io::Result<()> {
 
     // Hot loop: tight read of events ring + decision dispatch.
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-    let mut event_count: u64 = 0;
+    // event_count was a local debug counter; telemetry uses the
+    // shared `total_events` accumulator instead. Keep here only to
+    // avoid a Vec.is_empty()-style ambient zero in the loop.
+    let _event_count = 0u64;
 
     // Mode select: busy-poll (CORSAIR_TRADER_BUSY_POLL=1) trades 1
     // CPU core for ~50-100µs latency reduction by skipping the FIFO
@@ -207,7 +210,7 @@ async fn main() -> std::io::Result<()> {
                 buf.extend_from_slice(&chunk);
                 let frames = ipc::protocol::unpack_all_frames(&mut buf)?;
                 for body in frames {
-                    event_count += 1;
+                    // event_count tracked in telemetry; local counter retired
                     process_event(
                         &state, &counters, &commands_ring,
                         &body, &events_log, &decisions_log,
@@ -236,7 +239,7 @@ async fn main() -> std::io::Result<()> {
                 buf.extend_from_slice(&chunk);
                 let frames = ipc::protocol::unpack_all_frames(&mut buf)?;
                 for body in frames {
-                    event_count += 1;
+                    // event_count tracked in telemetry; local counter retired
                     process_event(
                         &state, &counters, &commands_ring,
                         &body, &events_log, &decisions_log,
