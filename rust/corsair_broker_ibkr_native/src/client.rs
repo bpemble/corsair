@@ -107,6 +107,18 @@ impl NativeClient {
         *self.next_order_id.lock().await
     }
 
+    /// Atomically allocate the next order id and advance the local
+    /// counter. Returns 0 if the gateway hasn't yet streamed the
+    /// initial nextValidId — caller should `wait_for_bootstrap` first.
+    pub async fn alloc_order_id(&self) -> i32 {
+        let mut g = self.next_order_id.lock().await;
+        let id = *g;
+        if id > 0 {
+            *g = id + 1;
+        }
+        id
+    }
+
     pub async fn managed_accounts(&self) -> Vec<String> {
         self.managed_accounts.lock().await.clone()
     }

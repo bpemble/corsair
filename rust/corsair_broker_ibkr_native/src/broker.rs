@@ -52,8 +52,9 @@ use corsair_broker_api::{
 use crate::client::{NativeClient, NativeClientConfig};
 use crate::error::NativeError;
 use crate::requests::{
-    cancel_mkt_data, cancel_order, req_account_updates, req_contract_details, req_mkt_data,
-    req_open_orders, req_positions, ContractRequest,
+    cancel_mkt_data, cancel_order, place_order, req_account_updates, req_contract_details,
+    req_executions, req_mkt_data, req_open_orders, req_positions, ContractRequest,
+    ExecutionFilter, PlaceOrderParams,
 };
 use crate::types::{
     AccountValueMsg, ContractDetailsMsg, ErrorMsg, ExecutionMsg, InboundMsg, OpenOrderMsg,
@@ -89,6 +90,9 @@ struct BrokerState {
     /// Pending qualify/chain responses, keyed by reqId.
     pending_contract_details: HashMap<i32, PendingContractRequest>,
 
+    /// Pending recent_fills responses, keyed by reqId.
+    pending_executions: HashMap<i32, PendingExecutionsRequest>,
+
     /// reqId → InstrumentId for tick routing.
     tick_routes: HashMap<i32, InstrumentId>,
 
@@ -99,6 +103,11 @@ struct BrokerState {
 struct PendingContractRequest {
     accumulated: Vec<ContractDetailsMsg>,
     sender: Option<oneshot::Sender<Result<Vec<Contract>, BrokerError>>>,
+}
+
+struct PendingExecutionsRequest {
+    accumulated: Vec<Fill>,
+    sender: Option<oneshot::Sender<Result<Vec<Fill>, BrokerError>>>,
 }
 
 #[derive(Clone)]
@@ -248,7 +257,24 @@ impl NativeBroker {
             }
             InboundMsg::Execution(e) => {
                 if let Some(fill) = execution_to_fill(&e) {
+                    // If req_id > 0, this is a response to reqExecutions.
+                    // Otherwise, it's a real-time exec from execDetailsEvent.
+                    if e.req_id > 0 {
+                        let mut s = state.lock().await;
+                        if let Some(p) = s.pending_executions.get_mut(&e.req_id) {
+                            p.accumulated.push(fill);
+                            return;
+                        }
+                    }
                     let _ = channels.fills.send(fill);
+                }
+            }
+            InboundMsg::ExecutionEnd(req_id) => {
+                let mut s = state.lock().await;
+                if let Some(mut p) = s.pending_executions.remove(&req_id) {
+                    if let Some(sender) = p.sender.take() {
+                        let _ = sender.send(Ok(std::mem::take(&mut p.accumulated)));
+                    }
                 }
             }
             InboundMsg::ContractDetails(cd) => {
@@ -553,6 +579,89 @@ fn currency_to_str(c: Currency) -> &'static str {
     }
 }
 
+fn place_order_contract_request(c: &Contract) -> ContractRequest {
+    let sec_type = match c.kind {
+        ContractKind::Future => "FUT",
+        ContractKind::Option => "FOP",
+    };
+    let right = c.right.map(|r| match r {
+        Right::Call => "C",
+        Right::Put => "P",
+    });
+    ContractRequest {
+        con_id: c.instrument_id.0 as i64,
+        symbol: c.symbol.clone(),
+        sec_type: sec_type.into(),
+        last_trade_date: c.expiry.format("%Y%m%d").to_string(),
+        strike: c.strike.unwrap_or(0.0),
+        right: right.unwrap_or("").into(),
+        multiplier: format!("{}", c.multiplier as i64),
+        exchange: exchange_to_str(c.exchange).into(),
+        primary_exchange: String::new(),
+        currency: currency_to_str(c.currency).into(),
+        local_symbol: c.local_symbol.clone(),
+        trading_class: String::new(),
+    }
+}
+
+fn build_place_params(
+    req: &PlaceOrderReq,
+    fallback_account: &str,
+) -> Result<PlaceOrderParams, BrokerError> {
+    let action = match req.side {
+        Side::Buy => "BUY".to_string(),
+        Side::Sell => "SELL".to_string(),
+    };
+    let (order_type, lmt_price, aux_price) = match req.order_type {
+        OrderType::Limit => {
+            let price = req.price.ok_or_else(|| {
+                BrokerError::InvalidRequest("limit order requires price".into())
+            })?;
+            ("LMT".to_string(), price, 0.0)
+        }
+        OrderType::Market => ("MKT".to_string(), 0.0, 0.0),
+        OrderType::StopLimit { stop_price } => {
+            let price = req.price.ok_or_else(|| {
+                BrokerError::InvalidRequest("stop-limit requires limit price".into())
+            })?;
+            ("STP LMT".to_string(), price, stop_price)
+        }
+    };
+    let tif = match req.tif {
+        TimeInForce::Gtc => "GTC",
+        TimeInForce::Day => "DAY",
+        TimeInForce::Gtd => "GTD",
+        TimeInForce::Ioc => "IOC",
+        TimeInForce::Fok => "FOK",
+    }
+    .to_string();
+    let good_till_date = match (req.tif, req.gtd_until_utc) {
+        (TimeInForce::Gtd, Some(t)) => t.format("%Y%m%d %H:%M:%S UTC").to_string(),
+        (TimeInForce::Gtd, None) => {
+            return Err(BrokerError::InvalidRequest(
+                "Gtd TIF requires gtd_until_utc".into(),
+            ))
+        }
+        _ => String::new(),
+    };
+    let account = req
+        .account
+        .clone()
+        .unwrap_or_else(|| fallback_account.to_string());
+    Ok(PlaceOrderParams {
+        action,
+        total_quantity: req.qty as f64,
+        order_type,
+        lmt_price,
+        aux_price,
+        tif,
+        good_till_date,
+        account,
+        order_ref: req.client_order_ref.clone(),
+        outside_rth: false,
+    })
+}
+
 fn empty_contract_request(symbol: &str, sec_type: &str) -> ContractRequest {
     ContractRequest {
         con_id: 0,
@@ -632,8 +741,24 @@ impl Broker for NativeBroker {
         self.connected.load(Ordering::SeqCst)
     }
 
-    async fn place_order(&self, _req: PlaceOrderReq) -> BResult<OrderId> {
-        Err(BrokerError::Internal("place_order: TODO Phase 6.6c".into()))
+    async fn place_order(&self, req: PlaceOrderReq) -> BResult<OrderId> {
+        if req.qty == 0 {
+            return Err(BrokerError::InvalidRequest("qty must be > 0".into()));
+        }
+        let order_id = self.client.alloc_order_id().await;
+        if order_id <= 0 {
+            return Err(BrokerError::Internal(
+                "next_valid_id not seeded — call wait_for_bootstrap".into(),
+            ));
+        }
+        let cr = place_order_contract_request(&req.contract);
+        let params = build_place_params(&req, &self.cfg.account)?;
+        let frame = place_order(order_id, &cr, &params);
+        self.client
+            .send_raw(&frame)
+            .await
+            .map_err(Self::map_native_err)?;
+        Ok(OrderId(order_id as u64))
     }
 
     async fn cancel_order(&self, id: OrderId) -> BResult<()> {
@@ -644,8 +769,36 @@ impl Broker for NativeBroker {
             .map_err(Self::map_native_err)
     }
 
-    async fn modify_order(&self, _id: OrderId, _req: ModifyOrderReq) -> BResult<()> {
-        Err(BrokerError::Internal("modify_order: TODO Phase 6.6c".into()))
+    async fn modify_order(&self, id: OrderId, req: ModifyOrderReq) -> BResult<()> {
+        // IBKR's modify is "place_order with the same orderId". We need
+        // the original contract + immutable fields; pull them from the
+        // open order cache.
+        let existing = {
+            let s = self.state.lock().await;
+            s.open_orders.get(&(id.0 as i32)).cloned()
+        };
+        let existing = existing.ok_or_else(|| {
+            BrokerError::Internal(format!("modify_order: orderId={} not in open cache", id.0))
+        })?;
+
+        let cr = place_order_contract_request(&existing.contract);
+        let placeholder = PlaceOrderReq {
+            contract: existing.contract.clone(),
+            side: existing.side,
+            qty: req.qty.unwrap_or(existing.qty),
+            order_type: existing.order_type,
+            price: req.price.or(existing.price),
+            tif: existing.tif,
+            gtd_until_utc: req.gtd_until_utc.or(existing.gtd_until_utc),
+            client_order_ref: existing.client_order_ref.clone(),
+            account: Some(self.cfg.account.clone()),
+        };
+        let params = build_place_params(&placeholder, &self.cfg.account)?;
+        let frame = place_order(id.0 as i32, &cr, &params);
+        self.client
+            .send_raw(&frame)
+            .await
+            .map_err(Self::map_native_err)
     }
 
     async fn positions(&self) -> BResult<Vec<Position>> {
@@ -682,8 +835,52 @@ impl Broker for NativeBroker {
         Ok(s.open_orders.values().cloned().collect())
     }
 
-    async fn recent_fills(&self, _since_ns: u64) -> BResult<Vec<Fill>> {
-        Err(BrokerError::Internal("recent_fills: TODO Phase 6.6d".into()))
+    async fn recent_fills(&self, since_ns: u64) -> BResult<Vec<Fill>> {
+        let req_id = self.alloc_req_id();
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut s = self.state.lock().await;
+            s.pending_executions.insert(
+                req_id,
+                PendingExecutionsRequest {
+                    accumulated: Vec::new(),
+                    sender: Some(tx),
+                },
+            );
+        }
+        let time = if since_ns == 0 {
+            String::new()
+        } else {
+            // ExecutionFilter expects "yyyymmdd-hh:mm:ss" UTC.
+            let secs = (since_ns / 1_000_000_000) as i64;
+            chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+                .map(|dt| dt.format("%Y%m%d-%H:%M:%S").to_string())
+                .unwrap_or_default()
+        };
+        let f = ExecutionFilter {
+            client_id: 0,
+            account: self.cfg.account.clone(),
+            time,
+            symbol: String::new(),
+            sec_type: String::new(),
+            exchange: String::new(),
+            side: String::new(),
+        };
+        self.client
+            .send_raw(&req_executions(req_id, &f))
+            .await
+            .map_err(Self::map_native_err)?;
+
+        match tokio::time::timeout(Duration::from_secs(15), rx).await {
+            Ok(Ok(Ok(fills))) => Ok(fills),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => Err(BrokerError::Internal("recent_fills channel dropped".into())),
+            Err(_) => {
+                let mut s = self.state.lock().await;
+                s.pending_executions.remove(&req_id);
+                Err(BrokerError::Internal("recent_fills timeout".into()))
+            }
+        }
     }
 
     async fn qualify_future(&self, q: FutureQuery) -> BResult<Contract> {
