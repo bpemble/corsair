@@ -1,8 +1,41 @@
-# Corsair v2 — Operator Notes
+# Corsair v3 — Operator Notes
 
 Hard-earned lessons. Read before debugging anything weird around connectivity,
 order lifecycle, or margin display. Each entry took hours to find live; the
 goal of this doc is to never re-discover them.
+
+## v3 cutover (2026-05-02) — what changed since the v2 notes were first written
+
+Phase 6.7 retired the Python broker. The hot path is now fully Rust:
+
+```
+PRODUCTION STACK (post-2026-05-02)
+  corsair-broker-rs    Rust daemon, native IBKR wire client, clientId=0,
+                       owns position/risk/hedge/snapshot/IPC server
+  trader               Rust binary, SHM IPC consumer, decides + places orders
+  ib-gateway           Unchanged
+  dashboard            Streamlit, reads hg_chain_snapshot.json
+```
+
+Binaries are baked into the corsair image at:
+- `/usr/local/bin/corsair_broker_rust`
+- `/usr/local/bin/corsair_trader_rust`
+
+**ib_insync is gone from the runtime hot path.** It's no longer in
+requirements.txt. The PyO3 bridge crate (`corsair_broker_ibkr`) was
+deleted in Phase 6.11. The legacy Python broker entry point
+(`src.main`) was deleted in Phase 6.8a.
+
+Sections written for the Python broker era are marked
+**[HISTORIC]** below where the underlying behavior no longer
+applies (e.g. §2 ib_insync openTrades quirks, §5 lean connect
+bypass). The lessons are preserved as context for postmortems
+but should not guide live debugging.
+
+Active config for the Rust runtime: `config/runtime_v3.yaml`.
+The legacy `config/hg_v1_4_paper.yaml` is preserved for documentation
+of the v1.4 spec mapping but is no longer read by any running
+service.
 
 ## Current spec: v1.4 (HG front-only)
 
@@ -39,7 +72,7 @@ current operational config.
 | Margin kill action | flatten | halt only | §7 |
 | vega_kill | $500 | 0 (disabled) | §13 |
 | Effective-delta gating | unspecified | combined options+hedge | §14 |
-| Architecture | single process | broker/trader split (cut-over default ON post-2026-05-01) | §15 |
+| Architecture | single Python process | Rust broker + Rust trader (Phase 6.7 cutover 2026-05-02) | §15 |
 | Hedge near-expiry lockout | 7 days (shared with options engine) | 30 days (hedge-specific knob added 2026-05-01) | §10 |
 
 ETH is tabled (config products list is HG-only) but the multi-product
@@ -48,16 +81,23 @@ its product block and wiring market data.
 
 ## 0. Source is BAKED INTO the corsair image — `restart` ≠ `up --build`
 
-The `corsair` service in `docker-compose.yml` builds from the local
-Dockerfile and **does not volume-mount `src/`**. Code edits do NOT take
-effect on `docker compose restart corsair` — that just bounces the
-existing container running the cached image.
+Both Rust binaries (`corsair_broker_rust`, `corsair_trader_rust`) and
+the corsair_pricing wheel are compiled into the corsair image at
+build time. The compose services do NOT volume-mount Rust source.
+Code edits do NOT take effect on `docker compose restart` — that just
+bounces the existing container running the cached image.
 
 To deploy code changes:
 
 ```bash
 docker compose up -d --build corsair
+docker compose up -d --force-recreate corsair-broker-rs trader
 ```
+
+The first line rebuilds the image; the second recreates the running
+containers using the new image. **`docker compose build corsair` alone
+will NOT redeploy** — running containers continue using the old image
+until they're recreated.
 
 Burned ~20 minutes on 2026-04-09 testing "fixes" against an old image
 because `restart` reported success and the new log lines never appeared.
@@ -99,7 +139,11 @@ master-client mode to function.
 `account=self._account` in `quote_engine._send_or_update`). Without it, IBKR
 returns Error 436 "You must specify an allocation."
 
-## 2. `openTrades()` returns multiple Trade objects per orderId
+## 2. `openTrades()` returns multiple Trade objects per orderId  **[HISTORIC — ib_insync only]**
+
+This was an ib_insync wrapper bug. The Rust native client doesn't
+have a Trade-object abstraction — orderId → state mapping is direct.
+Preserved for postmortem context.
 
 ib_insync sometimes constructs a NEW Trade object when an `openOrder`
 callback fires (notably after `reqAutoOpenOrders` adopts an order on
@@ -164,7 +208,13 @@ If you see `bid=-1` from a probe, just wait for the reopen. If the futures
 tick stream ALSO died, that's a real problem and the watchdog should be
 flapping.
 
-## 5. Lean connect bypass (don't let ib_insync's stock connectAsync run)
+## 5. Lean connect bypass (don't let ib_insync's stock connectAsync run)  **[HISTORIC — ib_insync only]**
+
+The native Rust client's connect path doesn't go through ib_insync,
+so the per-FA-account bootstrap timeout is structurally avoided.
+NativeBroker boot ~50ms (vs 30-90s for the lean Python bypass).
+Preserved for postmortem context — if we ever revert to PyO3+ib_insync
+for any reason, this is the gotcha.
 
 ib_insync's `IB.connectAsync` issues a long list of initializing requests
 in parallel after the API handshake: positions, open orders, **completed
@@ -432,7 +482,18 @@ so 0 is a no-op — no code change needed.
 Evidence: `docs/findings/vega_kill_characterization_2026-04-23.md`.
 HG-specific; re-characterize before any ETH capital bump.
 
-## 14. Effective-delta gating (2026-04-27 — paper-acceptable, live-blocked)
+## 14. Effective-delta gating (2026-04-27 paper, 2026-05-02 live-ready)
+
+**Status update 2026-05-02**: the §10 reconciliation prerequisite is now
+satisfied in the Rust runtime — boot reconcile, periodic reconcile
+(every 4 hedge ticks ~ 2 min), and `execDetails`-fed `apply_broker_fill`
+are all wired (Phase 6.9 + 6.10). Live-deployment block is lifted.
+
+The original 2026-04-27 notes below describe the Python-broker
+implementation and its constraints; the Rust implementation
+preserves the same gate semantics but reads `hedge_qty` from the
+periodically-reconciled `HedgeManager` state.
+
 
 `delta_ceiling` (constraint checker) and `delta_kill` (risk monitor) now
 gate against **effective_delta = options_delta + hedge_qty** instead of
@@ -494,82 +555,93 @@ metric the hedge subsystem already targets." Per
 `feedback_spec_deviation`, the change is documented at each call site
 and here.
 
-## 15. Broker/trader split (mm_service_split, 2026-05-01 — colo prep)
+## 15. Broker/trader split — fully shipped (Phase 6.7, 2026-05-02)
 
-Phased architectural split designed in
-`docs/architecture/mm_service_split.md`. Two processes share a single
-IBKR clientId via a Unix-socket IPC layer (msgpack frames). Built as
-prep for an eventual FIX-direct colo system; the trader process is
-intended to migrate with minimal change while the broker becomes a
-FIX adapter.
+The architectural split is now production. Two Rust processes share a
+single IBKR clientId via a SHM-ring IPC layer (msgpack frames). The
+trader is a self-contained binary; the broker can in principle be
+swapped (FIX/iLink) without touching the trader.
 
-### Topology
+### Production topology
 
 ```
-   broker (current corsair)              trader (new MM service)
-   ─────────────────────────              ──────────────────────
-   ib_insync IB(clientId=0)               (no gateway connection)
-   risk monitor, hedge, snapshot          price book, decision logic
-   slow workloads in worker threads       SABR theo via Rust
-   forwards events → IPC →                receives, decides, places
-   dispatches commands ← IPC ←            sends place_order back
+   corsair-broker-rs                       trader (corsair_trader_rust)
+   ─────────────────────────               ──────────────────────────
+   NativeBroker (Rust IBKR client)         No gateway connection
+   clientId=0 (FA master)                  SHM ring consumer
+   risk monitor, hedge, snapshot           tick → decide_quote → place
+   vol_surface fitter (60s)                6-layer safety stack (§16)
+   IPC server (SHM + FIFO notify)          tokio multi-thread runtime
+   forwards: ticks, fills, status,         sends: place_order,
+   risk_state, vol_surface →               cancel_order, modify_order,
+   ← receives commands from trader         telemetry → broker
 ```
 
-### Phase status (as of 2026-05-01)
+### Phase history
 
 | Phase | What | Status |
 |---|---|---|
-| 1 | IPC plumbing (Unix socket, msgpack) | done |
-| 2 | Broker forwards events; trader logs decisions | done |
-| 3 | Trader places orders via IPC; broker dispatches | **shipped, default DISABLED** |
-| 4 | Slow workloads off broker's loop (snapshot build, daily_state.save) | done — TTT p99 5ms → 2.4ms |
-| 5 | SHM ring-buffer transport | **PRODUCTION** since 2026-05-01 — TTT p50 1.85ms→0.94ms, IPC p99 208ms→4.9ms |
-| 6 | Rust port of trader's decide_quote + SABR | done |
+| 1-5  | Python broker + Python/Rust trader split | superseded |
+| 5B   | Rust broker daemon (shadow mode) | shipped |
+| 6.1-6.5 | Native Rust IBKR wire client | shipped |
+| 6.6  | NativeBroker — Broker trait impl | shipped |
+| 6.7  | Production cutover; Python broker retired | shipped 2026-05-02 |
+| 6.8-6.11 | Cleanup, P0/P1 fixes, dead-code removal | shipped 2026-05-02 |
 
-### Env flags
+### Env flags (default-on; opt-out with explicit unset)
 
-- `CORSAIR_BROKER_MODE=1` — broker starts the IPC server. Default off → no behavior change.
-- `CORSAIR_TRADER_PLACES_ORDERS=1` — broker dispatches trader commands to `ib.placeOrder`; broker's own quote engine is gated off. **DO NOT enable in production until further notice — see "Cut-over disabled" below.**
-- `CORSAIR_IPC_TRANSPORT=socket|shm` — default `socket`. SHM validated in production 2026-05-01 (cut TTT p50 in half, killed IPC tail latency). Pass `shm` on both broker and trader; they communicate via mmap rings at `/app/data/corsair_ipc.{events,commands}`. Rollback to socket via `unset CORSAIR_IPC_TRANSPORT` + restart.
-- `CORSAIR_TRADER_BACKEND=python` — forces the Python `decide_quote` path on the trader. Default uses Rust for SABR.
-- All four are wired through `docker-compose.yml`'s `environment:` blocks for both services. Adding a new flag requires updating the compose file too — host-shell exports alone don't reach containers.
+- `CORSAIR_BROKER_IPC_ENABLED` — defaults to `1` post-cutover. Broker
+  hosts the SHM IPC server.
+- `CORSAIR_TRADER_PLACES_ORDERS` — defaults to `1` post-cutover. Trader
+  emits place/cancel/modify commands.
+- `CORSAIR_IPC_TRANSPORT` — defaults to `shm`. The legacy `socket`
+  transport is no longer wired in the Rust trader binary; it would
+  require a Python-trader rebuild.
+- `CORSAIR_TRADER_LANG` — defaults to `rust`. The Python trader was
+  removed in Phase 6.8a.
+- `CORSAIR_BROKER_KIND` — defaults to `ibkr`, resolves to NativeBroker.
+  No alternate adapter is currently implemented.
 
-### Cut-over disabled
+### Operational gotchas (still applicable)
 
-`CORSAIR_TRADER_PLACES_ORDERS=1` was tested twice on 2026-05-01 (cut-over windows ~01:26 and ~01:43) and produced ~21 adverse fills with negative edge totaling several thousand dollars. Two contributing bugs:
+- **Compose env propagation**: each `docker compose stop` + `up` must
+  include any non-default env vars inline. Each Bash session is a
+  fresh shell — exports don't persist.
+- **Sticky risk kills survive restarts** for `source=risk` (delta,
+  margin, etc.). To clear: `docker compose restart corsair-broker-rs`
+  AND verify `kill_switch-*.jsonl` shows no recent risk-source kills.
+- **`scripts/flatten.py`** is the sanctioned way to clear positions
+  when the broker can't auto-recover. Stop the broker first, then run
+  with `--product HG --order-type limit` (HG is thin, market orders
+  give bad fills).
+- **TTT histogram**: trader's per-event TTT is logged every 10s in
+  the trader's container logs as `ttt_p50_us`/`ttt_p99_us`. Empty
+  (`None`) means no events processed (markets closed or no ticks).
+- **`legacy-python-broker` profile**: the old `corsair` (Python
+  broker) service is preserved as `--profile legacy-python-broker`
+  for emergency rollback ONLY. Bringing it up requires stopping
+  `corsair-broker-rs` first to avoid clientId=0 conflict; the rollback
+  path is git-revert + image rebuild rather than runtime config flip.
 
-1. **One-sided market quoting** — trader placed orders into thin/dark books at SABR theo, becoming the sole price on a side and getting filled when MMs dumped. **Fixed** in `src/trader/quote_decision.py` and `rust/corsair_pricing/src/lib.rs:decide_quote` — both now skip with reason `one_sided_or_dark` unless BOTH bid AND ask are live.
-2. **No risk feedback** — trader had no view of position deltas / margin / Greeks, so it kept placing orders that built up an options_delta of -14.48 and tripped delta_kill. **Fixed** in 712593d-followup: broker publishes a periodic `risk_state` event (1Hz) carrying margin / effective_delta / theta / vega / position counts; trader self-gates new placements against `delta_ceiling` / `delta_kill` / `margin_ceiling_pct` thresholds (delivered in hello config snapshot).
-
-After both fixes are validated end-to-end (next session), cut-over should be re-enabled cautiously — short window first, monitor `trader_decisions-*.jsonl` for risk_block reasons, ensure no buildup of imbalanced positions.
-
-### Operational gotchas
-
-- **Compose env propagation**: each `docker compose stop` + `up` must include the env vars inline (`CORSAIR_BROKER_MODE=1 docker compose up -d --force-recreate corsair`). Each Bash session is a fresh shell — exports don't persist.
-- **Sticky risk kills survive restarts** for `source=risk` (delta, margin, etc.). To clear: `docker compose restart corsair` AND verify `kill_switch-*.jsonl` shows no recent risk-source kills. Trader-driven cut-over has caused these — restart corsair WITHOUT the trader flag to recover.
-- **`scripts/flatten.py`** is the sanctioned way to clear positions when the broker can't auto-recover (post-cut-over delta blow-out, etc.). Stop corsair first, then run with `--product HG --order-type limit` (HG is thin, market orders give bad fills).
-- **TTT histogram**: cap is 500ms in `quote_engine.py:_record_send_latency`. Empty histogram (`n=0`) post-cutover means broker isn't placing orders (either killed, or trader-driven cut-over with the metric not yet rewired through the cut-over path — it's captured in `_try_place_order`, but TTT lookup needs `_decision_tick_ns` populated by the broker's quote engine which is gated off during cut-over).
-
-### Trader command-line workflow
+### Standard command-line workflow
 
 ```bash
-# Default (no broker mode, no trader): identical to pre-split
+# Default — brings up the live Rust stack
 docker compose up -d
 
-# Broker mode only — broker quotes, trader logs decisions for parity
-CORSAIR_BROKER_MODE=1 docker compose up -d --force-recreate corsair
-docker compose --profile broker-split up -d trader
+# Rebuild + redeploy after code changes
+docker compose up -d --build corsair
+docker compose up -d --force-recreate corsair-broker-rs trader
 
-# Full cut-over (CURRENTLY UNSAFE — see above)
-CORSAIR_BROKER_MODE=1 CORSAIR_TRADER_PLACES_ORDERS=1 \
-    docker compose up -d --force-recreate corsair
-CORSAIR_BROKER_MODE=1 CORSAIR_TRADER_PLACES_ORDERS=1 \
-    docker compose --profile broker-split up -d --force-recreate trader
+# Stop everything (gateway + dashboard stay up)
+docker compose stop corsair-broker-rs trader
 
-# Rollback from cut-over: drop the trader flag, restart corsair
-unset CORSAIR_TRADER_PLACES_ORDERS
-CORSAIR_BROKER_MODE=1 docker compose up -d --force-recreate corsair
-docker compose stop trader
+# Emergency rollback to Python broker (very last resort —
+# requires git-revert of Phase 6.7+; the legacy profile alone
+# is insufficient since the Python source was deleted in 6.8a)
+git revert --no-commit <Phase 6.7..6.11 SHAs>
+docker compose up -d --build corsair
+docker compose --profile legacy-python-broker up -d corsair
 ```
 
 ## 16. Cut-over safety stack (cleanup passes 3-6, 2026-05-01)
