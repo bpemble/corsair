@@ -236,6 +236,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "corsair_broker_ibkr_native"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "corsair_broker_api",
+ "env_logger",
+ "log",
+ "serde",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "corsair_constraint"
 version = "0.1.0"
 dependencies = [

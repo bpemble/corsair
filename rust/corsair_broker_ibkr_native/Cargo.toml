@@ -1,0 +1,22 @@
+[package]
+name = "corsair_broker_ibkr_native"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust IBKR API client. Phase 6: replaces the corsair_broker_ibkr PyO3 bridge so we can drop ib_insync."
+
+[lib]
+name = "corsair_broker_ibkr_native"
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+corsair_broker_api = { path = "../corsair_broker_api" }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "net", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util", "macros"] }
+env_logger = "0.11"
