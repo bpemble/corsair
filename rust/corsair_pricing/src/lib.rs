@@ -61,7 +61,7 @@ pub(crate) fn black76_price_inner(f: f64, k: f64, t: f64, sigma: f64, r: f64, ri
 
 #[pyfunction]
 #[pyo3(signature = (market_price, f, k, t, r=0.0, right="C"))]
-fn implied_vol(market_price: f64, f: f64, k: f64, t: f64, r: f64, right: &str) -> Option<f64> {
+pub fn implied_vol(market_price: f64, f: f64, k: f64, t: f64, r: f64, right: &str) -> Option<f64> {
     if t <= 0.0 || market_price <= 0.0 {
         return None;
     }

@@ -60,7 +60,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             capacity: 1 << 20,
         };
         match corsair_broker::spawn_ipc(runtime.clone(), cfg) {
-            Ok(_server) => log::warn!("ipc server enabled"),
+            Ok(server) => {
+                log::warn!("ipc server enabled");
+                corsair_broker::spawn_vol_surface(runtime.clone(), server);
+                log::warn!("vol_surface fitter enabled");
+            }
             Err(e) => log::error!("ipc server start failed: {e}"),
         }
     } else {

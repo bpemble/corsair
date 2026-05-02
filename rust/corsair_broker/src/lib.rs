@@ -45,7 +45,9 @@ pub mod config;
 pub mod ipc;
 pub mod runtime;
 pub mod tasks;
+pub mod vol_surface;
 
 pub use config::{BrokerDaemonConfig, ProductConfig};
 pub use ipc::{spawn_ipc, IpcConfig};
 pub use runtime::{Runtime, RuntimeError};
+pub use vol_surface::spawn_vol_surface;
