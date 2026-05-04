@@ -66,8 +66,9 @@ async def main():
     account = os.environ.get("IBKR_ACCOUNT", "DUP553657")
 
     ib = IB()
-    print(f"Connecting to {host}:{port} as clientId=99 account={account}")
-    await ib.connectAsync(host, port, clientId=99)
+    cid = int(os.environ.get("CORSAIR_TEST_CLIENT_ID", "99"))
+    print(f"Connecting to {host}:{port} as clientId={cid} account={account}")
+    await ib.connectAsync(host, port, clientId=cid)
     patch_transport(ib)
     print(f"Connected. server_version={ib.client.serverVersion()}")
 

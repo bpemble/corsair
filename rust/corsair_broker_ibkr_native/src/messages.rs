@@ -63,6 +63,14 @@ pub const IN_TICK_REQ_PARAMS: i32 = 81;
 /// 10.30+ ships. Everything older lacks fields we depend on.
 pub const MIN_SERVER_VERSION: i32 = 176;
 
-/// Highest version we know how to speak. Send up to this in the
-/// handshake range; server picks min(its_max, our_max).
-pub const MAX_CLIENT_VERSION: i32 = 178;
+/// Highest version we know how to speak. Capped at 176 to match
+/// ib_insync 0.9.86's reference negotiation, which is the only
+/// known-working wire format on our IBKR gateway. At v178+ the
+/// server expects post-v176 trailing fields (customerAccount,
+/// professionalCustomer, etc.) that we haven't fully verified;
+/// claiming v178 without sending those exact fields causes IBKR
+/// to mis-parse our place_order frame and reject with cryptic
+/// errors like 110 "VOL volatility required" — even though our
+/// fields up through manualOrderTime are byte-perfect against
+/// ib_insync's own v176-formatted frame.
+pub const MAX_CLIENT_VERSION: i32 = 176;
