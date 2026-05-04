@@ -2,9 +2,170 @@
 
 **Author:** Claude (Opus 4.7) for Brian Pemble (bpemble@me.com)
 **Created:** 2026-05-02
+**Cutover addendum:** 2026-05-04
 **Source host:** VPS, Linux 5.15.0-176-generic, x86_64
-**Target host:** dedicated home server, TBD
+**Target host:** dedicated bare-metal i7, 12 cores, 32 GB RAM, 2 TB NVMe
 **Goal:** reduce internal latency tail jitter from ~500-2000 µs (hypervisor) to ~50-100 µs (bare metal), and create a tunable platform for further latency work (RT kernel, isolcpus, NIC tuning, eventually colocation).
+
+---
+
+## Cutover-day addendum (2026-05-04)
+
+Read this before Part 1. The body of this doc is still valid; this section
+captures what's changed since it was written and the concrete steps for
+today.
+
+### Latest git state
+
+HEAD on `main` is `64b675e` ("Pre-handoff: Discord kill alerts +
+amend-path wire timing + safety nets"), pushed to
+`https://github.com/bpemble/corsair.git`. 12 commits added since the
+2026-05-02 doc was authored. `git pull` on the new host is sufficient.
+
+### Hardware vs the doc's recommended baseline
+
+The actual target box is a 12-core i7. Two notes against Phase 0 of
+this doc:
+
+- The doc warns against "heterogeneous (P+E) Intel CPUs" because
+  scheduler jitter is harder to reason about with mixed core types.
+  **If your i7 is a 12th-gen or later (Alder Lake / Raptor Lake / Meteor
+  Lake), it has P+E cores.** Verify with `lscpu | grep -i "model name"`
+  and `cat /sys/devices/cpu_core/cpus` (P-cores) vs
+  `cat /sys/devices/cpu_atom/cpus` (E-cores). If P+E, **isolate only
+  P-cores** in Phase 3's `isolcpus=` and pin broker+trader to P-cores
+  only in Phase 4. E-cores can host the OS, ib-gateway JVM, and dashboard.
+- The doc assumed 8-core sizing with `isolcpus=2-7` (6 isolated cores).
+  On a 12-core box use **`isolcpus=4-11`** if homogeneous (8 isolated)
+  or just the P-core range if heterogeneous. Reserve cores 0-3 for
+  OS / docker / ib-gateway.
+- 32 GB RAM is fine. The doc said 32-64 GB ECC; non-ECC is acceptable
+  for paper. Re-evaluate before going live.
+
+### New env var since 2026-05-02
+
+`DISCORD_WEBHOOK_URL` — optional. If set, the broker fires a
+fire-and-forget Discord embed on every kill event (red for sticky
+risk kills, orange for daily halt). Unset = silent (no spurious
+external requests in dev/test). Add to `.env` on the new host:
+
+```
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+```
+
+Confirm on boot via the broker log line `notify: Discord webhook
+configured` (or `notify: DISCORD_WEBHOOK_URL unset — kill notifications
+disabled`).
+
+### New runtime metrics worth capturing for the before/after table
+
+The amend path is now instrumented end-to-end (commit `64b675e`):
+
+- `wire_timing/v2 kind=modify` JSONL rows in `logs-paper/wire_timing-*.jsonl`
+- `modify_rtt_us` histogram on the dashboard latency tile
+
+These didn't exist on the old VPS, so for the comparison table in §3.2
+of this doc, the "BEFORE" cell for modify_rtt won't exist — capture
+"AFTER" only and treat it as the steady-state metric going forward.
+In steady-state market making, the loop is tick→modify (not tick→place),
+so `modify_rtt_us` is the latency to optimize against, not `place_rtt_us`.
+
+### New config knob: split strike subscription vs quote ranges
+
+`config/runtime_v3.yaml` now has `strike_range_low/high` separate from
+`quote_range_low/high`. Subscription is wider so SABR has wing data for
+stable fits (CLAUDE.md §12). No action required on the new host — the
+config is in git — but if you ever revert to a pre-`64b675e` build,
+the parser falls back gracefully (`#[serde(default)]`, defaults to the
+quote_range when unset).
+
+### Today's concrete cutover steps
+
+```bash
+# === ON OLD HOST (VPS) ===
+
+# 1. Verify git is fully pushed (should already be — done as part of this handoff)
+cd ~/corsair && git status && git log origin/main..main
+# Expect: working tree clean, origin/main..main empty.
+
+# 2. Snapshot runtime state
+tar czf /tmp/corsair-runtime-$(date +%Y%m%d-%H%M).tar.gz \
+    -C ~/corsair .env logs-paper/ logs/ data/daily_state.json 2>/dev/null
+ls -lh /tmp/corsair-runtime-*.tar.gz   # ~1.7 GB expected
+
+# 3. Note the current state for reconciliation
+docker compose ps
+docker compose logs --tail=20 corsair-broker-rs trader > /tmp/cutover-state.txt
+cat ~/corsair/data/daily_state.json   # P&L baseline
+
+# 4. SCP to new host (replace HOST)
+scp /tmp/corsair-runtime-*.tar.gz HOST:~/
+
+# 5. Stop the VPS stack — KEEP the VPS itself running for 7 days as rollback
+docker compose stop
+
+
+# === ON NEW HOST (i7 baremetal) ===
+
+# 6. Fresh clone
+cd ~ && git clone https://github.com/bpemble/corsair.git
+cd ~/corsair && git log -1   # should show 64b675e
+
+# 7. Restore runtime state
+tar xzf ~/corsair-runtime-*.tar.gz -C ~/corsair/
+ls -la ~/corsair/.env   # must exist; verify IBKR creds intact
+
+# 8. Optional: add Discord webhook
+echo "DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/..." >> ~/corsair/.env
+
+# 9. Apply Phase 2 free wins (governor, THP, irqbalance) — see §2 below
+#    Skip Phase 3-6 for now; bring up the stack first and measure baseline.
+
+# 10. Build + boot
+docker compose build       # 5-10 min on first build
+docker compose up -d
+sleep 30
+docker compose ps          # all should show Up / Healthy
+docker compose logs -f corsair-broker-rs | head -50
+
+# Look for:
+#   "NativeBroker connected, clientId=0"
+#   "notify: Discord webhook configured" (if DISCORD_WEBHOOK_URL is set)
+#   "vol_surface fit OK, F=X.XX, RMSE=Y"
+
+# 11. Smoke test (preflight + 30 min live_monitor)
+#     See §4.3 of this doc for the exact commands.
+```
+
+After 24h of stable operation on the new host with default tuning
+only, **then** apply Phase 3 (kernel cmdline) and re-measure. Don't
+apply all phases at once — you won't be able to attribute the win.
+
+### Things to verify in the first 24h
+
+- IBKR mobile 2FA approves the new host's gateway login (gateway logs
+  will show a 2FA prompt; approve from the IBKR app)
+- `clientId=0` is still set in `config/runtime_v3.yaml` (it should be,
+  it's in git)
+- The hedge subsystem reconciles correctly on first boot — look for
+  `hedge reconcile: pos=N matches IBKR` in the broker log. The
+  `hedge_qty` shouldn't reset to 0 (that's the bug §10 reconciliation
+  fixed)
+- Trader telemetry shows `ttt_p50_us` and `ttt_p99_us` populating —
+  if both stay `None` for >5 min after market open, IPC isn't
+  flowing (check SHM ring drop monitor)
+- Daily P&L baseline matches the VPS handoff snapshot (compare
+  `data/daily_state.json` before/after)
+
+### When to consider Phase 7 (kernel bypass)
+
+Don't. The §1 conversation that prompted this doc concluded that
+SHM-ring busy-polling is the only kernel-bypass that's actually
+applicable to this topology — DPDK / OpenOnload don't help when the
+hot path is local SHM and the upstream socket is loopback to a JVM
+gateway. Busy-polling is a 50-line code change; it's not in scope
+for the migration itself but is the next obvious latency lever once
+Phase 3-6 plateau.
 
 ---
 
