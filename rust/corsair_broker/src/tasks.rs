@@ -240,6 +240,20 @@ async fn pump_ticks(runtime: Arc<Runtime>) {
                             md.update_last(tick.instrument_id, p, tick.timestamp_ns);
                         }
                     }
+                    TickKind::BidSize => {
+                        // Size ticks come as separate TickSize msgs from
+                        // the price ticks; without explicit handling
+                        // bid_size stays 0 and the trader's dark-book
+                        // guard refuses to quote.
+                        if let Some(s) = tick.size {
+                            md.update_bid_size(tick.instrument_id, s, tick.timestamp_ns);
+                        }
+                    }
+                    TickKind::AskSize => {
+                        if let Some(s) = tick.size {
+                            md.update_ask_size(tick.instrument_id, s, tick.timestamp_ns);
+                        }
+                    }
                     TickKind::OptionOpenInterest => {
                         if let Some(s) = tick.size {
                             md.update_open_interest(tick.instrument_id, s, tick.timestamp_ns);
@@ -250,7 +264,7 @@ async fn pump_ticks(runtime: Arc<Runtime>) {
                             md.update_option_volume(tick.instrument_id, s, tick.timestamp_ns);
                         }
                     }
-                    _ => {} // BidSize/AskSize/Volume — handled implicitly via update_bid/ask args
+                    TickKind::Volume => {} // underlying volume — not currently surfaced
                 }
             }
             Err(RecvError::Lagged(n)) => log::warn!("pump_ticks: lagged {n}"),

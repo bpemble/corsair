@@ -198,10 +198,61 @@ fn snapshot_chain(
     product: &str,
 ) -> Option<(f64, std::collections::HashMap<String, Vec<(f64, f64, f64)>>)> {
     let md = runtime.market_data.lock().unwrap();
-    let forward = md.underlying_price(product)?;
-    if forward <= 0.0 {
+    let und_spot = md.underlying_price(product)?;
+    if und_spot <= 0.0 {
         return None;
     }
+    // Derive forward from the option chain via put-call parity: for
+    // each strike where both C_mid and P_mid are valid,
+    //   F ≈ K + (C_mid - P_mid)
+    // The mean across strikes near the underlying spot gives a robust
+    // estimate of the market-implied forward. This is critical when
+    // the underlying we subscribed to (HGK6 front-month) differs from
+    // the option's actual underlying (HGM6 next-month). Without this,
+    // theo is systematically biased — calls too cheap, puts too rich
+    // — by the contango/backwardation between contract months.
+    //
+    // Falls back to spot when fewer than 2 valid strikes are usable
+    // (boot before chain populates, or extreme one-sided market).
+    let forward = {
+        // Build C_mid/P_mid map per (expiry, strike). Same strike
+        // appears once per side; collect both then pair.
+        use std::collections::HashMap as HM;
+        let mut sides: HM<(chrono::NaiveDate, i64), (Option<f64>, Option<f64>)> = HM::new();
+        for opt in md.options_for_product(product) {
+            let Some(mid) = opt.mid() else { continue };
+            if mid <= 0.0 {
+                continue;
+            }
+            let key = (opt.expiry, (opt.strike * 10_000.0).round() as i64);
+            let entry = sides.entry(key).or_insert((None, None));
+            match opt.right {
+                corsair_broker_api::Right::Call => entry.0 = Some(mid),
+                corsair_broker_api::Right::Put => entry.1 = Some(mid),
+            }
+        }
+        // Use only strikes within 5 nickels (±$0.25) of spot —
+        // ATM/near-ATM where both sides are most liquid + parity
+        // is least noisy.
+        let mut samples: Vec<f64> = Vec::new();
+        for ((_exp, k_i), (cm, pm)) in &sides {
+            let k = (*k_i as f64) / 10_000.0;
+            if (k - und_spot).abs() > 0.25 {
+                continue;
+            }
+            if let (Some(c), Some(p)) = (cm, pm) {
+                samples.push(k + (c - p));
+            }
+        }
+        if samples.len() >= 2 {
+            samples.iter().sum::<f64>() / (samples.len() as f64)
+        } else {
+            // Fall back to spot. Theo will be biased by carry but at
+            // least the chain has *some* fit, and the bias decays
+            // toward expiry as carry → 0.
+            und_spot
+        }
+    };
     let now = chrono::Utc::now();
     let mut by_expiry: std::collections::HashMap<String, Vec<(f64, f64, f64)>> =
         std::collections::HashMap::new();

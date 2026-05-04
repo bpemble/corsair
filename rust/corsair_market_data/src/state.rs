@@ -157,6 +157,30 @@ impl MarketDataState {
         }
     }
 
+    /// Update bid SIZE only (TickKind::BidSize tick). The price-side
+    /// update path doesn't carry size — IBKR sends size as separate
+    /// tickSize messages from the price ticks. Without these methods
+    /// bid_size/ask_size stay at 0 and the trader's dark-book guard
+    /// blocks every place attempt.
+    pub fn update_bid_size(&mut self, iid: InstrumentId, size: u64, ts_ns: u64) {
+        if let Some(k) = self.by_instrument.get(&iid).cloned() {
+            if let Some(t) = self.options.get_mut(&k) {
+                t.bid_size = size;
+                t.last_updated_ns = ts_ns;
+            }
+        }
+    }
+
+    /// Update ask SIZE only (TickKind::AskSize tick).
+    pub fn update_ask_size(&mut self, iid: InstrumentId, size: u64, ts_ns: u64) {
+        if let Some(k) = self.by_instrument.get(&iid).cloned() {
+            if let Some(t) = self.options.get_mut(&k) {
+                t.ask_size = size;
+                t.last_updated_ns = ts_ns;
+            }
+        }
+    }
+
     /// Update option open interest for the leg keyed by instrument id.
     /// Pushed by IBKR's generic tick "101". No-op if not an option.
     pub fn update_open_interest(&mut self, iid: InstrumentId, oi: u64, ts_ns: u64) {
