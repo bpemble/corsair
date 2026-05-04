@@ -4,6 +4,7 @@
 //! `tasks.rs`) hold `Arc<Runtime>` and acquire the relevant
 //! `Mutex<...>` to read or mutate state.
 
+use chrono::NaiveDate;
 use corsair_broker_api::Broker;
 use corsair_broker_ibkr_native::{
     client::NativeClientConfig, NativeBroker, NativeBrokerConfig,
@@ -117,6 +118,12 @@ pub struct Runtime {
     /// the vol_surface fitter; consumed by build_chain_payload to
     /// compute per-leg theo prices for the dashboard.
     pub vol_surface_cache: Mutex<std::collections::HashMap<(String, String), VolSurfaceCacheEntry>>,
+
+    /// IPC events server handle. Held so handle_place can publish
+    /// place_ack events directly (without threading the server arc
+    /// through the dispatch path). Set during corsair_broker::ipc::
+    /// spawn just after server creation; None until then.
+    pub ipc_server: Mutex<Option<Arc<corsair_ipc::SHMServer>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +228,7 @@ impl Runtime {
             qualified_contracts: Mutex::new(std::collections::HashMap::new()),
             latency_samples: Mutex::new(crate::latency::LatencySamples::new()),
             vol_surface_cache: Mutex::new(std::collections::HashMap::new()),
+            ipc_server: Mutex::new(None),
             account: Mutex::new(corsair_broker_api::AccountSnapshot {
                 net_liquidation: 0.0,
                 maintenance_margin: 0.0,
@@ -475,6 +483,131 @@ impl Runtime {
             "corsair_broker seeded {opt_count} option positions, {hedge_count} hedge reconciles from broker"
         );
         Ok(())
+    }
+
+    /// Periodic options-position reconcile against an already-fetched
+    /// `positions` slice (the caller is expected to be running this
+    /// alongside hedge reconcile and has the data in hand). Compares
+    /// IBKR's view against PortfolioState; on any divergence (qty
+    /// mismatch, missing leg, extra leg) replaces wholesale and logs
+    /// loudly so the operator sees the recovery.
+    ///
+    /// This is the safety net for the silent-fill-loss class of bugs:
+    /// if `pump_fills` lags + drops, or a fill arrives on an instrument
+    /// not yet in the market_data registry, the per-fill update misses
+    /// — and without this call, the divergence persists indefinitely.
+    /// Returns the number of leg-quantity changes applied.
+    pub fn reconcile_options_with_broker_positions(
+        &self,
+        positions: &[corsair_broker_api::position::Position],
+    ) -> usize {
+        let registry_products: Vec<String> = {
+            let p = self.portfolio.lock().unwrap();
+            p.registry().products()
+        };
+
+        let mut to_insert: Vec<corsair_position::Position> = Vec::new();
+        for pos in positions {
+            if !registry_products.contains(&pos.contract.symbol) {
+                continue;
+            }
+            if pos.contract.kind != corsair_broker_api::ContractKind::Option {
+                continue;
+            }
+            let right = match pos.contract.right {
+                Some(r) => r,
+                None => continue,
+            };
+            let strike = match pos.contract.strike {
+                Some(s) => s,
+                None => continue,
+            };
+            let multiplier = if pos.contract.multiplier > 0.0 {
+                pos.contract.multiplier
+            } else {
+                continue;
+            };
+            to_insert.push(corsair_position::Position {
+                product: pos.contract.symbol.clone(),
+                strike,
+                expiry: pos.contract.expiry,
+                right,
+                quantity: pos.quantity,
+                avg_fill_price: pos.avg_cost / multiplier,
+                fill_time: chrono::Utc::now(),
+                multiplier,
+                delta: 0.0,
+                gamma: 0.0,
+                theta: 0.0,
+                vega: 0.0,
+                current_price: 0.0,
+            });
+        }
+
+        let mut p = self.portfolio.lock().unwrap();
+        // Build before/after fingerprints keyed only by identity +
+        // quantity. Greeks/current_price differ every tick so we must
+        // not let those diffs trigger spurious "changed" logs.
+        // f64 strike doesn't impl Hash/Eq, so we key on a string-
+        // serialized form for HashMap lookup.
+        let key = |q: &corsair_position::Position| -> String {
+            format!("{}|{:.4}|{}|{:?}", q.product, q.strike, q.expiry, q.right)
+        };
+        let before_map: std::collections::HashMap<String, (i32, f64, NaiveDate, corsair_broker_api::Right, String)> =
+            p.positions()
+                .iter()
+                .map(|q| {
+                    (
+                        key(q),
+                        (q.quantity, q.strike, q.expiry, q.right, q.product.clone()),
+                    )
+                })
+                .collect();
+        let after_map: std::collections::HashMap<String, (i32, f64, NaiveDate, corsair_broker_api::Right, String)> =
+            to_insert
+                .iter()
+                .map(|q| {
+                    (
+                        key(q),
+                        (q.quantity, q.strike, q.expiry, q.right, q.product.clone()),
+                    )
+                })
+                .collect();
+
+        // Quick equal-quantity check first — if every key + qty matches,
+        // there's nothing to report or replace.
+        let same = before_map.len() == after_map.len()
+            && before_map.iter().all(|(k, (qb, ..))| {
+                after_map.get(k).map(|(qa, ..)| qa == qb).unwrap_or(false)
+            });
+        if same {
+            return 0;
+        }
+
+        // DIVERGENCE detected — count and log each delta before we
+        // overwrite so the operator can audit what was lost.
+        let mut changes = 0usize;
+        for (k, (qa, strike, expiry, right, product)) in &after_map {
+            let qb = before_map.get(k).map(|(q, ..)| *q).unwrap_or(0);
+            if qb != *qa {
+                changes += 1;
+                log::error!(
+                    "POSITION DRIFT: {} K={} exp={} {:?}  local={} → ibkr={} (correcting)",
+                    product, strike, expiry, right, qb, qa
+                );
+            }
+        }
+        for (k, (qb, strike, expiry, right, product)) in &before_map {
+            if !after_map.contains_key(k) {
+                changes += 1;
+                log::error!(
+                    "POSITION DRIFT: {} K={} exp={} {:?}  local={} → ibkr=0 (closing)",
+                    product, strike, expiry, right, qb
+                );
+            }
+        }
+        p.replace_positions(to_insert);
+        changes
     }
 
     /// Run a closure with a `&dyn MarketView` borrowed from

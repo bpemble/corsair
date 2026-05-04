@@ -330,8 +330,14 @@ fn round_to_increment(value: f64, increment: f64) -> f64 {
 
 fn generate_strikes(atm: f64, product: &ProductConfig) -> Vec<f64> {
     let inc = product.strike_increment;
-    let lo = product.quote_range_low as f64 * inc;
-    let hi = product.quote_range_high as f64 * inc;
+    // Subscription is wider than quoting per CLAUDE.md §12 — SABR
+    // needs wing data points to fit stably. Falls back to quote_range
+    // when strike_range_low/high are unset, preserving existing
+    // single-window configs.
+    let lo_steps = product.strike_range_low.unwrap_or(product.quote_range_low);
+    let hi_steps = product.strike_range_high.unwrap_or(product.quote_range_high);
+    let lo = lo_steps as f64 * inc;
+    let hi = hi_steps as f64 * inc;
     let mut out = Vec::new();
     let mut k = atm + lo;
     while k <= atm + hi + 1e-9 {

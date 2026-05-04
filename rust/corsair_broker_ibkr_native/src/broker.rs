@@ -121,6 +121,16 @@ struct BrokerState {
     /// reqId → InstrumentId for tick routing.
     tick_routes: HashMap<i32, InstrumentId>,
 
+    /// reqId → option Right for the leg (only populated for option
+    /// subscriptions). IBKR sends tick_type 27 (call OI) AND 28 (put
+    /// OI) to every option subscription regardless of whether the leg
+    /// is a call or a put — for the OPPOSITE side, IBKR sends 0. Without
+    /// this map we'd take the wrong side's 0 and overwrite the right
+    /// side's value (last-write-wins on a single iid). We use this to
+    /// drop the wrong-side updates at decode time. Same applies to
+    /// per-side volume (29 / 30).
+    tick_route_right: HashMap<i32, Right>,
+
     /// reqId → InstrumentId for L2 depth routing. Separate from
     /// tick_routes because reqMktDepth uses a different reqId space
     /// per IBKR (and we want fast disambiguation in route()).
@@ -133,6 +143,14 @@ struct BrokerState {
 
     /// Tracks bootstrap-time seeding.
     seeding: SeedingProgress,
+
+    /// Diagnostic histogram of incoming TickSize tick_type values.
+    /// Used by `dump_tick_type_hist` (logged from a periodic task) to
+    /// surface routing bugs — e.g. if call OI (tick_type 27) never
+    /// appears in this map but put OI (28) does, our subscription or
+    /// the gateway's contract permission is the problem, not our
+    /// dispatch table.
+    pub(crate) tick_type_hist: HashMap<i32, u64>,
 }
 
 struct PendingContractRequest {
@@ -417,6 +435,14 @@ impl NativeBroker {
                 let ack = if matches!(
                     parsed_status,
                     OrderStatus::Submitted
+                        | OrderStatus::PendingSubmit  // PreSubmitted = IBKR
+                            // accepted the message (place or amend); for
+                            // place_ack semantics this is sufficient
+                            // confirmation. Without including this, every
+                            // amend hit the 2s timeout because IBKR's
+                            // first response is PreSubmitted and we
+                            // never see Submitted on a re-amend that
+                            // didn't transition state.
                         | OrderStatus::Filled
                         | OrderStatus::Cancelled
                         | OrderStatus::PendingCancel
@@ -426,6 +452,15 @@ impl NativeBroker {
                         open.status = parsed_status;
                         open.filled_qty = o.filled as u32;
                     }
+                    // Purge of terminal entries was tried 2026-05-04
+                    // and reverted: when IBKR Cancels an order (GTD
+                    // expiry, peer cross), the trader hasn't yet
+                    // observed the cancel via order_status — its
+                    // next amend attempt hits "orderId not in open
+                    // cache" because we just purged it. Keep terminal
+                    // entries; build_chain_payload + cancel_all_resting
+                    // already filter on status so the bloat is
+                    // cosmetic. Cleanup belongs in a periodic GC.
                     // v2 wire-timing — first ack signal lands here
                     // when OrderStatus precedes OpenOrder.
                     s.wire_ack_ns.entry(o.order_id).or_insert_with(now_ns);
@@ -542,21 +577,54 @@ impl NativeBroker {
                 }
             }
             InboundMsg::TickSize(t) => {
+                // Diagnostic: count distinct tick_types observed.
+                {
+                    let mut s = state.lock();
+                    *s.tick_type_hist.entry(t.tick_type).or_insert(0) += 1;
+                }
+                // Drop wrong-side OI / per-side-volume ticks. IBKR sends
+                // BOTH 27 (call OI) AND 28 (put OI) to every option
+                // subscription regardless of leg right — for the
+                // opposite side it sends 0. Without filtering, the 0
+                // overwrites the real value. Same for 29 (call vol) /
+                // 30 (put vol). Tick 8 (overall option vol) is right-
+                // agnostic and always kept.
+                if matches!(t.tick_type, 27 | 28 | 29 | 30) {
+                    let leg_right = state.lock().tick_route_right.get(&t.req_id).copied();
+                    if let Some(r) = leg_right {
+                        let want = match (t.tick_type, r) {
+                            (27, Right::Call) => true,
+                            (28, Right::Put) => true,
+                            (29, Right::Call) => true,
+                            (30, Right::Put) => true,
+                            _ => false, // wrong-side; drop
+                        };
+                        if !want {
+                            return;
+                        }
+                    }
+                }
                 let kind = match t.tick_type {
                     0 => Some(TickKind::BidSize),
                     3 => Some(TickKind::AskSize),
-                    8 => Some(TickKind::Volume),
-                    // Generic tick "101" → option open interest. The
-                    // tick_type split (27=call, 28=put) is informational
-                    // only — our subscription is per-leg so we already
-                    // know the right from the contract.
+                    // Generic tick "100" / "101" deliver:
+                    //   8  → Volume (overall option session volume —
+                    //         IBKR uses this for options too, not just
+                    //         futures; routing to OptionVolume so it
+                    //         lands in the per-leg counter)
+                    //   27 → OptionCallOpenInterest
+                    //   28 → OptionPutOpenInterest
+                    //   29 → OptionCallVolume
+                    //   30 → OptionPutVolume
+                    // The call/put split is informational — our
+                    // subscription is per-leg so we already know the
+                    // right from the contract; same TickKind for both.
+                    8 | 29 | 30 => Some(TickKind::OptionVolume),
                     27 | 28 => Some(TickKind::OptionOpenInterest),
-                    // Generic tick "100" → option session volume.
-                    29 | 30 => Some(TickKind::OptionVolume),
                     // Delayed-data size tick types.
                     69 => Some(TickKind::BidSize),
                     70 => Some(TickKind::AskSize),
-                    71 => Some(TickKind::Volume),
+                    71 => Some(TickKind::OptionVolume),
                     _ => None,
                 };
                 if let Some(kind) = kind {
@@ -1255,13 +1323,13 @@ impl Broker for NativeBroker {
         Some((send, ack))
     }
 
-    // modify_order continues to use the slow encoder; modify is a
-    // rarer path than place_order. Future: extend templates to
-    // memo'ize per-orderId modifies if it shows up in profile.
+    // Fast-path modify: uses the pre-encoded ContractTemplate cache
+    // built by place_order. IBKR's modify protocol is "placeOrder
+    // with same orderId", so the contract section of the wire frame
+    // is identical to the original place. Switching to template
+    // memcpy here saves ~50µs per amend (was ~60µs encode time;
+    // template path is ~10µs).
     async fn modify_order(&self, id: OrderId, req: ModifyOrderReq) -> BResult<()> {
-        // IBKR's modify is "place_order with the same orderId". We need
-        // the original contract + immutable fields; pull them from the
-        // open order cache.
         let existing = {
             let s = self.state.lock();
             s.open_orders.get(&(id.0 as i32)).cloned()
@@ -1270,7 +1338,6 @@ impl Broker for NativeBroker {
             BrokerError::Internal(format!("modify_order: orderId={} not in open cache", id.0))
         })?;
 
-        let cr = place_order_contract_request(&existing.contract);
         let placeholder = PlaceOrderReq {
             contract: existing.contract.clone(),
             side: existing.side,
@@ -1283,16 +1350,84 @@ impl Broker for NativeBroker {
             account: Some(self.cfg.account.clone()),
         };
         let params = build_place_params(&placeholder, &self.cfg.account)?;
-        let frame = place_order(id.0 as i32, &cr, &params);
-        self.client
-            .send_raw(&frame)
-            .await
-            .map_err(Self::map_native_err)
+
+        // Fast frame build via cached contract template. First amend
+        // for an instrument may pay the encode cost; subsequent ones
+        // memcpy. Same template as the original place_order so amends
+        // hit the cache immediately.
+        let frame = {
+            let mut s = self.state.lock();
+            let template = s.place_templates
+                .entry(existing.contract.instrument_id)
+                .or_insert_with(|| {
+                    let cr = place_order_contract_request(&existing.contract);
+                    crate::place_template::ContractTemplate::from_contract(&cr)
+                });
+            crate::place_template::place_order_fast(id.0 as i32, template, &params)
+        };
+        // Wire trace for amend verification: confirms we're sending a
+        // placeOrder with the SAME orderId as the existing order, only
+        // price/gtd changed. IBKR's protocol treats this as amend.
+        log::info!(
+            "AMEND wire: orderId={} side={:?} qty={} old_price={:?} new_price={:?} gtd={:?} frame_len={}",
+            id.0,
+            existing.side,
+            placeholder.qty,
+            existing.price,
+            placeholder.price,
+            placeholder.gtd_until_utc.map(|d| d.timestamp()),
+            frame.len(),
+        );
+
+        // Pattern mirrors place_order — install a per-orderId waiter
+        // BEFORE the wire send so the route() handler can signal back
+        // when IBKR's OpenOrder/OrderStatus reply for this amend
+        // arrives. Without this, handle_modify's drain_wire_timing
+        // returned None (ack hadn't landed yet) and amend_us
+        // collapsed to ~50µs of local encode latency rather than the
+        // true round trip. Same 2s timeout as place_order.
+        let (tx, rx) = oneshot::channel::<Result<(), BrokerError>>();
+        {
+            let mut s = self.state.lock();
+            s.pending_place_acks.insert(id.0 as i32, tx);
+            s.wire_send_ns.insert(id.0 as i32, now_ns());
+        }
+        if let Err(e) = self.client.send_raw(&frame).await {
+            let mut s = self.state.lock();
+            s.pending_place_acks.remove(&(id.0 as i32));
+            s.wire_send_ns.remove(&(id.0 as i32));
+            return Err(Self::map_native_err(e));
+        }
+
+        match tokio::time::timeout(Duration::from_secs(2), rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(broker_err))) => Err(broker_err),
+            Ok(Err(_dropped)) => Err(BrokerError::Internal(
+                "modify_order ack channel dropped".into(),
+            )),
+            Err(_elapsed) => {
+                let mut s = self.state.lock();
+                s.pending_place_acks.remove(&(id.0 as i32));
+                s.wire_send_ns.remove(&(id.0 as i32));
+                s.wire_ack_ns.remove(&(id.0 as i32));
+                Err(BrokerError::Protocol {
+                    code: None,
+                    message: format!("modify_order ack timeout (orderId={})", id.0),
+                })
+            }
+        }
     }
 
     async fn positions(&self) -> BResult<Vec<Position>> {
         let s = self.state.lock();
         Ok(s.positions.values().cloned().collect())
+    }
+
+    fn diagnostic_take_tick_type_hist(&self) -> Vec<(i32, u64)> {
+        let mut s = self.state.lock();
+        let mut out: Vec<(i32, u64)> = s.tick_type_hist.drain().collect();
+        out.sort_by_key(|(k, _)| *k);
+        out
     }
 
     async fn account_values(&self) -> BResult<AccountSnapshot> {
@@ -1305,7 +1440,16 @@ impl Broker for NativeBroker {
             realized_pnl_today: 0.0,
             timestamp_ns: now_ns(),
         };
-        for ((key, _ccy, _acct), v) in s.account_values.iter() {
+        // Filter by configured account: on FA logins, IBKR also
+        // streams aggregate/master rollups (empty-string account or the
+        // DFP master). Iterating those into our snapshot polluted
+        // maintenance_margin with the FA-rolled-up value, which sat
+        // above our 50% ceiling indefinitely with zero positions
+        // locally and stuck the trader in risk_block.
+        for ((key, _ccy, acct), v) in s.account_values.iter() {
+            if acct != &self.cfg.account {
+                continue;
+            }
             let parsed: f64 = v.value.parse().unwrap_or(0.0);
             match key.as_str() {
                 "NetLiquidation" => snap.net_liquidation = parsed,
@@ -1539,6 +1683,15 @@ impl Broker for NativeBroker {
         {
             let mut s = self.state.lock();
             s.tick_routes.insert(req_id, sub.instrument_id);
+            // Record option leg's Right so we can drop wrong-side OI /
+            // volume ticks at decode time. Only options carry a Right;
+            // futures subs leave this empty and the decode skip is a
+            // no-op for them.
+            if let Some(c) = &sub.contract {
+                if let Some(r) = c.right {
+                    s.tick_route_right.insert(req_id, r);
+                }
+            }
             s.handle_to_req_id.insert(handle, req_id);
         }
         // Build the full contract descriptor. IBKR rejects reqMktData

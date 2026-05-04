@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::decision::{decide_on_tick, Decision};
+use crate::decision::{decide_on_tick, Decision, GTD_LIFETIME_S};
 use crate::ipc::shm::{wait_for_rings, Ring, DEFAULT_RING_CAPACITY};
 use crate::messages::*;
 use crate::state::{DecisionCounters, OurOrder, TraderState};
@@ -173,6 +173,78 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
     let counters = Arc::new(Mutex::new(DecisionCounters::default()));
     let events_ring = Arc::new(Mutex::new(events_ring));
     let commands_ring = Arc::new(Mutex::new(commands_ring));
+
+    // Graceful shutdown: SIGTERM / SIGINT → cancel every resting
+    // order at IBKR, then exit. Without this, `docker compose stop
+    // trader` killed the container while orders sat at IBKR for up
+    // to GTD_LIFETIME_S seconds — any market cross during that window
+    // would fill orphans and rebuild the cascade pattern we just
+    // spent the day fixing. Spawned on the bg runtime so the hot
+    // path stays untouched.
+    {
+        let state_sd = Arc::clone(&state);
+        let commands_ring_sd = Arc::clone(&commands_ring);
+        bg_handle.spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("graceful_shutdown: SIGTERM handler failed: {e}");
+                    return;
+                }
+            };
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("graceful_shutdown: SIGINT handler failed: {e}");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => log::warn!("graceful_shutdown: SIGTERM"),
+                _ = sigint.recv() => log::warn!("graceful_shutdown: SIGINT"),
+            }
+            // Snapshot all live order_ids and emit cancel frames.
+            // Holding state lock briefly only to read order_id list;
+            // we cap the cancel set at the moment of signal so an
+            // ongoing place_ack flood can't keep us alive.
+            let order_ids: Vec<i64> = {
+                let s = state_sd.lock().unwrap();
+                s.orderid_to_key.keys().copied().collect()
+            };
+            log::warn!(
+                "graceful_shutdown: cancelling {} resting orders before exit",
+                order_ids.len()
+            );
+            let send_ts = now_ns_wall();
+            let frames: Vec<Vec<u8>> = order_ids
+                .into_iter()
+                .filter_map(|oid| {
+                    let cancel = CancelOrder {
+                        msg_type: "cancel_order",
+                        ts_ns: send_ts,
+                        order_id: oid,
+                    };
+                    rmp_serde::to_vec_named(&cancel)
+                        .ok()
+                        .map(|body| ipc::protocol::pack_frame(&body))
+                })
+                .collect();
+            {
+                let mut ring = commands_ring_sd.lock().unwrap();
+                for frame in &frames {
+                    ring.write_frame(frame);
+                }
+            }
+            // Brief delay so the cancels actually clear our SHM ring
+            // and reach the broker before we exit. Broker forwards to
+            // IBKR; once on the wire they're authoritative regardless
+            // of whether we're alive.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            log::warn!("graceful_shutdown: cancels flushed, exiting");
+            std::process::exit(0);
+        });
+    }
 
     // Staleness loop — cancels resting orders whose price has drifted
     // too far from current theo. Mirrors src/trader/main.py's
@@ -461,7 +533,10 @@ fn process_event(
             }
             s.orderid_to_key.insert(p.order_id, key);
         }
-        "order_ack" => {
+        // Broker emits "order_status" (the canonical name in Rust runtime);
+        // legacy adapters may use "order_ack". Both routed to the same
+        // terminal-state cleanup path.
+        "order_status" | "order_ack" => {
             let a: OrderAckMsg = match serde_json::from_value(generic.extra.clone()) {
                 Ok(t) => t,
                 Err(_) => {
@@ -619,49 +694,102 @@ fn on_tick(
     // Then take the locks just once each at the end. Reduces contention
     // with staleness/telemetry tasks.
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(decisions.len() * 2);
+    // Track outcomes: (key, new_state, optional_old_orderid_to_evict).
+    // For Place + cancel_old_oid we evict the old orderid mapping; for
+    // Modify the orderid stays valid (same order, new price).
     let mut places_to_track: Vec<((u64, String, char, char), OurOrder, Option<i64>)> =
         Vec::with_capacity(decisions.len());
+    let mut modifies_to_track: Vec<((u64, String, char, char), f64, i64)> =
+        Vec::with_capacity(decisions.len());
+    let mut cancel_all_fired = false;
     let r_char_for_track = tick.right.chars().next().unwrap_or('C').to_ascii_uppercase();
     for d in decisions {
-        if let Decision::Place { side, price, cancel_old_oid } = d {
-            if let Some(oid) = cancel_old_oid {
-                let cancel = CancelOrder {
-                    msg_type: "cancel_order",
+        match d {
+            Decision::Place { side, price, cancel_old_oid } => {
+                if let Some(oid) = cancel_old_oid {
+                    let cancel = CancelOrder {
+                        msg_type: "cancel_order",
+                        ts_ns: send_ns_wall,
+                        order_id: oid,
+                    };
+                    if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
+                        frames.push(ipc::protocol::pack_frame(&body));
+                    }
+                }
+                let p = PlaceOrder {
+                    msg_type: "place_order",
                     ts_ns: send_ns_wall,
-                    order_id: oid,
+                    strike: tick.strike,
+                    expiry: tick.expiry.clone(),
+                    right: tick.right.clone(),
+                    side: side.as_str().to_string(),
+                    qty: 1,
+                    price,
+                    order_ref: "corsair_trader_rust".into(),
+                    triggering_tick_broker_recv_ns: tick.broker_recv_ns,
                 };
-                if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
+                if let Ok(body) = rmp_serde::to_vec_named(&p) {
                     frames.push(ipc::protocol::pack_frame(&body));
                 }
+                let okey = (TraderState::strike_key(tick.strike),
+                            tick.expiry.clone(), r_char_for_track,
+                            side.as_char());
+                places_to_track.push((
+                    okey,
+                    OurOrder {
+                        price,
+                        send_ns: send_ns_wall,
+                        place_monotonic_ns: now_mono,
+                        order_id: None,
+                    },
+                    cancel_old_oid,
+                ));
             }
-            let p = PlaceOrder {
-                msg_type: "place_order",
-                ts_ns: send_ns_wall,
-                strike: tick.strike,
-                expiry: tick.expiry.clone(),
-                right: tick.right.clone(),
-                side: side.as_str().to_string(),
-                qty: 1,
-                price,
-                order_ref: "corsair_trader_rust".into(),
-                triggering_tick_broker_recv_ns: tick.broker_recv_ns,
-            };
-            if let Ok(body) = rmp_serde::to_vec_named(&p) {
-                frames.push(ipc::protocol::pack_frame(&body));
-            }
-            let okey = (TraderState::strike_key(tick.strike),
-                        tick.expiry.clone(), r_char_for_track,
-                        side.as_char());
-            places_to_track.push((
-                okey,
-                OurOrder {
+            Decision::Modify { side, order_id, price } => {
+                // Single-message amend. Refresh GTD on every modify so
+                // the order doesn't expire mid-update.
+                let m = ModifyOrder {
+                    msg_type: "modify_order",
+                    ts_ns: send_ns_wall,
+                    order_id,
                     price,
-                    send_ns: send_ns_wall,
-                    place_monotonic_ns: now_mono,
-                    order_id: None,
-                },
-                cancel_old_oid,
-            ));
+                    gtd_seconds: GTD_LIFETIME_S as u32,
+                    triggering_tick_broker_recv_ns: tick.broker_recv_ns,
+                };
+                if let Ok(body) = rmp_serde::to_vec_named(&m) {
+                    frames.push(ipc::protocol::pack_frame(&body));
+                }
+                let okey = (TraderState::strike_key(tick.strike),
+                            tick.expiry.clone(), r_char_for_track,
+                            side.as_char());
+                modifies_to_track.push((okey, price, order_id));
+            }
+            Decision::CancelAll { order_ids } => {
+                // Fire cancel_order for each known orderId, then clear
+                // our_orders so subsequent ticks see no incumbents
+                // (idempotent — we won't re-fire CancelAll once empty).
+                let n = order_ids.len();
+                for oid in &order_ids {
+                    let cancel = CancelOrder {
+                        msg_type: "cancel_order",
+                        ts_ns: send_ns_wall,
+                        order_id: *oid,
+                    };
+                    if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
+                        frames.push(ipc::protocol::pack_frame(&body));
+                    }
+                }
+                log::warn!(
+                    "trader: CancelAll fired ({} orders) — risk self-block",
+                    n
+                );
+                // Schedule local our_orders flush after the ring
+                // write below.
+                modifies_to_track.clear();
+                places_to_track.clear();
+                cancel_all_fired = true;
+            }
+            Decision::Skip => {}
         }
     }
 
@@ -676,11 +804,33 @@ fn on_tick(
     // Single state lock for all incumbency updates.
     {
         let mut s = state.lock().unwrap();
+        if cancel_all_fired {
+            // Wipe local incumbents — broker-side cancel will land
+            // shortly, but our_orders should already reflect "no
+            // longer want resting". Avoids re-firing CancelAll on
+            // subsequent ticks during the in-flight cancel window
+            // and prevents the next tick from trying to amend
+            // orders we just cancelled.
+            s.our_orders.clear();
+            s.orderid_to_key.clear();
+        }
         for (key, order, cancel_old_oid) in places_to_track {
             if let Some(oid) = cancel_old_oid {
                 s.orderid_to_key.remove(&oid);
             }
             s.our_orders.insert(key, order);
+        }
+        // Modify path: update price + cooldown timestamp on the
+        // existing entry. order_id stays the same; do NOT remove the
+        // orderid_to_key mapping (same order at IBKR).
+        for (key, new_price, order_id) in modifies_to_track {
+            if let Some(o) = s.our_orders.get_mut(&key) {
+                o.price = new_price;
+                o.send_ns = send_ns_wall;
+                o.place_monotonic_ns = now_mono;
+                // order_id stays Some(order_id); confirmed for clarity.
+                debug_assert_eq!(o.order_id, Some(order_id));
+            }
         }
     }
 }

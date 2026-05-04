@@ -27,6 +27,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // applied in async_main once the config is loaded.)
     init_logger("info");
 
+    // Resolve the Discord webhook URL once at boot. notify_kill is
+    // safe to call before this (it'll return None) but the log line
+    // confirms whether notifications are wired.
+    corsair_broker::notify::init_from_env();
+
     // Build a multi-thread tokio runtime with worker threads pinned
     // to specific CPUs. Pinning is honored within the container's
     // cpuset (sched_getaffinity), so docker compose `cpuset:` carries

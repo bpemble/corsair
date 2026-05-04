@@ -46,9 +46,10 @@ pub struct LatencySnapshot {
     pub ttt_us: LatencyStats,
     /// Broker→IBKR→broker round-trip on place_order (microseconds).
     pub place_rtt_us: LatencyStats,
-    /// Broker→IBKR→broker round-trip on modify (microseconds). Will
-    /// be empty in trader-driven mode (trader cancels+replaces rather
-    /// than modifies); kept for legacy dashboard pill compatibility.
+    /// Broker→IBKR→broker round-trip on modify (microseconds). Now
+    /// populated post-amend conversion: trader emits modify_order
+    /// instead of cancel+place at any key with a known live order_id,
+    /// so this is the relevant steady-state quote-update RTT.
     pub amend_us: LatencyStats,
 }
 

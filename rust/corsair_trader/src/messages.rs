@@ -125,21 +125,24 @@ pub struct RiskStateMsg {
     pub n_positions: i64,
 }
 
-/// place_ack message from broker. The trader uses order_id to map
-/// place commands back to keys (see state.rs::OurOrder); the other
-/// fields are parsed for completeness/log fidelity.
+/// Order status update from broker. Trader uses this to clear
+/// `OurOrder` entries on terminal states (Filled / Cancelled /
+/// Rejected) so subsequent quote updates don't try to amend a dead
+/// order. Broker emits `"order_status"` events with snake_case
+/// `order_id`; the alias accepts the legacy `orderId` form too in
+/// case the field name diverges between adapters.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderAckMsg {
-    #[serde(rename = "orderId", default)]
+    #[serde(alias = "orderId", default)]
     pub order_id: Option<i64>,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
     pub side: Option<String>,
-    #[serde(rename = "lmtPrice", default)]
+    #[serde(alias = "lmtPrice", default)]
     pub lmt_price: Option<f64>,
-    #[serde(rename = "orderRef", default)]
+    #[serde(alias = "orderRef", default)]
     pub order_ref: Option<String>,
 }
 
@@ -182,6 +185,27 @@ pub struct CancelOrder {
     pub ts_ns: u64,
     #[serde(rename = "orderId")]
     pub order_id: i64,
+}
+
+/// Outbound: modify_order command. Replaces cancel-before-replace at
+/// keys with a known live order_id — single round trip instead of two.
+/// Broker (`ipc.rs::handle_modify`) sends a placeOrder with same id +
+/// new price (IBKR's amend protocol). Wire-timing path mirrors
+/// place_order so modify_rtt_us shows up in the latency block.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModifyOrder {
+    #[serde(rename = "type")]
+    pub msg_type: &'static str,
+    pub ts_ns: u64,
+    pub order_id: i64,
+    pub price: f64,
+    /// GTD refresh in seconds. The broker converts to absolute UTC.
+    /// Send on every modify so the order doesn't expire mid-update.
+    pub gtd_seconds: u32,
+    /// v2 wire-timing: the trigger tick that drove this amend, used
+    /// by the broker's wire_timing JSONL emitter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggering_tick_broker_recv_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

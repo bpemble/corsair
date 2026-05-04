@@ -67,7 +67,11 @@ pub fn parse_inbound(fields: &[String]) -> Result<InboundMsg, NativeError> {
             fields.get(2).cloned().unwrap_or_default(),
         )),
         IN_EXECUTION_DATA_END => {
-            let req_id = parse_int(fields.get(2).map(|s| s.as_str()).unwrap_or("0"))?;
+            // Same version-stripping as parse_execution: server >=
+            // MIN_SERVER_VER_LAST_LIQUIDITY removed the version field
+            // on both 11 (execDetails) and 55 (executionEnd). req_id
+            // is now at field[1], not field[2].
+            let req_id = parse_int(fields.get(1).map(|s| s.as_str()).unwrap_or("0"))?;
             Ok(InboundMsg::ExecutionEnd(req_id))
         }
         _ => Ok(InboundMsg::Unparsed {
@@ -300,47 +304,58 @@ fn parse_contract_details(fields: &[String]) -> Result<InboundMsg, NativeError> 
     }))
 }
 
-/// `[11, version, reqId, orderId, conId, symbol, secType, expiry,
-///   strike, right, multiplier, exchange, currency, localSymbol,
-///   tradingClass, execId, time, acctNumber, exchange, side, shares,
-///   price, permId, clientId, liquidation, cumQty, avgPrice,
-///   orderRef, evRule, evMultiplier, modelCode, lastLiquidity]`
+/// IBKR removed the version field on execDetails at server version
+/// 78 (MIN_SERVER_VER_LAST_LIQUIDITY). Modern gateways (>=176, our
+/// MAX_CLIENT_VERSION) never send it. Layout used here:
+///   `[11, reqId, orderId, conId, symbol, secType, expiry, strike,
+///    right, multiplier, exchange, currency, localSymbol,
+///    tradingClass, execId, time, acctNumber, exchange, side,
+///    shares, price, permId, clientId, liquidation, cumQty,
+///    avgPrice, orderRef, evRule, evMultiplier, modelCode,
+///    lastLiquidity]`
+///
+/// Pre-fix this parser assumed a version field at field[1] and read
+/// the symbol as conId, so every execDetails on a fresh gateway
+/// failed with "expected int64, got HG". The dispatcher silently
+/// dropped these, causing pump_fills to never see fills, hedge
+/// rebalance_on_fill never to fire, and a $30K cascade on
+/// 2026-05-04 11:51 because we couldn't observe our own pile-up.
 fn parse_execution(fields: &[String]) -> Result<InboundMsg, NativeError> {
-    if fields.len() < 24 {
+    if fields.len() < 23 {
         return Err(NativeError::Malformed(format!(
             "execDetails fields={}", fields.len()
         )));
     }
     Ok(InboundMsg::Execution(ExecutionMsg {
-        req_id: parse_int(&fields[2])?,
-        order_id: parse_int(&fields[3])?,
+        req_id: parse_int(&fields[1])?,
+        order_id: parse_int(&fields[2])?,
         contract: ContractDecoded {
-            con_id: parse_int64(&fields[4])?,
-            symbol: fields[5].clone(),
-            sec_type: fields[6].clone(),
-            last_trade_date: fields[7].clone(),
-            strike: parse_f64(&fields[8])?,
-            right: fields[9].clone(),
-            multiplier: fields[10].clone(),
-            exchange: fields[11].clone(),
-            currency: fields[12].clone(),
-            local_symbol: fields[13].clone(),
-            trading_class: fields[14].clone(),
+            con_id: parse_int64(&fields[3])?,
+            symbol: fields[4].clone(),
+            sec_type: fields[5].clone(),
+            last_trade_date: fields[6].clone(),
+            strike: parse_f64(&fields[7])?,
+            right: fields[8].clone(),
+            multiplier: fields[9].clone(),
+            exchange: fields[10].clone(),
+            currency: fields[11].clone(),
+            local_symbol: fields[12].clone(),
+            trading_class: fields[13].clone(),
             primary_exchange: String::new(),
         },
-        exec_id: fields[15].clone(),
-        time: fields[16].clone(),
-        account: fields[17].clone(),
-        exchange: fields[18].clone(),
-        side: fields[19].clone(),
-        shares: parse_f64(&fields[20])?,
-        price: parse_f64(&fields[21])?,
-        perm_id: parse_int(&fields[22])?,
-        client_id: parse_int(&fields[23])?,
-        liquidation: parse_int(fields.get(24).map(|s| s.as_str()).unwrap_or("0"))?,
-        cum_qty: parse_f64(fields.get(25).map(|s| s.as_str()).unwrap_or("0"))?,
-        avg_price: parse_f64(fields.get(26).map(|s| s.as_str()).unwrap_or("0"))?,
-        order_ref: fields.get(27).cloned().unwrap_or_default(),
+        exec_id: fields[14].clone(),
+        time: fields[15].clone(),
+        account: fields[16].clone(),
+        exchange: fields[17].clone(),
+        side: fields[18].clone(),
+        shares: parse_f64(&fields[19])?,
+        price: parse_f64(&fields[20])?,
+        perm_id: parse_int(&fields[21])?,
+        client_id: parse_int(&fields[22])?,
+        liquidation: parse_int(fields.get(23).map(|s| s.as_str()).unwrap_or("0"))?,
+        cum_qty: parse_f64(fields.get(24).map(|s| s.as_str()).unwrap_or("0"))?,
+        avg_price: parse_f64(fields.get(25).map(|s| s.as_str()).unwrap_or("0"))?,
+        order_ref: fields.get(26).cloned().unwrap_or_default(),
     }))
 }
 

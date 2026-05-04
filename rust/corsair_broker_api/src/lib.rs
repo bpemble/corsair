@@ -163,6 +163,16 @@ pub trait Broker: Send + Sync + 'static {
     /// `constraint_checker.IBKRMarginChecker.update_cached_margin`.
     async fn account_values(&self) -> Result<AccountSnapshot>;
 
+    /// Diagnostic: snapshot of (tick_type, count) for incoming TickSize
+    /// messages since the last call (drain-and-reset semantics). Default
+    /// returns empty for non-IBKR adapters. Used by `corsair_broker::
+    /// tasks::periodic_tick_type_hist` to surface routing or
+    /// permissions issues — e.g. if call OI (27) never appears but put
+    /// OI (28) does, the data feed itself is the problem.
+    fn diagnostic_take_tick_type_hist(&self) -> Vec<(i32, u64)> {
+        Vec::new()
+    }
+
     /// Live orders at the gateway. Reconciliation source; the OMS keeps
     /// its own canonical view from order_status_stream events.
     ///

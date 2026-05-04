@@ -30,8 +30,31 @@ pub fn spawn_all(runtime: Arc<Runtime>) -> Vec<tokio::task::JoinHandle<()>> {
     handles.push(tokio::spawn(periodic_snapshot(runtime.clone())));
     handles.push(tokio::spawn(periodic_account_poll(runtime.clone())));
     handles.push(tokio::spawn(daily_halt_rollover(runtime.clone())));
+    handles.push(tokio::spawn(periodic_tick_type_hist(runtime.clone())));
 
     handles
+}
+
+/// Diagnostic: every 30s, log the histogram of incoming TickSize
+/// tick_type values since the last tick. Surfaces routing and
+/// gateway-permission issues — e.g. if call OI (27) is missing while
+/// put OI (28) flows, that's a data-feed problem, not a code bug.
+async fn periodic_tick_type_hist(runtime: Arc<Runtime>) {
+    let mut t = interval(Duration::from_secs(30));
+    log::info!("periodic_tick_type_hist: cadence 30s");
+    loop {
+        t.tick().await;
+        let hist = runtime.broker.diagnostic_take_tick_type_hist();
+        if hist.is_empty() {
+            continue;
+        }
+        let summary: String = hist
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        log::info!("tick_type_hist (30s): {summary}");
+    }
 }
 
 // ─── Stream pumps ──────────────────────────────────────────────────
@@ -48,7 +71,28 @@ async fn pump_fills(runtime: Arc<Runtime>) {
                 handle_fill(&runtime, fill).await;
             }
             Err(RecvError::Lagged(n)) => {
-                log::warn!("pump_fills: lagged {n} frames");
+                // Lagged = silent fill loss. Each dropped frame is a
+                // fill that never updated our portfolio state, leaving
+                // local out-of-sync with IBKR until the next periodic
+                // reconcile. Treat as a P0 incident: log loud, force
+                // an immediate reconcile rather than waiting up to 2
+                // min for the next periodic_hedge sweep.
+                log::error!(
+                    "pump_fills LAGGED {n} frames — fills lost. Triggering \
+                     immediate position re-sync from broker."
+                );
+                let positions_result = {
+                    let b = runtime.broker.clone();
+                    b.positions().await
+                };
+                if let Ok(positions) = positions_result {
+                    let n = runtime.reconcile_options_with_broker_positions(&positions);
+                    log::error!(
+                        "pump_fills lag-recovery reconcile: corrected {n} option leg(s)"
+                    );
+                } else if let Err(e) = positions_result {
+                    log::error!("pump_fills lag-recovery: positions() failed: {e}");
+                }
             }
             Err(RecvError::Closed) => {
                 log::info!("pump_fills: channel closed; exiting");
@@ -147,8 +191,30 @@ async fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::F
         let mut r = runtime.risk.lock().unwrap();
         r.check_daily_pnl_only(&p, &*md)
     };
-    if matches!(halt_outcome, corsair_risk::RiskCheckOutcome::Killed(_)) {
+    if let corsair_risk::RiskCheckOutcome::Killed(ref ev) = halt_outcome {
+        crate::notify::notify_kill(ev.clone());
         cancel_all_resting(runtime, "daily_halt_per_fill").await;
+    }
+
+    // Per-fill DELTA enforcement. The 300s periodic risk_check is too
+    // slow to catch a fast cascade — on 2026-05-04 we accumulated ~38
+    // contracts in ~4 minutes (options_delta 0 → -14.6) before the
+    // periodic check fired. This gate runs on EVERY option fill and
+    // forces the kill the moment effective_delta crosses delta_kill.
+    let effective_delta_post_fill: f64 = {
+        let p = runtime.portfolio.lock().unwrap();
+        let h = runtime.hedge.lock().unwrap();
+        let agg = p.aggregate();
+        let hedge_qty: i32 = h.managers().iter().map(|m| m.hedge_qty()).sum();
+        agg.total.net_delta + hedge_qty as f64
+    };
+    let delta_outcome = {
+        let mut r = runtime.risk.lock().unwrap();
+        r.check_per_fill_delta(effective_delta_post_fill)
+    };
+    if let corsair_risk::RiskCheckOutcome::Killed(ref ev) = delta_outcome {
+        crate::notify::notify_kill(ev.clone());
+        cancel_all_resting(runtime, "delta_kill_per_fill").await;
     }
 
     // CLAUDE.md §10: rebalance hedge on every option fill (in
@@ -381,6 +447,16 @@ async fn periodic_greek_refresh(runtime: Arc<Runtime>) {
 async fn periodic_risk_check(runtime: Arc<Runtime>) {
     let mut t = interval(Duration::from_secs(300));
     log::info!("periodic_risk_check: cadence 300s");
+    // Race condition fix: tokio::interval fires the first tick
+    // immediately. At boot, options Greeks haven't been computed yet
+    // (greek_refresh runs every 5s starting after first interval),
+    // so the seeded positions show delta=0. If hedge_qty is non-zero
+    // at seed, options_delta+hedge_qty == hedge_qty alone, which can
+    // wrongly trip delta_kill (sticky → trader stuck blocked).
+    // Burn the immediate tick so the first real risk eval happens
+    // ~6s after boot, well after the first greek_refresh has run.
+    t.tick().await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
     loop {
         t.tick().await;
         // Compute outcome under locks; release before any await.
@@ -417,6 +493,7 @@ async fn periodic_risk_check(runtime: Arc<Runtime>) {
         match &outcome {
             corsair_risk::RiskCheckOutcome::Killed(ev) => {
                 log::error!("risk check fired kill: {ev:?}");
+                crate::notify::notify_kill(ev.clone());
                 // CLAUDE.md §7/§8: every kill must cancel all resting
                 // orders. Without this, kill is cosmetic — orders
                 // continue resting until GTD-expiry.
@@ -517,9 +594,11 @@ async fn periodic_hedge(runtime: Arc<Runtime>) {
         tick_count = tick_count.wrapping_add(1);
 
         // CLAUDE.md §10 periodic reconcile: every 4 ticks (~2 min)
-        // call broker.positions() and reconcile hedge_qty against
-        // IBKR's view. Catches divergences from non-filling IOCs.
-        // Done every 4 ticks rather than every tick to keep the
+        // call broker.positions() and reconcile BOTH options portfolio
+        // AND hedge_qty against IBKR's view. Options reconcile catches
+        // the silent-fill-loss class (broadcast lag, fill-on-
+        // unregistered-instrument); hedge reconcile catches non-filling
+        // IOCs. Done every 4 ticks rather than every tick to keep the
         // periodic loop light — divergence accumulates slowly.
         if tick_count.is_multiple_of(4) {
             let positions_result = {
@@ -527,6 +606,18 @@ async fn periodic_hedge(runtime: Arc<Runtime>) {
                 b.positions().await
             };
             if let Ok(positions) = positions_result {
+                // Options portfolio reconcile — silent no-op when
+                // local matches IBKR; loud + auto-correcting on drift.
+                let opts_changes =
+                    runtime.reconcile_options_with_broker_positions(&positions);
+                if opts_changes > 0 {
+                    log::error!(
+                        "periodic_reconcile: corrected {opts_changes} option leg(s) — \
+                         likely missed fills from pump_fills lag or unregistered \
+                         instrument. Investigate logs for RecvError::Lagged or \
+                         'fill on unregistered instrument'."
+                    );
+                }
                 let mut h = runtime.hedge.lock().unwrap();
                 // First touch all managers so flat legs (which won't
                 // appear in `positions`) keep their freshness gate
@@ -536,7 +627,7 @@ async fn periodic_hedge(runtime: Arc<Runtime>) {
                 for mgr in h.managers_mut() {
                     mgr.touch_freshness();
                 }
-                for pos in positions {
+                for pos in &positions {
                     if pos.contract.kind != corsair_broker_api::ContractKind::Future {
                         continue;
                     }
@@ -550,6 +641,8 @@ async fn periodic_hedge(runtime: Arc<Runtime>) {
                         mgr.reconcile_with_position(pos.quantity, avg, true);
                     }
                 }
+            } else if let Err(e) = positions_result {
+                log::error!("periodic_reconcile: broker.positions() failed: {e}");
             }
         }
 
@@ -644,8 +737,18 @@ async fn place_hedge_order(
         log::warn!("hedge[{product}]: no underlying price, skipping");
         return;
     }
-    let offset = (ioc_offset as f64) * hedge_tick;
-    let lmt = if is_buy { f + offset } else { (f - offset).max(hedge_tick) };
+    // Hedge order type: MARKET. The original design was IOC ±N ticks
+    // — small bounded slippage if filled, but the IOC dies when
+    // market moves >N ticks during the ~140ms IBKR RTT. In a fast
+    // move (exactly when we MOST need to be hedged) the IOC reliably
+    // missed. HG futures depth is deep enough that a 4-contract
+    // market order slips 1-2 ticks at worst. "Fill at any reasonable
+    // price" beats "fill at +N ticks or never". `_ioc_offset` and
+    // `_hedge_tick` are retained for the price-anchor field but
+    // unused on the market path. 2026-05-04: switched after
+    // observing 4 consecutive 30s-periodic IOC misses while
+    // options_delta sat at -4.3.
+    let _ = (ioc_offset, hedge_tick);
     let req = corsair_broker_api::PlaceOrderReq {
         contract,
         side: if is_buy {
@@ -654,8 +757,11 @@ async fn place_hedge_order(
             corsair_broker_api::Side::Sell
         },
         qty,
-        order_type: corsair_broker_api::OrderType::Limit,
-        price: Some(lmt),
+        order_type: corsair_broker_api::OrderType::Market,
+        price: None,
+        // IOC so a market order doesn't queue if for some reason the
+        // contract has no bid/ask momentarily — caller's next periodic
+        // tick will retry with fresh underlying.
         tif: corsair_broker_api::TimeInForce::Ioc,
         gtd_until_utc: None,
         client_order_ref: format!("corsair_hedge_{}", reason),
@@ -672,10 +778,9 @@ async fn place_hedge_order(
     };
     match result {
         Ok(oid) => log::warn!(
-            "hedge[{product}]: placed {} {} @ {:.4} oid={} ({})",
+            "hedge[{product}]: placed MKT {} {} oid={} ({})",
             if is_buy { "BUY" } else { "SELL" },
             qty,
-            lmt,
             oid,
             reason
         ),
@@ -716,12 +821,34 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
             let b = runtime.broker.clone();
             b.open_orders().await.unwrap_or_default()
         };
+        // Diagnostic: log status histogram every snapshot tick (info
+        // level temporarily so we can see WITHOUT a custom RUST_LOG).
+        // If build_chain_payload's filter (Submitted | PendingSubmit)
+        // is dropping everything, this surfaces what status IBKR is
+        // actually leaving them in.
+        {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 40 == 0 {
+                // Once every ~10s (snapshot is 250ms cadence)
+                let mut by_status = std::collections::HashMap::<String, u32>::new();
+                for o in &open_orders_snapshot {
+                    *by_status.entry(format!("{:?}", o.status)).or_insert(0) += 1;
+                }
+                log::info!(
+                    "open_orders snapshot: total={} statuses={:?}",
+                    open_orders_snapshot.len(),
+                    by_status
+                );
+            }
+        }
         // Pull latency stats from the rolling sample buffer.
         let latency_snapshot = {
             let s = runtime.latency_samples.lock().unwrap();
             let (ttt_n, ttt_p50, ttt_p99) = s.ttt_stats();
             let (rtt_n, rtt_p50, rtt_p99) = s.place_rtt_stats();
-            if ttt_n > 0 || rtt_n > 0 {
+            let (mod_n, mod_p50, mod_p99) = s.modify_rtt_stats();
+            if ttt_n > 0 || rtt_n > 0 || mod_n > 0 {
                 Some(corsair_snapshot::payload::LatencySnapshot {
                     ttt_us: corsair_snapshot::payload::LatencyStats {
                         n: ttt_n,
@@ -733,7 +860,11 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
                         p50: rtt_p50,
                         p99: rtt_p99,
                     },
-                    amend_us: corsair_snapshot::payload::LatencyStats::default(),
+                    amend_us: corsair_snapshot::payload::LatencyStats {
+                        n: mod_n,
+                        p50: mod_p50,
+                        p99: mod_p99,
+                    },
                 })
             } else {
                 None
@@ -790,8 +921,15 @@ async fn daily_halt_rollover(runtime: Arc<Runtime>) {
 }
 
 async fn periodic_account_poll(runtime: Arc<Runtime>) {
-    let mut t = interval(Duration::from_secs(300));
-    log::info!("periodic_account_poll: cadence 300s");
+    // Cadence dropped 300s → 15s on 2026-05-04. The 5-min refresh
+    // meant the dashboard's Margin tile and the trader's margin gate
+    // worked off stale data — during the 12:16 cascade we had ~$280K
+    // of fresh maint margin while the cached snapshot still showed $0
+    // (boot-time value). 15s is a comfortable trade — IBKR pushes
+    // AccountValue updates every ~5s anyway; this is just refreshing
+    // our cache from the streamed map.
+    let mut t = interval(Duration::from_secs(15));
+    log::info!("periodic_account_poll: cadence 15s");
     loop {
         t.tick().await;
         let result = {
@@ -939,9 +1077,18 @@ fn build_chain_payload(
                     }
                 }
             }
+            // External (peer) best — strips our resting orders from
+            // the top of book using L2 depth. When we're the lone bid
+            // the L1 bid IS our quote; the dashboard wants to show
+            // the next-best peer quote so the operator can see whether
+            // we're inside the spread or matching it. Falls back to
+            // raw L1 (= 0.0) on strikes outside the L2-rotator window;
+            // dashboard's `_fmt_side` then displays raw_bid/raw_ask.
+            let ext_bid = opt.depth.external_best_bid(our_bid, 1);
+            let ext_ask = opt.depth.external_best_ask(our_ask, 1);
             let side = SideBlockSnapshot {
-                market_bid: opt.bid,
-                market_ask: opt.ask,
+                market_bid: if ext_bid > 0.0 { ext_bid } else { opt.bid },
+                market_ask: if ext_ask > 0.0 { ext_ask } else { opt.ask },
                 bid_size: opt.bid_size,
                 ask_size: opt.ask_size,
                 last: opt.last,

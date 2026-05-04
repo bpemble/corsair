@@ -264,6 +264,36 @@ impl RiskMonitor {
         RiskCheckOutcome::Healthy
     }
 
+    /// Per-fill delta enforcement. The 300s periodic risk_check is too
+    /// slow to catch a fast cascade (2026-05-04: options_delta drifted
+    /// 0 → -14.6 between two periodic ticks while we accumulated ~38
+    /// contracts in 4 minutes). This fires the kill the moment a fill
+    /// pushes effective_delta past `delta_kill`, before the next quote
+    /// is even decided.
+    ///
+    /// Caller passes the post-fill `effective_delta` (options +
+    /// hedge_qty). Hedge state is read by the caller because the risk
+    /// monitor doesn't own a HedgeFanout reference and we want the
+    /// gate to operate on the same metric the trader self-blocks on.
+    pub fn check_per_fill_delta(&mut self, effective_delta: f64) -> RiskCheckOutcome {
+        if self.killed.is_some() {
+            return RiskCheckOutcome::AlreadyKilled(self.killed.clone().unwrap());
+        }
+        if effective_delta.abs() > self.cfg.delta_kill {
+            let ev = KillEvent {
+                reason: format!(
+                    "DELTA KILL (fill-path): {:+.2} > ±{:.1}",
+                    effective_delta, self.cfg.delta_kill
+                ),
+                source: KillSource::Risk,
+                kill_type: KillType::HedgeFlat,
+                timestamp_ns: now_ns(),
+            };
+            return self.fire(ev);
+        }
+        RiskCheckOutcome::Healthy
+    }
+
     /// Check for induced-kill sentinels in the configured directory.
     /// Removes the sentinel BEFORE firing so the kill can't re-trigger
     /// on the next cycle if the remove succeeds. If remove fails, log

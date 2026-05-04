@@ -63,6 +63,12 @@ pub fn spawn_ipc(
     let server = Arc::new(SHMServer::create(server_cfg)?);
     let (cmd_rx, _drop_rx) = server.start();
 
+    // Stash the server arc on Runtime so handle_place can publish
+    // place_ack events directly. Without this, the trader never
+    // learns the order_id of orders it placed and every re-quote
+    // falls through to a fresh Place — breaking the amend path.
+    *runtime.ipc_server.lock().unwrap() = Some(Arc::clone(&server));
+
     // Spawn the command-dispatch loop.
     tokio::spawn(dispatch_commands(runtime.clone(), cmd_rx));
 
@@ -311,6 +317,15 @@ struct ModifyOrderCmd {
     qty: Option<u32>,
     #[serde(default)]
     gtd_seconds: Option<u32>,
+    /// Trader's send-time wall clock (ns). Used by the wire-timing
+    /// JSONL emitter so we can compute trader→broker IPC latency on
+    /// the amend path.
+    #[serde(default)]
+    ts_ns: Option<u64>,
+    /// Trigger tick's broker_recv_ns. Used for the modify-equivalent
+    /// of TTT (tick → modify_order send).
+    #[serde(default)]
+    triggering_tick_broker_recv_ns: Option<u64>,
 }
 
 /// Broker → trader event envelopes.
@@ -602,13 +617,57 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
         s.push_place_rtt(place_rtt_us);
     }
 
-    match result {
+    match &result {
         Ok(oid) => log::info!(
             "ipc place_order placed: oid={} for ref='{}'",
             oid,
-            cmd.client_order_ref.unwrap_or_default()
+            cmd.client_order_ref.clone().unwrap_or_default()
         ),
         Err(e) => log::warn!("ipc place_order failed: {e}"),
+    }
+
+    // Publish place_ack so the trader can populate OurOrder.order_id
+    // and switch to the modify path on subsequent updates at this key.
+    // Without this, the trader sees order_id=None forever and every
+    // re-quote falls back to a fresh Place — defeating the amend
+    // conversion.
+    if let Ok(oid) = &result {
+        // Field names match `corsair_trader::messages::PlaceAckMsg`
+        // exactly — order_id is `orderId` (camelCase) on the wire to
+        // match the trader's serde rename. Mismatch here means the
+        // trader silently drops the parse and OurOrder.order_id never
+        // populates — exactly the bug we're fixing.
+        #[derive(Serialize)]
+        struct PlaceAckEvent<'a> {
+            #[serde(rename = "type")]
+            ty: &'a str,
+            #[serde(rename = "orderId")]
+            order_id: u64,
+            strike: f64,
+            expiry: &'a str,
+            right: &'a str,
+            side: &'a str,
+            price: f64,
+            ts_ns: u64,
+        }
+        let ev = PlaceAckEvent {
+            ty: "place_ack",
+            order_id: oid.0,
+            strike: cmd.strike,
+            expiry: &cmd.expiry,
+            right: &cmd.right,
+            side: &cmd.side,
+            price: cmd.price,
+            ts_ns: now_ns(),
+        };
+        if let Ok(body) = rmp_serde::to_vec_named(&ev) {
+            let server = runtime.ipc_server.lock().unwrap().clone();
+            if let Some(s) = server {
+                if !s.publish(&body) {
+                    log::warn!("ipc events ring full — dropped place_ack");
+                }
+            }
+        }
     }
 }
 
@@ -634,6 +693,7 @@ async fn handle_cancel(runtime: &Arc<Runtime>, body: &[u8]) {
 }
 
 async fn handle_modify(runtime: &Arc<Runtime>, body: &[u8]) {
+    let broker_order_recv_ns = now_ns();
     let cmd: ModifyOrderCmd = match rmp_serde::from_slice(body) {
         Ok(c) => c,
         Err(e) => {
@@ -652,10 +712,63 @@ async fn handle_modify(runtime: &Arc<Runtime>, body: &[u8]) {
             .gtd_seconds
             .map(|s| chrono::Utc::now() + chrono::Duration::seconds(s as i64)),
     };
-    let result = {
+    // Mirrors handle_place's instrumentation — see ipc.rs handle_place
+    // for the RTT semantics. Modify path: broker_order_send_marker_ns
+    // is the moment we await modify_order; broker_order_ack_marker_ns
+    // is set after drain_wire_timing returns the in-NativeBroker
+    // (send_ns, ack_ns) pair captured at the actual TCP send + first
+    // OrderStatus update for this order_id.
+    let broker_order_send_marker_ns = now_ns();
+    let (result, precise_send_ns, precise_ack_ns) = {
         let b = runtime.broker.clone();
-        b.modify_order(OrderId(cmd.order_id), req).await
+        let r = b.modify_order(OrderId(cmd.order_id), req).await;
+        let timing = match &r {
+            Ok(_) => b.drain_wire_timing(cmd.order_id),
+            Err(_) => None,
+        };
+        let (s, a) = timing.unzip();
+        (r, s, a)
     };
+    let broker_order_ack_marker_ns = now_ns();
+    let broker_order_send_ns = precise_send_ns.unwrap_or(broker_order_send_marker_ns);
+    let broker_order_ack_ns = precise_ack_ns.unwrap_or(broker_order_ack_marker_ns);
+
+    let outcome_str = if result.is_ok() { "ack" } else { "rejected" };
+    let row = serde_json::json!({
+        "schema": "wire_timing/v2",
+        "kind": "modify",
+        "ts_ns": broker_order_ack_ns,
+        "outcome": outcome_str,
+        "order_id": cmd.order_id,
+        "price": cmd.price,
+        "triggering_tick_broker_recv_ns": cmd.triggering_tick_broker_recv_ns,
+        "trader_decide_ts_ns": cmd.ts_ns,
+        "broker_order_recv_ns": broker_order_recv_ns,
+        "broker_order_send_ns": broker_order_send_ns,
+        "broker_order_ack_ns": broker_order_ack_ns,
+        "broker_order_send_marker_ns": broker_order_send_marker_ns,
+        "broker_order_ack_marker_ns": broker_order_ack_marker_ns,
+        "send_ns_precise": precise_send_ns.is_some(),
+        "ack_ns_precise": precise_ack_ns.is_some(),
+    });
+    runtime.wire_timing.write(row);
+
+    // Push to dashboard latency block. Same TTT / RTT semantics as
+    // place — TTT measures our internal hot path, RTT measures
+    // IBKR network round-trip on the amend send.
+    if result.is_ok() {
+        let modify_rtt_us = (broker_order_ack_marker_ns
+            .saturating_sub(broker_order_send_marker_ns))
+            / 1000;
+        let trigger_ns = cmd
+            .triggering_tick_broker_recv_ns
+            .unwrap_or(broker_order_recv_ns);
+        let ttt_us = (broker_order_send_marker_ns.saturating_sub(trigger_ns)) / 1000;
+        let mut s = runtime.latency_samples.lock().unwrap();
+        s.push_ttt(ttt_us);
+        s.push_modify_rtt(modify_rtt_us);
+    }
+
     if let Err(e) = result {
         log::warn!("ipc modify_order failed: {e}");
     }

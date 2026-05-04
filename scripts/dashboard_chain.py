@@ -45,7 +45,10 @@ def _fmt_side(s, pfmt="1"):
     our_bid = s.get("our_bid")
     our_ask = s.get("our_ask")
     theo = s.get("theo")
-    pos = s.get("position", 0)
+    # Snapshot key is "pos" (broker payload, snapshot/payload.rs); the
+    # legacy v2 Python broker emitted "position". Accept either so the
+    # dashboard renders position chips on Rust-broker snapshots.
+    pos = s.get("pos", s.get("position", 0)) or 0
 
     our_bid_html = _our_price_cell(our_bid, s.get("bid_live", False), mkt_bid, raw_bid, "BUY", pfmt=pfmt)
     our_ask_html = _our_price_cell(our_ask, s.get("ask_live", False), mkt_ask, raw_ask, "SELL", pfmt=pfmt)
@@ -181,6 +184,16 @@ def build_chain_html(snapshot, selected_expiry: str = None):
     strikes = None
     if selected_expiry and selected_expiry in chains:
         strikes = chains[selected_expiry].get("strikes")
+    # Fallback chain — when caller didn't pick an expiry, use the
+    # broker-emitted front_month_expiry, otherwise the first key.
+    # Without this, Rust-broker snapshots (which only emit `chains`,
+    # not the legacy top-level `strikes`) render empty on first load.
+    if not strikes:
+        front = snapshot.get("front_month_expiry")
+        if front and front in chains:
+            strikes = chains[front].get("strikes")
+    if not strikes and chains:
+        strikes = next(iter(chains.values())).get("strikes")
     if not strikes:
         strikes = snapshot.get("strikes")
     if not strikes:

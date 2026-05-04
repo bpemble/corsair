@@ -86,9 +86,18 @@ pub struct ProductConfig {
     /// Default IV when MarketView has no value. 0.30 typical.
     #[serde(default = "default_iv")]
     pub default_iv: f64,
-    /// Strike subscription range, low/high in increments.
+    /// Strike QUOTING range, low/high in increments. Trader places
+    /// orders only on strikes within this window relative to ATM.
     pub quote_range_low: i32,
     pub quote_range_high: i32,
+    /// Strike SUBSCRIPTION range, low/high in increments. Wider than
+    /// quote_range so SABR has wing data for stable fits — CLAUDE.md
+    /// §12 specifies +2 buffer on each side. Defaults to quote_range
+    /// when unset (back-compat with older configs).
+    #[serde(default)]
+    pub strike_range_low: Option<i32>,
+    #[serde(default)]
+    pub strike_range_high: Option<i32>,
     pub strike_increment: f64,
     pub enabled: bool,
 }

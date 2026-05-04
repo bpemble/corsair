@@ -154,20 +154,34 @@ def _normalize_snapshot(snap, path):
     # emit per-right buckets — compute from positions here.
     positions_raw = port.get("positions") or []
     if positions_raw and "calls" not in port:
+        # Total maint margin to split between calls and puts. The
+        # Rust broker doesn't emit per-side margin (SPAN doesn't
+        # decompose cleanly by right); proportional allocation by
+        # gross contracts is a reasonable operator-facing approximation.
+        # The headline Margin tile shows the precise total.
+        total_maint = float((snap.get("account") or {}).get("maintenance_margin", 0.0) or 0.0)
+        total_gross = sum(abs(int(p.get("quantity", 0))) for p in positions_raw) or 1
+
         def _bucket(filt):
             ps = [p for p in positions_raw if filt(p.get("right", ""))]
             d = sum(
                 float(p.get("delta", 0.0) or 0.0) * int(p.get("quantity", 0))
                 for p in ps
             )
+            # Per-contract theta is already in $/contract/day terms
+            # (Black76 model emits dollar-per-day with the multiplier
+            # baked in — corsair_position::aggregation::add multiplies
+            # by qty only, not by multiplier). Multiplying by
+            # multiplier here would inflate by 25,000× for HG and
+            # produce nonsense like +$77M on a small short-put book.
             t = sum(
                 float(p.get("theta", 0.0) or 0.0)
                 * int(p.get("quantity", 0))
-                * float(p.get("multiplier", 1.0) or 1.0)
                 for p in ps
             )
             g = sum(abs(int(p.get("quantity", 0))) for p in ps)
-            return {"delta": d, "theta": t, "margin": 0.0, "gross": g}
+            margin = total_maint * (g / total_gross) if total_gross > 0 else 0.0
+            return {"delta": d, "theta": t, "margin": margin, "gross": g}
         port["calls"] = _bucket(lambda r: r.startswith("C"))
         port["puts"] = _bucket(lambda r: r.startswith("P"))
         snap["portfolio"] = port
@@ -183,8 +197,8 @@ def _normalize_snapshot(snap, path):
             "avg_entry": h.get("avg_entry_f", 0.0),
             "mtm_usd": h.get("mtm_usd", 0.0),
             "realized_pnl_usd": h.get("realized_pnl_usd", 0.0),
-            "forward": 0.0,  # not emitted by Rust broker yet
-            "expiry": "",    # not emitted by Rust broker yet
+            "forward": h.get("forward", 0.0),
+            "expiry": h.get("expiry", ""),
         }
 
     # Underlying: dashboard reads snapshot["underlying_price"] (scalar);
@@ -365,7 +379,15 @@ with _psel_col:
 if snapshot is not None:
     port = snapshot.get("portfolio", {})
     underlying = snapshot.get("underlying_price", 0)
-    margin_val = port.get("margin", 0)
+    # Margin lives on the account block, not portfolio. Rust broker
+    # emits account.maintenance_margin (the IBKR-confirmed figure).
+    # Legacy Python broker emitted portfolio.margin via a SPAN-derived
+    # estimate; preserved as fallback for old snapshots.
+    margin_val = (
+        snapshot.get("account", {}).get("maintenance_margin")
+        or port.get("margin", 0)
+        or 0
+    )
     # Headline Net Delta = effective (options + hedge). Per-side Calls/Puts
     # buckets below stay options-only since hedge isn't a Call or Put.
     # Falls back to options-only net_delta on snapshots without the field
@@ -542,7 +564,10 @@ if snapshot is not None:
         daily_label = "—"
         daily_color = None
     else:
-        daily_label = f"${daily_nlv:+,.0f}"
+        # No +/- prefix — color already conveys sign and the +$67 form
+        # reads weirdly for tiny intraday moves. Negative renders as
+        # $-67 (the minus stays so the number is still unambiguous).
+        daily_label = f"${daily_nlv:,.0f}"
         daily_color = "green" if daily_nlv >= 0 else "red"
     cells = [
         ("Account",       acct.get("account_id", "—"),                None),
@@ -617,6 +642,12 @@ if snapshot is not None:
             # Right column: collapse "Call"/"Put" → "C"/"P" so the
             # contract column reads as "5.90C" / "5.90P".
             right_letter = (p.get('right') or '')[:1].upper() or '—'
+            # Greeks are stored per-contract (unsigned). Position-list
+            # display wants the position-signed exposure: short calls
+            # have NEGATIVE delta, short options COLLECT theta (positive).
+            # Multiply by signed qty (already includes long/short sign).
+            signed_delta = (p['delta'] or 0.0) * qty
+            signed_theta = (p['theta'] or 0.0) * qty
             rows += f"""<tr>
                 <td>{prod}</td>
                 <td>{strike_label}{right_letter}</td>
@@ -625,8 +656,8 @@ if snapshot is not None:
                 <td>${avg_fmt}</td>
                 <td>${mark_fmt}</td>
                 <td class="chain-edge {unr_class}">${unr:+,.0f}</td>
-                <td>{p['delta']:+.3f}</td>
-                <td>{p['theta']:+,.0f}</td>
+                <td>{signed_delta:+.3f}</td>
+                <td>{signed_theta:+,.0f}</td>
             </tr>"""
         return f"""
         <table class="chain-table">

@@ -34,6 +34,9 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
+# HTTP client for Discord webhook notifications on kill events.
+# rustls-tls so we don't pull in OpenSSL — keeps the docker image lean.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"

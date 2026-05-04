@@ -57,6 +57,16 @@ pub struct TraderState {
     /// Vol surface params per (expiry, right-char). Bounded by ~4 entries.
     pub vol_surfaces: AHashMap<(String, char), VolSurfaceEntry>,
 
+    /// Optimization #3 — SVI/SABR theo cache, keyed by
+    /// (strike_bits, expiry, right_char, fit_ts_ns). theo is a pure
+    /// function of (forward, strike, tte, params, right); within a
+    /// single fit cycle the only changing input is tte, which moves
+    /// less than 1 tick over a 60s fit window. We invalidate the
+    /// entry when fit_ts_ns changes (new SABR fit landed). Saves
+    /// ~80µs per tick (SVI/SABR + Black76) in the steady-state amend
+    /// loop where the same key sees many ticks per second.
+    pub theo_cache: AHashMap<(u64, String, char, u64), f64>,
+
     /// Underlying spot. Updated from underlying_tick.
     pub underlying_price: f64,
 
@@ -99,6 +109,7 @@ impl TraderState {
         Self {
             options: AHashMap::new(),
             vol_surfaces: AHashMap::new(),
+            theo_cache: AHashMap::new(),
             underlying_price: 0.0,
             our_orders: AHashMap::new(),
             orderid_to_key: AHashMap::new(),
@@ -167,6 +178,17 @@ pub struct DecisionCounters {
     pub staleness_cancel_dark: u64,
     pub replace_cancel: u64,
     pub replace_skip_cancel_near_gtd: u64,
+    /// Quote update fired as a single modify_order (amend) instead of
+    /// cancel + place. Replaces most replace_cancel events: a known
+    /// live order_id at the key + price-update path goes through
+    /// modify in one round trip.
+    pub modify: u64,
+    /// Modify rejected by IBKR (price too far, contract issue, etc).
+    /// Trader falls back to cancel + place. Currently increments
+    /// from the broker side via the modify_order Result; the trader
+    /// logs the broker-side reject but doesn't yet observe it on
+    /// the IPC. Reserved for the post-`order_status_modify` path.
+    pub modify_reject: u64,
 }
 
 impl DecisionCounters {
@@ -200,6 +222,8 @@ impl DecisionCounters {
             ("staleness_cancel_dark", self.staleness_cancel_dark),
             ("replace_cancel", self.replace_cancel),
             ("replace_skip_cancel_near_gtd", self.replace_skip_cancel_near_gtd),
+            ("modify", self.modify),
+            ("modify_reject", self.modify_reject),
         ];
         for (k, v) in pairs {
             if *v > 0 {

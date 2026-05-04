@@ -52,6 +52,11 @@ products:
     default_iv: 0.30
     quote_range_low: -5
     quote_range_high: 5
+    # Subscribe wider than we quote — SABR's wings need strikes
+    # ±2 beyond the quoting range or the fit extrapolates.
+    # CLAUDE.md §12.
+    strike_range_low: -7
+    strike_range_high: 7
     strike_increment: 0.05
     enabled: true
 
@@ -72,7 +77,12 @@ hedging:
   rebalance_cadence_sec: 30
   include_in_daily_pnl: true
   flatten_on_halt: true
-  ioc_tick_offset: 2
+  # Bumped 2 → 4 on 2026-05-04. Thin HG futures and ~140ms IBKR
+  # round trip mean a ±2-tick IOC arrives stale ~half the time and
+  # dies unfilled — exactly what was leaving us at -4.3 delta with
+  # hedge_qty=0 despite the periodic firing every 30s. Trade-off:
+  # ~$25/contract slippage at HG's 0.0005 tick × 25k multiplier.
+  ioc_tick_offset: 4
   hedge_tick_size: 0.0005
   hedge_lockout_days: 30
 

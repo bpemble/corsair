@@ -16,6 +16,17 @@ pub const MAX_STRIKE_OFFSET_USD: f64 = 0.30;
 // pub const STALENESS_INTERVAL_SECS: f64 = 0.10;
 pub const STALENESS_TICKS: i32 = 1;
 pub const COOLDOWN_NS: u64 = 250_000_000; // 250ms
+/// Maximum time to wait for a place_ack before assuming it was lost
+/// and proceeding with a fresh place at the same key. The original
+/// HI-003 gate used COOLDOWN_NS (250ms) — too short for real ack
+/// latency tails (place_rtt p99 ~1s on paper). With place_rtt p50
+/// ~140ms, 2s gives ~14× headroom; well above any reasonable retry
+/// while still bounded so we recover if place_ack genuinely drops.
+/// 2026-05-04: pre-fix this was 250ms, which combined with the
+/// camelCase place_ack bug let the trader pile orders at IBKR
+/// (one new order every 250ms × 4 strikes × 2 sides = ~32/sec) and
+/// every market cross filled the entire stack.
+pub const UNACK_INFLIGHT_NS: u64 = 2_000_000_000; // 2s
 pub const DEAD_BAND_TICKS: i32 = 1;
 pub const GTD_LIFETIME_S: f64 = 5.0;
 pub const GTD_REFRESH_LEAD_S: f64 = 1.5;
@@ -34,11 +45,32 @@ pub enum Decision {
     #[allow(dead_code)]
     Skip,
     /// Send place_order at this price for this side. If `cancel_old_oid`
-    /// is Some, send a cancel_order first.
+    /// is Some, send a cancel_order first. Used for fresh placements +
+    /// the rare fallback case (no live order_id at this key).
     Place {
         side: Side,
         price: f64,
         cancel_old_oid: Option<i64>,
+    },
+    /// Send a single modify_order at the existing order_id. Replaces
+    /// cancel-before-replace when we have a known live order_id —
+    /// one round trip instead of two, no transient empty quote window.
+    Modify {
+        side: Side,
+        order_id: i64,
+        price: f64,
+    },
+    /// Cancel ALL of our resting orders. Fired when the trader self-
+    /// blocks on risk (risk_all = effective_delta near kill threshold)
+    /// and we still have live quotes at IBKR — without this, the
+    /// resting stack continues to absorb fills until the kill fires
+    /// or the orders GTD-expire. With it, we yank the stack the
+    /// moment risk says "stop trading", well before the kill.
+    /// 2026-05-04 cascade post-mortem: 12 fills accumulated in 13s
+    /// because risk_all only blocked NEW placements while the existing
+    /// 22 orders sat at theo±tick taking adverse hits.
+    CancelAll {
+        order_ids: Vec<i64>,
     },
 }
 
@@ -114,6 +146,21 @@ pub fn decide_on_tick(
     // All-blocking risk gate hoisted before per-side loop.
     if risk_all {
         counters.risk_block += 2;
+        // Proactive cancel: when self-blocked on risk AND we still
+        // have live quotes resting, fire cancel_all immediately. The
+        // alternative (passively waiting for the per-fill kill) lets
+        // the resting stack absorb adverse fills until the next fill
+        // crosses the kill — too slow in fast markets. Bounded fire:
+        // emit once when our_orders is non-empty; subsequent ticks
+        // see empty our_orders and skip.
+        let order_ids: Vec<i64> = state
+            .our_orders
+            .values()
+            .filter_map(|o| o.order_id)
+            .collect();
+        if !order_ids.is_empty() {
+            out.push(Decision::CancelAll { order_ids });
+        }
         return out;
     }
 
@@ -161,15 +208,38 @@ pub fn decide_on_tick(
         return out;
     }
 
-    // Pre-compute theo once per tick (side-independent within a right).
-    // BUT theo IS right-dependent (calls and puts have different prices
-    // even at the same iv). Pass the option's right (already computed
-    // above as r_char for the vol_surfaces key).
-    let (_iv, theo) = match compute_theo(fit_forward, strike, tte, r_char, &vp_msg.params) {
-        Some(v) => v,
+    // Theo cache (optimization #3). Within a single fit window
+    // (60s), theo is a pure function of (forward, strike, tte,
+    // params, right). The only mover is tte and it shifts <1µs/sec
+    // — well below tick precision. So we cache by (key, fit_ts_ns)
+    // and invalidate only when a new fit lands. Saves ~80µs per
+    // tick on the SVI implied_vol + Black76 chain in the amend loop.
+    let theo_key = (
+        TraderState::strike_key(strike),
+        expiry.clone(),
+        r_char,
+        vp_msg.fit_ts_ns,
+    );
+    let theo = match state.theo_cache.get(&theo_key).copied() {
+        Some(t) => t,
         None => {
-            counters.skip_other += 1;
-            return out;
+            let (_iv, t) = match compute_theo(fit_forward, strike, tte, r_char, &vp_msg.params) {
+                Some(v) => v,
+                None => {
+                    counters.skip_other += 1;
+                    return out;
+                }
+            };
+            // Bound cache size: prune all entries on fit change. The
+            // hashmap key includes fit_ts_ns so old entries are dead;
+            // sweep them when the fit advances by retaining only
+            // current-fit keys. Cheap O(N≤44) per fit cycle.
+            if state.theo_cache.len() > 200 {
+                let current_fit = vp_msg.fit_ts_ns;
+                state.theo_cache.retain(|(_, _, _, ts), _| *ts == current_fit);
+            }
+            state.theo_cache.insert(theo_key, t);
+            t
         }
     };
 
@@ -327,14 +397,22 @@ pub fn decide_on_tick(
         if let Some(ref ex) = existing {
             // HI-003: no place while previous order is still unack'd
             // (order_id is None until place_ack arrives). Without this
-            // gate, GTD-refresh path can fire a second place at the same
-            // key while the first is in-flight, leaving the first to
-            // expire via GTD-5s and bloating IBKR's order book.
-            // Tolerance: only enforce this BEFORE the cooldown floor
-            // expires; if cooldown has elapsed (>250 ms), the place_ack
-            // path failed silently and we must replace.
+            // gate, every quote update past the cooldown floor would
+            // place a SECOND order at the same key while the first is
+            // still resting at IBKR — we'd accumulate hundreds of
+            // resting orders within seconds because we don't know the
+            // first one's orderId to cancel it.
+            //
+            // 2026-05-04 cascade root cause: this gate timeout was set
+            // to COOLDOWN_NS (250ms), well below typical place_ack
+            // latency. Combined with a camelCase field-name bug where
+            // place_ack never reached the trader, every key piled
+            // ~5 fresh orders/sec at IBKR. Fix: extend the gate
+            // window to UNACK_INFLIGHT_NS (2s); past that, place_ack
+            // is presumed lost and we proceed (phantom orphan at
+            // IBKR, but bounded by GTD-5s).
             if ex.order_id.is_none()
-                && (now_monotonic_ns - ex.place_monotonic_ns) < COOLDOWN_NS
+                && (now_monotonic_ns - ex.place_monotonic_ns) < UNACK_INFLIGHT_NS
             {
                 counters.skip_unack_inflight += 1;
                 continue;
@@ -361,32 +439,33 @@ pub fn decide_on_tick(
         // single-thread Rust version they're identical, so skip the
         // duplicate check.
 
-        // Cancel-before-replace: only if old order has substantial GTD left.
-        let cancel_old_oid = match &existing {
-            Some(ex) => {
-                let age_s = (now_monotonic_ns - ex.place_monotonic_ns) as f64 / 1e9;
-                let gtd_remaining = GTD_LIFETIME_S - age_s;
-                if gtd_remaining > CANCEL_THRESHOLD_S {
-                    if let Some(oid) = ex.order_id {
-                        counters.replace_cancel += 1;
-                        Some(oid)
-                    } else {
-                        None
-                    }
-                } else {
-                    if ex.order_id.is_some() {
-                        counters.replace_skip_cancel_near_gtd += 1;
-                    }
-                    None
-                }
+        // Re-quote path:
+        //   - If we have a live order_id at this key, AMEND (single
+        //     modify_order). Cuts wire RTT in half vs cancel+place and
+        //     leaves no empty-quote window where opposite-side traders
+        //     can pick the lone surviving leg.
+        //   - If no order_id (place_ack hasn't arrived yet AND cooldown
+        //     elapsed → place ack failed silently), fall back to a
+        //     fresh Place with no cancel.
+        //   - If existing order is near-GTD-expiry, prefer modify too —
+        //     a modify refreshes GTD via gtd_until_utc on the same id.
+        //     The replace_skip_cancel_near_gtd counter survives for
+        //     diagnostic continuity but no longer gates anything.
+        if let Some(ref ex) = existing {
+            if let Some(oid) = ex.order_id {
+                counters.modify += 1;
+                out.push(Decision::Modify {
+                    side,
+                    order_id: oid,
+                    price: target_q,
+                });
+                continue;
             }
-            None => None,
-        };
-
+        }
         out.push(Decision::Place {
             side,
             price: target_q,
-            cancel_old_oid,
+            cancel_old_oid: None,
         });
         counters.place += 1;
     }

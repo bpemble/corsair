@@ -10,8 +10,13 @@ const RING_CAPACITY: usize = 1024;
 pub struct LatencySamples {
     /// Tick → broker_order_ack (microseconds).
     ttt_us: VecDeque<u64>,
-    /// Broker send → broker recv ack (microseconds).
+    /// Broker send → broker recv ack on place_order.
     place_rtt_us: VecDeque<u64>,
+    /// Broker send → broker recv ack on modify_order (amend). The
+    /// industry-conventional "quote update" latency: in steady-state
+    /// MM, the loop is tick → modify, not tick → place, so this is
+    /// the metric to optimize.
+    modify_rtt_us: VecDeque<u64>,
 }
 
 impl LatencySamples {
@@ -27,6 +32,10 @@ impl LatencySamples {
         push_bounded(&mut self.place_rtt_us, us);
     }
 
+    pub fn push_modify_rtt(&mut self, us: u64) {
+        push_bounded(&mut self.modify_rtt_us, us);
+    }
+
     /// Compute (n, p50, p99). Empty buffer returns (0, None, None).
     pub fn ttt_stats(&self) -> (u64, Option<u64>, Option<u64>) {
         stats(&self.ttt_us)
@@ -34,6 +43,10 @@ impl LatencySamples {
 
     pub fn place_rtt_stats(&self) -> (u64, Option<u64>, Option<u64>) {
         stats(&self.place_rtt_us)
+    }
+
+    pub fn modify_rtt_stats(&self) -> (u64, Option<u64>, Option<u64>) {
+        stats(&self.modify_rtt_us)
     }
 }
 
