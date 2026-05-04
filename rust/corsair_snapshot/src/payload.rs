@@ -95,6 +95,25 @@ pub struct SideBlockSnapshot {
     /// for this leg).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub our_ask: Option<f64>,
+    /// True when our_bid corresponds to an order that IBKR reports as
+    /// Submitted/PreSubmitted (live at the exchange). False when the
+    /// order is in flight (PendingSubmit) or status is unknown.
+    /// Dashboard uses this to color the cell green (live+leading)
+    /// vs amber (pending).
+    #[serde(default)]
+    pub bid_live: bool,
+    /// True when our_ask is live at IBKR.
+    #[serde(default)]
+    pub ask_live: bool,
+    /// L1 raw bid (IBKR best bid). Same as market_bid in our pipeline
+    /// (we don't run a self-fill filter); kept as a separate field
+    /// because the dashboard's at-BBO comparison reads `raw_bid` to
+    /// decide "quoting" (green) vs "behind" (red).
+    #[serde(default)]
+    pub raw_bid: f64,
+    /// L1 raw ask (IBKR best ask).
+    #[serde(default)]
+    pub raw_ask: f64,
     /// SVI/SABR theo price for this leg, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theo: Option<f64>,

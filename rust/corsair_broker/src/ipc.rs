@@ -339,9 +339,26 @@ async fn dispatch_commands(
 ) {
     while let Some(cmd) = rx.recv().await {
         match cmd.kind.as_str() {
-            "place_order" => handle_place(&runtime, &cmd.body).await,
-            "cancel_order" => handle_cancel(&runtime, &cmd.body).await,
-            "modify_order" => handle_modify(&runtime, &cmd.body).await,
+            // Spawn each order command so it doesn't serialize behind
+            // the previous one's IBKR ack. handle_place awaits a 2s
+            // timeout for OpenOrder/OrderStatus internally; without
+            // spawning, a burst of N place commands stacks up at
+            // (sum of RTTs) wall-clock — observed 45-77ms IPC tail
+            // before this fix when cancel-replace cycles fired bursts.
+            // The IBKR client's per-orderId waiter ensures each
+            // task's ack routes correctly without lock-contention.
+            "place_order" => {
+                let r = runtime.clone();
+                tokio::spawn(async move { handle_place(&r, &cmd.body).await });
+            }
+            "cancel_order" => {
+                let r = runtime.clone();
+                tokio::spawn(async move { handle_cancel(&r, &cmd.body).await });
+            }
+            "modify_order" => {
+                let r = runtime.clone();
+                tokio::spawn(async move { handle_modify(&r, &cmd.body).await });
+            }
             // Trader emits a "telemetry" command every 10s with its
             // own observed counters. The broker just acknowledges by
             // dropping it — the trader logs the same numbers locally,

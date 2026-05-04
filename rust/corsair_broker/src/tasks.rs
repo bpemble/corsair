@@ -859,8 +859,13 @@ fn build_chain_payload(
             // Look up our resting orders for this leg. Take the LAST
             // (most recent) order on each side; cancel-before-replace
             // means earlier ones for the same key are aging-out.
+            // Track liveness too so the dashboard can render green
+            // (live at IBKR) vs amber (in flight / unknown).
             let mut our_bid: Option<f64> = None;
             let mut our_ask: Option<f64> = None;
+            let mut bid_live = false;
+            let mut ask_live = false;
+            use corsair_broker_api::OrderStatus;
             for o in open_orders.iter().filter(|o| {
                 o.contract.kind == corsair_broker_api::ContractKind::Option
                     && o.contract.right == Some(opt.right)
@@ -868,9 +873,20 @@ fn build_chain_payload(
                     && (o.contract.strike.unwrap_or(0.0) - opt.strike).abs() < 1e-6
             }) {
                 if let Some(p) = o.price {
+                    // ONLY Submitted is "live at exchange" (green).
+                    // PendingSubmit / PreSubmitted means the gateway
+                    // hasn't yet promoted the order — yellow on the
+                    // dashboard.
+                    let live = matches!(o.status, OrderStatus::Submitted);
                     match o.side {
-                        Side::Buy => our_bid = Some(p),
-                        Side::Sell => our_ask = Some(p),
+                        Side::Buy => {
+                            our_bid = Some(p);
+                            bid_live = live;
+                        }
+                        Side::Sell => {
+                            our_ask = Some(p);
+                            ask_live = live;
+                        }
                     }
                 }
             }
@@ -886,6 +902,10 @@ fn build_chain_payload(
                 theo,
                 open_interest: opt.open_interest,
                 volume: opt.volume,
+                bid_live,
+                ask_live,
+                raw_bid: opt.bid,
+                raw_ask: opt.ask,
             };
             match opt.right {
                 Right::Call => strike_block.call = Some(side),
