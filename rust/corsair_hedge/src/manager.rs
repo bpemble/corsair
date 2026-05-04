@@ -334,6 +334,12 @@ impl HedgeManager {
         broker_avg_cost: f64,
         silent: bool,
     ) -> bool {
+        // Bump freshness even on no-op (already-matched) reconciles.
+        // Audit T1-1: without this, the freshness gate
+        // (HedgeState::is_fresh) silently disengages after 300s in
+        // steady state, and CLAUDE.md §14's effective-delta gate
+        // falls back to options-only without operator-visible signal.
+        self.state.touch_freshness();
         if broker_qty == self.state.hedge_qty {
             return false;
         }
@@ -349,6 +355,14 @@ impl HedgeManager {
             );
         }
         true
+    }
+
+    /// Mark this manager's hedge state as freshly observed even when
+    /// no reconcile/fill happened. Used by the periodic hedge-tick
+    /// loop to keep the freshness gate alive on FLAT legs (which
+    /// otherwise never visit `reconcile_with_position`).
+    pub fn touch_freshness(&mut self) {
+        self.state.touch_freshness();
     }
 }
 

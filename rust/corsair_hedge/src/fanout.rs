@@ -21,6 +21,10 @@ impl HedgeFanout {
         &self.managers
     }
 
+    pub fn managers_mut(&mut self) -> &mut [HedgeManager] {
+        &mut self.managers
+    }
+
     /// Look up by product key. None if not registered.
     pub fn for_product(&self, product: &str) -> Option<&HedgeManager> {
         self.managers

@@ -206,6 +206,10 @@ services:
       CORSAIR_BROKER_CONFIG: "/app/config/runtime_v3.yaml"
       CORSAIR_BROKER_SHADOW: "${CORSAIR_BROKER_SHADOW:-0}"
       CORSAIR_BROKER_IPC_ENABLED: "${CORSAIR_BROKER_IPC_ENABLED:-1}"
+      # Busy-poll the trader→broker commands ring. Drops command IPC
+      # latency p50 from ~1ms to ~50µs at the cost of 1 CPU core hot.
+      # Worth it for a market-maker; bare-metal has cores to spare.
+      CORSAIR_BROKER_BUSY_POLL: "${CORSAIR_BROKER_BUSY_POLL:-1}"
     volumes:
       - ./logs:/app/logs
       - ./logs-paper:/app/logs-paper

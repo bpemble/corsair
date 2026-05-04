@@ -74,7 +74,7 @@ async fn subscribe_product(
         md.register_underlying(symbol, underlying.instrument_id);
     }
     {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_ticks(TickSubscription {
             instrument_id: underlying.instrument_id,
             tick_by_tick: false,
@@ -187,10 +187,14 @@ pub async fn run_depth_rotator(runtime: Arc<Runtime>) {
         // Pick target instruments: strikes nearest ATM with valid L1
         // mid, capped at MAX_ACTIVE (call+put treated separately so
         // we cover both sides of ATM).
+        //
+        // Audit T1-3: lock order MUST be portfolio → market_data,
+        // matching tasks.rs:periodic_*. Hoist the products list out
+        // of the md+qc lock-block so we don't hold md across portfolio.
+        let products = runtime.portfolio.lock().unwrap().registry().products();
         let target: Vec<(corsair_broker_api::InstrumentId, corsair_broker_api::Contract)> = {
             let md = runtime.market_data.lock().unwrap();
             let qc = runtime.qualified_contracts.lock().unwrap();
-            let products = runtime.portfolio.lock().unwrap().registry().products();
             let mut candidates: Vec<(f64, corsair_broker_api::InstrumentId, corsair_broker_api::Contract)> =
                 Vec::new();
             for prod in &products {
@@ -231,7 +235,7 @@ pub async fn run_depth_rotator(runtime: Arc<Runtime>) {
             .collect();
         for iid in to_cancel {
             if let Some(h) = active.remove(&iid) {
-                let b = runtime.broker.lock().await;
+                let b = runtime.broker.clone();
                 if let Err(e) = b.unsubscribe_market_depth(h).await {
                     log::warn!("depth_rotator: unsubscribe {:?} failed: {}", iid, e);
                 }
@@ -243,7 +247,7 @@ pub async fn run_depth_rotator(runtime: Arc<Runtime>) {
             if active.contains_key(&iid) {
                 continue;
             }
-            let b = runtime.broker.lock().await;
+            let b = runtime.broker.clone();
             match b
                 .subscribe_market_depth(
                     corsair_broker_api::TickSubscription {
@@ -283,7 +287,7 @@ async fn resolve_underlying(
         min_expiry: Some(chrono::Utc::now().date_naive()),
     };
     let chain = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.list_chain(q).await?
     };
     if chain.is_empty() {
@@ -377,7 +381,7 @@ async fn qualify_and_subscribe(
         multiplier: product.multiplier,
     };
     let qualified = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.qualify_option(q).await?
     };
     {
@@ -398,7 +402,7 @@ async fn qualify_and_subscribe(
         qc.insert(qualified.instrument_id, qualified.clone());
     }
     {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_ticks(TickSubscription {
             instrument_id: qualified.instrument_id,
             tick_by_tick: false,

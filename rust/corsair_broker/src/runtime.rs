@@ -72,9 +72,12 @@ pub struct Runtime {
     pub mode: RuntimeMode,
     pub config: BrokerDaemonConfig,
 
-    /// Boxed broker so we can swap IBKR ↔ iLink at construction.
-    /// Tokio mutex because async methods are called across .await.
-    pub broker: AsyncMutex<Box<dyn Broker>>,
+    /// Shared broker. Trait methods are now `&self` (interior
+    /// mutability via Arc<NativeClient> etc.), so consumers no longer
+    /// need an outer Mutex. Audit T1-2: the previous AsyncMutex
+    /// serialized every place_order across its 30ms+ IBKR ack wait,
+    /// defeating the parallel command dispatch in ipc.rs.
+    pub broker: Arc<dyn Broker + Send + Sync>,
     pub portfolio: Mutex<PortfolioState>,
     pub risk: Mutex<RiskMonitor>,
     pub constraint: Mutex<ConstraintChecker>,
@@ -207,7 +210,7 @@ impl Runtime {
         let runtime = Arc::new(Self {
             mode,
             config: cfg,
-            broker: AsyncMutex::new(broker),
+            broker,
             portfolio: Mutex::new(portfolio),
             risk: Mutex::new(risk),
             constraint: Mutex::new(constraint),
@@ -300,7 +303,7 @@ impl Runtime {
                 min_expiry: Some(min_expiry),
             };
             let contracts_result = {
-                let b = self.broker.lock().await;
+                let b = self.broker.clone();
                 b.list_chain(q).await
             };
             match contracts_result {
@@ -334,7 +337,7 @@ impl Runtime {
     }
 
     async fn connect(self: &Arc<Self>) -> Result<(), RuntimeError> {
-        let mut b = self.broker.lock().await;
+        let b = self.broker.clone();
         b.connect().await?;
         Ok(())
     }
@@ -350,7 +353,7 @@ impl Runtime {
             "waiting up to {}s for broker initial snapshot...",
             timeout.as_secs()
         );
-        let b = self.broker.lock().await;
+        let b = self.broker.clone();
         if let Err(e) = b.wait_for_initial_snapshot(timeout).await {
             log::warn!("broker initial snapshot wait failed: {e}");
         }
@@ -363,7 +366,7 @@ impl Runtime {
     /// locally on every restart and triggers spurious delta_kill.
     async fn seed_positions_from_broker(self: &Arc<Self>) -> Result<(), RuntimeError> {
         let positions = {
-            let b = self.broker.lock().await;
+            let b = self.broker.clone();
             b.positions().await?
         };
 
@@ -488,13 +491,13 @@ impl Runtime {
     /// Disconnect cleanly. Called from the shutdown handler.
     pub async fn shutdown(self: &Arc<Self>) -> Result<(), RuntimeError> {
         log::warn!("corsair_broker daemon shutting down");
-        let mut b = self.broker.lock().await;
+        let b = self.broker.clone();
         b.disconnect().await?;
         Ok(())
     }
 }
 
-fn build_broker(cfg: &BrokerDaemonConfig) -> Result<Box<dyn Broker>, RuntimeError> {
+fn build_broker(cfg: &BrokerDaemonConfig) -> Result<Arc<dyn Broker + Send + Sync>, RuntimeError> {
     match cfg.broker.kind.as_str() {
         // Native Rust IBKR client. Phase 6.7 cutover retired the
         // PyO3+ib_insync bridge; Phase 6.11 deleted the bridge crate
@@ -518,7 +521,7 @@ fn build_broker(cfg: &BrokerDaemonConfig) -> Result<Box<dyn Broker>, RuntimeErro
                 account: ibkr.account.clone(),
             };
             let adapter = NativeBroker::new(nb_cfg);
-            Ok(Box::new(adapter))
+            Ok(Arc::new(adapter))
         }
         "ilink" => Err(RuntimeError::Internal(
             "ilink adapter not implemented (Phase 7)".into(),

@@ -524,6 +524,7 @@ mod tests {
                     beta: None,
                     nu: None,
                 },
+                fit_ts_ns: 1_000_000_000,
             },
         );
     }
@@ -539,6 +540,11 @@ mod tests {
             bid_size: Some(10),
             ask_size: Some(10),
             ts_ns: Some(1),
+            broker_recv_ns: None,
+            depth_bid_0: None,
+            depth_bid_1: None,
+            depth_ask_0: None,
+            depth_ask_1: None,
         }
     }
 

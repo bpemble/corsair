@@ -56,10 +56,9 @@ pub use client::{NativeClient, NativeClientConfig};
 pub use decoder::parse_inbound;
 pub use error::NativeError;
 pub use requests::{
-    cancel_mkt_data, cancel_order, cancel_positions, place_order, req_account_updates,
-    req_all_open_orders, req_auto_open_orders, req_contract_details, req_executions,
-    req_ids, req_managed_accounts, req_mkt_data, req_open_orders, req_positions,
-    ContractRequest, ExecutionFilter, PlaceOrderParams,
+    cancel_mkt_data, cancel_mkt_depth, cancel_order, place_order, req_account_updates,
+    req_auto_open_orders, req_contract_details, req_executions, req_mkt_data, req_mkt_depth,
+    req_open_orders, req_positions, ContractRequest, ExecutionFilter, PlaceOrderParams,
 };
 pub use types::{
     AccountValueMsg, CommissionReportMsg, ContractDecoded, ContractDetailsMsg, ErrorMsg,

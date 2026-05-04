@@ -28,16 +28,8 @@ pub fn req_positions() -> Vec<u8> {
     frame(&[encode_int(OUT_REQ_POSITIONS), "1".into()])
 }
 
-pub fn cancel_positions() -> Vec<u8> {
-    frame(&[encode_int(OUT_CANCEL_POSITIONS), "1".into()])
-}
-
 pub fn req_open_orders() -> Vec<u8> {
     frame(&[encode_int(OUT_REQ_OPEN_ORDERS), "1".into()])
-}
-
-pub fn req_all_open_orders() -> Vec<u8> {
-    frame(&[encode_int(OUT_REQ_ALL_OPEN_ORDERS), "1".into()])
 }
 
 pub fn req_auto_open_orders(auto_bind: bool) -> Vec<u8> {
@@ -46,14 +38,6 @@ pub fn req_auto_open_orders(auto_bind: bool) -> Vec<u8> {
         "1".into(),
         encode_bool(auto_bind),
     ])
-}
-
-pub fn req_managed_accounts() -> Vec<u8> {
-    frame(&[encode_int(OUT_REQ_MANAGED_ACCTS), "1".into()])
-}
-
-pub fn req_ids(num: i32) -> Vec<u8> {
-    frame(&[encode_int(OUT_REQ_IDS), "1".into(), encode_int(num)])
 }
 
 // ─── Contract resolution ──────────────────────────────────────────
@@ -346,12 +330,6 @@ pub fn place_order(
         encode_unset(), // advancedErrorOverride (server >= 166)
         encode_unset(), // manualOrderTime (server >= 169)
     ];
-    // Trim trailing unsets that the server doesn't expect — for our
-    // server version 178 the order-format is known. Keep all fields
-    // up through advancedErrorOverride.
-    // (Field count must exactly match what the server expects for
-    // its protocol version; if we go too long, we break.)
-    let _ = &mut fields;
     encode_owned(&fields)
 }
 

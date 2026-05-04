@@ -98,6 +98,14 @@ impl HedgeState {
         self.avg_entry_f = avg_f;
     }
 
+    /// Bump freshness without changing qty/avg. Caller is asserting
+    /// "I just observed this state and it matches the broker" — used
+    /// by the periodic hedge tick to keep flat legs fresh, and by
+    /// reconcile_with_position on no-op reconciles.
+    pub fn touch_freshness(&mut self) {
+        self.last_update_ns = systemtime_ns();
+    }
+
     /// Audit T1-5: returns true when the most recent reconcile/fill
     /// happened within `max_age_ns`. Callers (effective-delta gates)
     /// should treat `hedge_qty` as 0 when this returns false (fail

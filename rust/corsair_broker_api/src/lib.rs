@@ -91,14 +91,19 @@ pub trait Broker: Send + Sync + 'static {
     /// Connect to the gateway. Idempotent; if already connected, returns
     /// `Ok(())` without reconnecting.
     ///
+    /// `&self` rather than `&mut self` so the broker can live behind
+    /// `Arc<dyn Broker>` (interior mutability for connection state).
+    /// Audit T1-2: previously `&mut self` forced an `AsyncMutex<Box<…>>`
+    /// wrapper that serialized every place_order across its IBKR ack.
+    ///
     /// Maps to: `connection.py:connect_ib` (the lean-bypass path).
-    async fn connect(&mut self) -> Result<()>;
+    async fn connect(&self) -> Result<()>;
 
     /// Disconnect cleanly. After this returns, push streams have closed
     /// and `is_connected()` returns false.
     ///
     /// Maps to: `connection.py:disconnect_ib`, `IB.disconnect()`.
-    async fn disconnect(&mut self) -> Result<()>;
+    async fn disconnect(&self) -> Result<()>;
 
     /// Current connection state (cheap; cached locally by the adapter).
     ///

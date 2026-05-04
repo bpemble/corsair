@@ -55,27 +55,34 @@ pub struct DepthLevel {
 
 impl DepthBook {
     /// Apply an IBKR depth op. `position` is 0-indexed; `op` is
-    /// 0=insert, 1=update, 2=delete. Bounds-checks both directions.
+    /// 0=insert, 1=update, 2=delete. Bounds-checks all directions.
+    /// Audit T1-5: out-of-range positions are dropped silently rather
+    /// than padding with zero-price holes (which corrupt downstream
+    /// `external_best_*` lookups).
     pub fn apply(&mut self, is_bid: bool, position: i32, op: i32, price: f64, size: u64) {
         let book = if is_bid { &mut self.bids } else { &mut self.asks };
         let pos = position as usize;
         match op {
             0 => {
-                // Insert: shift everything from pos onward down by 1.
-                if pos > book.len() {
-                    book.resize(pos, DepthLevel::default());
+                // Insert: only valid if pos <= book.len() and book
+                // hasn't already hit max depth (5 levels).
+                if pos <= book.len() && book.len() < 5 {
+                    book.insert(pos, DepthLevel { price, size });
+                } else if pos == book.len() && book.len() == 5 {
+                    // Special case: insert at tail when full evicts oldest.
+                    book.pop();
+                    book.push(DepthLevel { price, size });
                 }
-                book.insert(pos, DepthLevel { price, size });
-                book.truncate(5);
+                // else: pathological; drop.
             }
             1 => {
                 if pos < book.len() {
                     book[pos] = DepthLevel { price, size };
-                } else {
-                    book.resize(pos, DepthLevel::default());
+                } else if pos == book.len() && book.len() < 5 {
+                    // Update at tail+1 == "create new last level".
                     book.push(DepthLevel { price, size });
-                    book.truncate(5);
                 }
+                // else: out-of-range update; drop rather than padding.
             }
             2 => {
                 if pos < book.len() {

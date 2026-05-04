@@ -38,7 +38,7 @@ pub fn spawn_all(runtime: Arc<Runtime>) -> Vec<tokio::task::JoinHandle<()>> {
 
 async fn pump_fills(runtime: Arc<Runtime>) {
     let mut rx = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_fills()
     };
     log::info!("pump_fills: subscribed");
@@ -172,7 +172,7 @@ async fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::F
 
 async fn pump_status(runtime: Arc<Runtime>) {
     let mut rx = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_order_status()
     };
     log::info!("pump_status: subscribed");
@@ -213,7 +213,7 @@ async fn pump_status(runtime: Arc<Runtime>) {
 /// per-leg book that the trader can query for "external best".
 async fn pump_depth(runtime: Arc<Runtime>) {
     let mut rx = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_depth_stream()
     };
     log::info!("pump_depth: subscribed");
@@ -241,7 +241,7 @@ async fn pump_depth(runtime: Arc<Runtime>) {
 
 async fn pump_ticks(runtime: Arc<Runtime>) {
     let mut rx = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_ticks_stream()
     };
     log::info!("pump_ticks: subscribed");
@@ -311,7 +311,7 @@ async fn pump_ticks(runtime: Arc<Runtime>) {
 
 async fn pump_errors(runtime: Arc<Runtime>) {
     let mut rx = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_errors()
     };
     log::info!("pump_errors: subscribed");
@@ -333,7 +333,7 @@ async fn pump_errors(runtime: Arc<Runtime>) {
 
 async fn pump_connection(runtime: Arc<Runtime>) {
     let mut rx = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_connection()
     };
     log::info!("pump_connection: subscribed");
@@ -447,7 +447,7 @@ async fn periodic_risk_check(runtime: Arc<Runtime>) {
 /// runtime OMS, which is not populated by the broker daemon — using
 /// the OMS would cancel zero orders and the kill would be cosmetic.
 async fn cancel_all_resting(runtime: &Arc<Runtime>, reason: &str) {
-    let b = runtime.broker.lock().await;
+    let b = runtime.broker.clone();
     let opens = match b.open_orders().await {
         Ok(v) => v,
         Err(e) => {
@@ -523,11 +523,19 @@ async fn periodic_hedge(runtime: Arc<Runtime>) {
         // periodic loop light — divergence accumulates slowly.
         if tick_count.is_multiple_of(4) {
             let positions_result = {
-                let b = runtime.broker.lock().await;
+                let b = runtime.broker.clone();
                 b.positions().await
             };
             if let Ok(positions) = positions_result {
                 let mut h = runtime.hedge.lock().unwrap();
+                // First touch all managers so flat legs (which won't
+                // appear in `positions`) keep their freshness gate
+                // alive. Audit T1-1: without this, is_fresh() returns
+                // false after 300s on flat legs and the effective-
+                // delta gate quietly falls back to options-only.
+                for mgr in h.managers_mut() {
+                    mgr.touch_freshness();
+                }
                 for pos in positions {
                     if pos.contract.kind != corsair_broker_api::ContractKind::Future {
                         continue;
@@ -659,7 +667,7 @@ async fn place_hedge_order(
             .map(|i| i.account.clone()),
     };
     let result = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.place_order(req).await
     };
     match result {
@@ -705,7 +713,7 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
         // payload to populate our_bid / our_ask per strike so the
         // dashboard's chain table can highlight our resting prices.
         let open_orders_snapshot = {
-            let b = runtime.broker.lock().await;
+            let b = runtime.broker.clone();
             b.open_orders().await.unwrap_or_default()
         };
         // Pull latency stats from the rolling sample buffer.
@@ -787,7 +795,7 @@ async fn periodic_account_poll(runtime: Arc<Runtime>) {
     loop {
         t.tick().await;
         let result = {
-            let b = runtime.broker.lock().await;
+            let b = runtime.broker.clone();
             b.account_values().await
         };
         match result {
@@ -892,27 +900,32 @@ fn build_chain_payload(
                 })
                 .map(|p| p.quantity)
                 .unwrap_or(0);
-            // Look up our resting orders for this leg. Take the LAST
-            // (most recent) order on each side; cancel-before-replace
-            // means earlier ones for the same key are aging-out.
-            // Track liveness too so the dashboard can render green
-            // (live at IBKR) vs amber (in flight / unknown).
+            // Look up our resting orders for this leg.
+            // Audit T1-6: filter to actively-live statuses FIRST so a
+            // stale Cancelled/Filled/Rejected order can never win the
+            // overwrite race against a fresh Submitted/PendingSubmit
+            // one. The broker's open_orders cache is a HashMap whose
+            // iteration order is undefined, so without this filter
+            // cancel-before-replace can flicker the dashboard between
+            // the live new price and the dead old one.
+            use corsair_broker_api::OrderStatus;
             let mut our_bid: Option<f64> = None;
             let mut our_ask: Option<f64> = None;
             let mut bid_live = false;
             let mut ask_live = false;
-            use corsair_broker_api::OrderStatus;
             for o in open_orders.iter().filter(|o| {
-                o.contract.kind == corsair_broker_api::ContractKind::Option
+                matches!(
+                    o.status,
+                    OrderStatus::Submitted | OrderStatus::PendingSubmit
+                ) && o.contract.kind == corsair_broker_api::ContractKind::Option
                     && o.contract.right == Some(opt.right)
                     && o.contract.expiry == opt.expiry
                     && (o.contract.strike.unwrap_or(0.0) - opt.strike).abs() < 1e-6
             }) {
                 if let Some(p) = o.price {
-                    // ONLY Submitted is "live at exchange" (green).
-                    // PendingSubmit / PreSubmitted means the gateway
-                    // hasn't yet promoted the order — yellow on the
-                    // dashboard.
+                    // Submitted = live at exchange (green); PendingSubmit
+                    // = gateway-accepted but exchange not yet confirmed
+                    // (yellow on the dashboard).
                     let live = matches!(o.status, OrderStatus::Submitted);
                     match o.side {
                         Side::Buy => {

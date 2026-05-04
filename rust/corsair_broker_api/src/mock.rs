@@ -178,7 +178,7 @@ impl Default for MockBroker {
 
 #[async_trait]
 impl Broker for MockBroker {
-    async fn connect(&mut self) -> Result<()> {
+    async fn connect(&self) -> Result<()> {
         *self.connected.lock().unwrap() = true;
         self.calls.lock().unwrap().connect_count += 1;
         let _ = self.conn_tx.send(ConnectionEvent {
@@ -189,7 +189,7 @@ impl Broker for MockBroker {
         Ok(())
     }
 
-    async fn disconnect(&mut self) -> Result<()> {
+    async fn disconnect(&self) -> Result<()> {
         *self.connected.lock().unwrap() = false;
         self.calls.lock().unwrap().disconnect_count += 1;
         let _ = self.conn_tx.send(ConnectionEvent {

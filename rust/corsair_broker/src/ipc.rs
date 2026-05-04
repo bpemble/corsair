@@ -22,8 +22,7 @@
 //!   ✓ Forward risk_state at 1Hz (Phase 5B.6, see periodic_risk_state)
 
 use corsair_broker_api::{
-    ContractKind, Currency, Exchange, ModifyOrderReq, OrderId,
-    OrderType, PlaceOrderReq, Right, Side, TickKind, TimeInForce,
+    ModifyOrderReq, OrderId, OrderType, PlaceOrderReq, Right, Side, TickKind, TimeInForce,
 };
 use corsair_ipc::{ServerCommand, ServerConfig, SHMServer};
 use serde::{Deserialize, Serialize};
@@ -229,7 +228,7 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
             }
         });
     let installed = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.set_tick_publisher(publisher).await
     };
     if installed {
@@ -422,9 +421,11 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
     let r_norm = cmd.right.chars().next()
         .map(|c| c.to_ascii_uppercase())
         .unwrap_or('C');
+    // Audit T1-3: lock order portfolio → market_data, matching the
+    // periodic_* tasks. Fetch products first, then md.
+    let products = runtime.portfolio.lock().unwrap().registry().products();
     let contract = {
         let md = runtime.market_data.lock().unwrap();
-        let products = runtime.portfolio.lock().unwrap().registry().products();
         let mut found_iid: Option<corsair_broker_api::InstrumentId> = None;
         for prod in products {
             for t in md.options_for_product(&prod) {
@@ -518,7 +519,7 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
     };
     let broker_order_send_marker_ns = now_ns();
     let (result, precise_send_ns, precise_ack_ns) = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         let r = b.place_order(req).await;
         // Drain precise broker-internal timestamps (NativeBroker only;
         // mock returns None). On success this is the just-before
@@ -624,7 +625,7 @@ async fn handle_cancel(runtime: &Arc<Runtime>, body: &[u8]) {
         return;
     }
     let result = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.cancel_order(OrderId(cmd.order_id)).await
     };
     if let Err(e) = result {
@@ -652,7 +653,7 @@ async fn handle_modify(runtime: &Arc<Runtime>, body: &[u8]) {
             .map(|s| chrono::Utc::now() + chrono::Duration::seconds(s as i64)),
     };
     let result = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.modify_order(OrderId(cmd.order_id), req).await
     };
     if let Err(e) = result {
@@ -664,7 +665,7 @@ async fn handle_modify(runtime: &Arc<Runtime>, body: &[u8]) {
 
 async fn forward_fills(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
     let mut rx = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_fills()
     };
     log::info!("ipc forward_fills: subscribed");
@@ -700,7 +701,7 @@ async fn forward_fills(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
 
 async fn forward_status(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
     let mut rx = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_order_status()
     };
     log::info!("ipc forward_status: subscribed");
@@ -733,7 +734,7 @@ async fn forward_status(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
 
 async fn forward_connection(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
     let mut rx = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_connection()
     };
     log::info!("ipc forward_connection: subscribed");
@@ -828,7 +829,7 @@ struct ConsolidatedTick {
 
 async fn forward_ticks(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
     let mut rx = {
-        let b = runtime.broker.lock().await;
+        let b = runtime.broker.clone();
         b.subscribe_ticks_stream()
     };
     log::info!("ipc forward_ticks: subscribed");
@@ -1022,7 +1023,7 @@ async fn periodic_risk_state(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
         // just skip this tick. (Account refreshes every ~5s in
         // IBKR's stream so this is best-effort.)
         let margin_usd = match {
-            let b = runtime.broker.lock().await;
+            let b = runtime.broker.clone();
             tokio::time::timeout(
                 std::time::Duration::from_millis(50),
                 b.account_values(),

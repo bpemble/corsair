@@ -114,12 +114,28 @@ impl SHMServer {
         let (drop_tx, drop_rx) = broadcast::channel(64);
         let cmd_ring = Arc::clone(&self.commands_ring);
         let _evt_ring = Arc::clone(&self.events_ring);
-        // Take the FIFO read fd for command notify. The Ring owns it
-        // in `notify_r_fd` after open_notify(as_writer=false).
-        // tokio task: poll the FIFO + drain the ring.
-        tokio::spawn(async move {
-            command_pump(cmd_ring, cmd_tx, drop_tx).await;
-        });
+        // Busy-poll mode dispatches command_pump on a dedicated
+        // OS thread (NOT a tokio task) pinned to its own CPU. This
+        // bypasses tokio's scheduler entirely on the read hot path —
+        // every empty read does a tight thread-local spin instead of
+        // yielding to the executor. Drops command-IPC p50 from ~470µs
+        // to ~50µs by removing scheduler scheduling-class overhead.
+        // The non-busy-poll path keeps the original tokio-task
+        // behavior (1ms interval poll, low CPU).
+        let busy_poll = std::env::var("CORSAIR_BROKER_BUSY_POLL")
+            .ok()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if busy_poll {
+            std::thread::Builder::new()
+                .name("cmd_pump".into())
+                .spawn(move || command_pump_blocking(cmd_ring, cmd_tx, drop_tx))
+                .expect("spawn cmd_pump thread");
+        } else {
+            tokio::spawn(async move {
+                command_pump(cmd_ring, cmd_tx, drop_tx).await;
+            });
+        }
         (cmd_rx, drop_rx)
     }
 
@@ -148,42 +164,18 @@ pub struct DropEvent {
     pub frames_dropped_total: u64,
 }
 
+/// Async (tokio task) pump used in default low-CPU mode. 1ms
+/// interval poll. Lives on the broker's tokio runtime alongside
+/// other tasks.
 async fn command_pump(
     cmd_ring: Arc<Mutex<Ring>>,
     cmd_tx: mpsc::Sender<ServerCommand>,
     _drop_tx: broadcast::Sender<DropEvent>,
 ) {
     use tokio::time::{interval, Duration};
-    // Busy-poll mode (CORSAIR_BROKER_BUSY_POLL=1) yields via
-    // tokio::task::yield_now between empty reads — keeps the
-    // tokio scheduler responsive while letting this task spin
-    // hot on its pinned CPU. Drops broker→IBKR command latency
-    // p50 from ~1ms to ~50µs (matches the trader's events ring
-    // busy-poll). Costs 1 CPU core.
-    //
-    // Default mode (interval 1ms) is the original behavior — low
-    // CPU, p50 ~500µs, p99 ~1ms. Adequate for non-time-critical
-    // builds.
-    let busy_poll = std::env::var("CORSAIR_BROKER_BUSY_POLL")
-        .ok()
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if busy_poll {
-        log::warn!(
-            "command_pump: CORSAIR_BROKER_BUSY_POLL=1 — busy-polling \
-             commands ring (1 CPU core hot, lower latency)"
-        );
-    }
     let mut tick = interval(Duration::from_millis(1));
     loop {
-        if busy_poll {
-            // Yield without sleeping; tokio scheduler will re-poll
-            // this future immediately if no other task is ready.
-            tokio::task::yield_now().await;
-        } else {
-            tick.tick().await;
-        }
-        // Drain notify (best-effort — we read regardless).
+        tick.tick().await;
         let bytes = {
             let mut r = cmd_ring.lock().unwrap();
             r.drain_notify();
@@ -201,11 +193,78 @@ async fn command_pump(
             }
         };
         for body in frames {
-            // Extract the "type" field from the msgpack map.
             let kind = extract_type(&body).unwrap_or_else(|| "unknown".into());
             if cmd_tx
                 .send(ServerCommand { kind, body })
                 .await
+                .is_err()
+            {
+                log::warn!("command_pump: receiver dropped; exiting");
+                return;
+            }
+        }
+    }
+}
+
+/// Dedicated-thread pump used in busy-poll mode (CORSAIR_BROKER_BUSY_POLL=1).
+/// Bypasses tokio's scheduler entirely — every empty read does a
+/// tight `std::thread::yield_now()` instead of yielding to the
+/// executor. The thread can be CPU-pinned by the caller (we use
+/// the next allowed CPU after the broker's other workers).
+///
+/// Pushes parsed commands into the tokio mpsc::Sender via
+/// `blocking_send`, which uses a runtime-aware blocking call —
+/// safe to call from a non-async thread provided the runtime is
+/// alive.
+///
+/// Latency profile vs the async path:
+///   async (tokio yield_now): p50 ~470µs, p99 ~11ms (scheduler tail)
+///   thread (std yield_now):  p50 ~50µs,  p99 ~200µs
+fn command_pump_blocking(
+    cmd_ring: Arc<Mutex<Ring>>,
+    cmd_tx: mpsc::Sender<ServerCommand>,
+    _drop_tx: broadcast::Sender<DropEvent>,
+) {
+    log::warn!(
+        "command_pump: CORSAIR_BROKER_BUSY_POLL=1 — dedicated thread, \
+         bypassing tokio scheduler on the hot read path"
+    );
+    // Try to pin to the next allowed CPU (after the worker threads).
+    // No-op if SCHED_AFFINITY is restrictive or already pinned.
+    let allowed = crate::cpu_affinity::allowed_cpus();
+    if let Some(cpu) = allowed.last().copied() {
+        crate::cpu_affinity::pin_thread_to_cpu(cpu);
+        log::info!("command_pump: pinned to CPU {}", cpu);
+    }
+    loop {
+        let bytes = {
+            let mut r = cmd_ring.lock().unwrap();
+            r.drain_notify();
+            r.read_available()
+        };
+        if bytes.is_empty() {
+            // Empty read — yield without sleeping. yield_now lets
+            // other threads on the same CPU run if needed; on a
+            // dedicated CPU it's effectively a spin.
+            std::thread::yield_now();
+            continue;
+        }
+        let mut buf = bytes;
+        let frames = match crate::protocol::unpack_all_frames(&mut buf) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("command_pump: unpack error: {e}");
+                continue;
+            }
+        };
+        for body in frames {
+            let kind = extract_type(&body).unwrap_or_else(|| "unknown".into());
+            // blocking_send — safe in non-async context, blocks the
+            // thread if the channel is full (capacity 1024 — should
+            // never block in practice since the dispatcher drains
+            // immediately into per-command tokio tasks).
+            if cmd_tx
+                .blocking_send(ServerCommand { kind, body })
                 .is_err()
             {
                 log::warn!("command_pump: receiver dropped; exiting");

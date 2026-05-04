@@ -1050,7 +1050,7 @@ fn empty_contract_request(symbol: &str, sec_type: &str) -> ContractRequest {
 
 #[async_trait]
 impl Broker for NativeBroker {
-    async fn connect(&mut self) -> BResult<()> {
+    async fn connect(&self) -> BResult<()> {
         if self.connected.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -1108,7 +1108,7 @@ impl Broker for NativeBroker {
         Ok(())
     }
 
-    async fn disconnect(&mut self) -> BResult<()> {
+    async fn disconnect(&self) -> BResult<()> {
         self.connected.store(false, Ordering::SeqCst);
         // Drain pending waiters so callers don't block on their
         // tokio::time::timeout (P1-8).

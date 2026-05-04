@@ -21,10 +21,7 @@ pub const OUT_REQ_EXECUTIONS: i32 = 7;
 pub const OUT_REQ_IDS: i32 = 8;
 pub const OUT_REQ_CONTRACT_DATA: i32 = 9;
 pub const OUT_REQ_AUTO_OPEN_ORDERS: i32 = 15;
-pub const OUT_REQ_ALL_OPEN_ORDERS: i32 = 16;
-pub const OUT_REQ_MANAGED_ACCTS: i32 = 17;
 pub const OUT_REQ_POSITIONS: i32 = 61;
-pub const OUT_CANCEL_POSITIONS: i32 = 64;
 pub const OUT_START_API: i32 = 71;
 
 // ─── Inbound (server → client) ────────────────────────────────────
