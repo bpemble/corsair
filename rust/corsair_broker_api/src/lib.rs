@@ -376,6 +376,7 @@ mod tests {
             multiplier: 25_000.0,
             exchange: Exchange::Comex,
             currency: Currency::Usd,
+            trading_class: "HG".into(),
         };
         let err = b.place_order(sample_place(c)).await.unwrap_err();
         assert!(err.is_connection_error());

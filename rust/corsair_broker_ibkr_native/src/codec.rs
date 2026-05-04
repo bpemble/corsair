@@ -146,6 +146,18 @@ pub fn encode_f64(v: f64) -> String {
     }
 }
 
+/// String form of `write_qty` for the slow-path encoder. Emits "1"
+/// for integral values (matching ib_insync's str(int)) and ryu float
+/// otherwise.
+pub fn encode_qty(v: f64) -> String {
+    if v.fract() == 0.0 && v.is_finite() && v.abs() < 1e18 {
+        let mut buf = itoa::Buffer::new();
+        buf.format(v as i64).to_string()
+    } else {
+        encode_f64(v)
+    }
+}
+
 /// Write an i32 directly to `buf` (no String allocation).
 #[inline]
 pub fn write_int(buf: &mut Vec<u8>, v: i32) {
@@ -169,6 +181,22 @@ pub fn write_f64(buf: &mut Vec<u8>, v: f64) {
     } else {
         let mut ryu_buf = ryu::Buffer::new();
         buf.extend_from_slice(ryu_buf.format(v).as_bytes());
+    }
+}
+
+/// Write a quantity to `buf`. ib_insync emits integral quantities as
+/// "1" (Python int) but floats as "1.0" (Python float). For total
+/// quantity on options/futures (always whole numbers in our use case),
+/// the int form matches ib_insync's reference encoding byte-for-byte.
+/// Falls back to float (`write_f64`) for non-integral values, e.g.
+/// fractional crypto orders.
+#[inline]
+pub fn write_qty(buf: &mut Vec<u8>, v: f64) {
+    if v.fract() == 0.0 && v.is_finite() && v.abs() < 1e18 {
+        let mut itoa_buf = itoa::Buffer::new();
+        buf.extend_from_slice(itoa_buf.format(v as i64).as_bytes());
+    } else {
+        write_f64(buf, v);
     }
 }
 

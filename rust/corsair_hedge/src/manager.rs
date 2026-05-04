@@ -389,6 +389,7 @@ mod tests {
             multiplier: 25_000.0,
             exchange: Exchange::Comex,
             currency: Currency::Usd,
+            trading_class: "HG".into(),
         }
     }
 

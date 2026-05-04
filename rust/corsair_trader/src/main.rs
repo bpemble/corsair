@@ -391,17 +391,25 @@ fn process_event(
                     return;
                 }
             };
-            // Side comes as "C"/"P"; intern as char for the map key
-            // to avoid an allocation per lookup later.
-            let side_char = vs.side.chars().next().unwrap_or('C').to_ascii_uppercase();
-            state.lock().unwrap().vol_surfaces.insert(
-                (vs.expiry, side_char),
-                crate::state::VolSurfaceEntry {
-                    forward: vs.forward,
-                    params: vs.params,
-                    fit_ts_ns: vs.ts_ns.unwrap_or(0),
-                },
-            );
+            // Side comes as "C", "P", or "BOTH" (current broker fits a
+            // combined surface, see audit T4-10). The lookup at
+            // decision.rs:123 tries (expiry, right_char) → 'C' → 'P';
+            // it never tries 'B'. So when broker emits "BOTH", populate
+            // both 'C' and 'P' entries with the same params.
+            let entry = crate::state::VolSurfaceEntry {
+                forward: vs.forward,
+                params: vs.params,
+                fit_ts_ns: vs.ts_ns.unwrap_or(0),
+            };
+            let mut s = state.lock().unwrap();
+            let side_upper = vs.side.to_ascii_uppercase();
+            if side_upper == "BOTH" {
+                s.vol_surfaces.insert((vs.expiry.clone(), 'C'), entry.clone());
+                s.vol_surfaces.insert((vs.expiry, 'P'), entry);
+            } else {
+                let side_char = side_upper.chars().next().unwrap_or('C');
+                s.vol_surfaces.insert((vs.expiry, side_char), entry);
+            }
         }
         "risk_state" => {
             let r: RiskStateMsg = match serde_json::from_value(generic.extra.clone()) {
@@ -466,7 +474,15 @@ fn process_event(
                 None => return,
             };
             let status = a.status.unwrap_or_default();
-            let terminal = matches!(status.as_str(), "Filled" | "Cancelled" | "ApiCancelled" | "Inactive");
+            // Audit T1-4: Rejected and ApiRejected are terminal too;
+            // FA accounts emit them when IBKR rejects a place at the
+            // pre-trade risk check. Without these, our_orders leaks
+            // the entry and staleness loop tries to cancel a
+            // non-existent orderId forever.
+            let terminal = matches!(
+                status.as_str(),
+                "Filled" | "Cancelled" | "ApiCancelled" | "Inactive" | "Rejected" | "ApiRejected"
+            );
             if terminal {
                 let mut s = state.lock().unwrap();
                 if let Some(key) = s.orderid_to_key.remove(&oid) {

@@ -266,6 +266,7 @@ impl Broker for MockBroker {
             multiplier: 25_000.0,
             exchange: q.exchange,
             currency: q.currency,
+            trading_class: q.symbol.clone(),
         })
     }
 
@@ -290,6 +291,7 @@ impl Broker for MockBroker {
             multiplier: q.multiplier,
             exchange: q.exchange,
             currency: q.currency,
+            trading_class: q.symbol.clone(),
         })
     }
 
@@ -320,6 +322,7 @@ impl Broker for MockBroker {
                 multiplier: 25_000.0,
                 exchange: q.exchange,
                 currency: q.currency,
+                trading_class: q.symbol.clone(),
             });
         }
         Ok(out)

@@ -70,6 +70,8 @@ def parse_args():
                     help="Refuse any single order > this many contracts")
     ap.add_argument("--skip-cancel", action="store_true",
                     help="Skip the cancel-working-orders step")
+    ap.add_argument("--include-futures", action="store_true",
+                    help="Also flatten FUT positions for --product (e.g. HG hedge legs)")
     args = ap.parse_args()
     args._tick_size = products[args.product]["tick_size"]
     return args
@@ -174,14 +176,15 @@ async def main():
     if not args.skip_cancel:
         await _cancel_working_orders(ib, args.product)
 
+    sec_types = ("FOP", "FUT") if args.include_futures else ("FOP",)
     positions = [
         p for p in ib.positions(account)
         if p.contract.symbol == args.product
-        and p.contract.secType == "FOP"
+        and p.contract.secType in sec_types
         and int(p.position) != 0
     ]
-    log.info("%d non-zero %s option position(s) before flatten",
-             len(positions), args.product)
+    log.info("%d non-zero %s position(s) before flatten (sec_types=%s)",
+             len(positions), args.product, sec_types)
     for p in positions:
         c = p.contract
         log.info("  %s qty=%+d avgCost=%.4f",

@@ -220,23 +220,27 @@ fn generate_strikes(atm: f64, product: &ProductConfig) -> Vec<f64> {
     out
 }
 
-/// Pick the option expiry. For HG, options on a futures contract
-/// expire on the same date as the underlying future. Use the
-/// underlying contract's expiry as the option expiry too.
+/// Pick the FRONT-MONTH option expiry — the one we want to quote on.
+/// HG copper options trade until the day BEFORE the underlying
+/// future's last trade date — observed from IBKR position data:
+///   HXEM6 (May options) lastTradeDate=20260526; HGK6 (May futures) =20260527
+///   HXEN6 (Jun options) lastTradeDate=20260625; HGM6 (Jun futures) =20260626
+///
+/// Audit T2-4: previously fell back to the FIRST position's expiry,
+/// which broke quoting if the only position was on back-month. Now
+/// always derives from underlying.expiry; back-month positions are
+/// covered separately via the position-leg union in subscribe_product.
+///
+/// Both observed cases (Wed→Tue, Fri→Thu) land on a weekday with -1
+/// day; CME doesn't list HG options expiring on weekends. TODO:
+/// proper fix is to reqContractDetails for the HXE option chain and
+/// pick the first lastTradeDate past today.
 fn pick_option_expiry(
-    runtime: &Arc<Runtime>,
-    product: &str,
+    _runtime: &Arc<Runtime>,
+    _product: &str,
     underlying: &Contract,
 ) -> NaiveDate {
-    // If the seeded portfolio has positions, prefer their expiry
-    // (handles the "we're holding back-month options" edge case).
-    let p = runtime.portfolio.lock().unwrap();
-    let from_positions = p
-        .positions_for_product(product)
-        .first()
-        .map(|pos| pos.expiry);
-    drop(p);
-    from_positions.unwrap_or(underlying.expiry)
+    underlying.expiry - chrono::Duration::days(1)
 }
 
 async fn qualify_and_subscribe(
@@ -268,6 +272,13 @@ async fn qualify_and_subscribe(
             right,
             qualified.instrument_id,
         );
+    }
+    {
+        // Cache full Contract for IPC place_order use (audit/wire fix:
+        // place_order needs the IBKR-canonical local_symbol +
+        // trading_class, not a synthesized placeholder).
+        let mut qc = runtime.qualified_contracts.lock().unwrap();
+        qc.insert(qualified.instrument_id, qualified.clone());
     }
     {
         let b = runtime.broker.lock().await;

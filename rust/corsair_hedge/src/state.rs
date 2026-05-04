@@ -18,6 +18,16 @@ pub struct HedgeState {
     /// resets on restart, not persisted). Surfaced via snapshot so
     /// the dashboard's account row can fold in hedge realized.
     pub realized_pnl_usd: f64,
+    /// SystemTime ns at the most recent reconcile-or-fill that updated
+    /// this state. Audit T1-5: effective-delta gating in the trader
+    /// trusts `hedge_qty`, but that trust depends on a recent
+    /// reconcile against IBKR. This field lets the gate fail closed
+    /// when the most recent update is too old (>300s by default —
+    /// 10× the periodic reconcile cadence). 0 = never updated.
+    /// SystemTime (not Instant) so the timestamp can be compared
+    /// across crates without sharing a process-static T0.
+    #[serde(default)]
+    pub last_update_ns: u64,
 }
 
 impl HedgeState {
@@ -34,6 +44,7 @@ impl HedgeState {
     ///
     /// Mirrors `_apply_local_fill` in Python.
     pub fn apply_fill(&mut self, is_buy: bool, qty: u32, price: f64, multiplier: f64) {
+        self.last_update_ns = systemtime_ns();
         let effect = if is_buy { qty as i32 } else { -(qty as i32) };
         let new_qty = self.hedge_qty + effect;
 
@@ -82,9 +93,31 @@ impl HedgeState {
     /// Reset state — used on bootstrap reconcile when broker reports
     /// a different position than we held locally.
     pub fn replace(&mut self, qty: i32, avg_f: f64) {
+        self.last_update_ns = systemtime_ns();
         self.hedge_qty = qty;
         self.avg_entry_f = avg_f;
     }
+
+    /// Audit T1-5: returns true when the most recent reconcile/fill
+    /// happened within `max_age_ns`. Callers (effective-delta gates)
+    /// should treat `hedge_qty` as 0 when this returns false (fail
+    /// closed).
+    pub fn is_fresh(&self, now_ns: u64, max_age_ns: u64) -> bool {
+        if self.last_update_ns == 0 {
+            // Never updated — assume freshly-booted runtime that
+            // hasn't yet seen its first reconcile. Conservative.
+            return false;
+        }
+        now_ns.saturating_sub(self.last_update_ns) <= max_age_ns
+    }
+}
+
+fn systemtime_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

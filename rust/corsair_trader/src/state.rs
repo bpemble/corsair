@@ -177,6 +177,10 @@ impl DecisionCounters {
         let pairs: &[(&str, u64)] = &[
             ("place", self.place),
             ("skip_no_vol_surface", self.skip_no_vol_surface),
+            // Audit T4-3: previously omitted from telemetry.
+            ("skip_vol_surface_stale", self.skip_vol_surface_stale),
+            ("skip_unack_inflight", self.skip_unack_inflight),
+            ("dropped_parse_errors", self.dropped_parse_errors),
             ("skip_off_atm", self.skip_off_atm),
             ("skip_itm", self.skip_itm),
             ("skip_thin_book", self.skip_thin_book),

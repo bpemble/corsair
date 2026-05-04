@@ -617,6 +617,11 @@ fn parse_status(s: &str) -> OrderStatus {
         "Filled" => OrderStatus::Filled,
         "Cancelled" | "ApiCancelled" => OrderStatus::Cancelled,
         "PendingCancel" => OrderStatus::PendingCancel,
+        // Audit T4-1: Rejected was previously bucketed into Inactive.
+        // FA accounts return "Rejected" / "ApiRejected" on pre-trade
+        // risk failures; the consumer (pump_status) already has a
+        // Rejected arm at tasks.rs:189, so route them through.
+        "Rejected" | "ApiRejected" => OrderStatus::Rejected,
         "Inactive" => OrderStatus::Inactive,
         _ => OrderStatus::Inactive,
     }
@@ -685,6 +690,7 @@ fn native_to_contract(cd: &ContractDetailsMsg) -> Option<Contract> {
         multiplier: cd.contract.multiplier.parse().unwrap_or(0.0),
         exchange: parse_exchange(&cd.contract.exchange),
         currency: parse_currency(&cd.contract.currency),
+        trading_class: cd.contract.trading_class.clone(),
     })
 }
 
@@ -712,6 +718,7 @@ fn native_to_position(p: &PositionMsg) -> Option<Position> {
             multiplier: p.contract.multiplier.parse().unwrap_or(0.0),
             exchange: parse_exchange(&p.contract.exchange),
             currency: parse_currency(&p.contract.currency),
+            trading_class: p.contract.trading_class.clone(),
         },
         quantity: p.position as i32,
         avg_cost: p.avg_cost,
@@ -738,6 +745,7 @@ fn native_to_open_order(o: &OpenOrderMsg) -> Option<OpenOrder> {
         multiplier: o.contract.multiplier.parse().unwrap_or(0.0),
         exchange: parse_exchange(&o.contract.exchange),
         currency: parse_currency(&o.contract.currency),
+        trading_class: o.contract.trading_class.clone(),
     };
     Some(OpenOrder {
         order_id: OrderId(o.order_id as u64),
@@ -882,7 +890,15 @@ fn place_order_contract_request(c: &Contract) -> ContractRequest {
         primary_exchange: String::new(),
         currency: currency_to_str(c.currency).into(),
         local_symbol: c.local_symbol.clone(),
-        trading_class: String::new(),
+        // Audit T1-1: tradingClass required for FUT under FA accounts.
+        // Native_to_contract populates it from IBKR's contractDetails;
+        // fall back to symbol if for some reason it's empty (matches
+        // CME convention: HG futures tradingClass = "HG").
+        trading_class: if c.trading_class.is_empty() {
+            c.symbol.clone()
+        } else {
+            c.trading_class.clone()
+        },
     }
 }
 
@@ -918,6 +934,12 @@ fn build_place_params(
     }
     .to_string();
     let good_till_date = match (req.tif, req.gtd_until_utc) {
+        // IBKR-documented format with explicit timezone string. The
+        // example in the API docs is `yyyymmdd hh:mm:ss xx/xxxx` with
+        // names like "US/Eastern". Empirically the gateway accepts
+        // "UTC" too. Dash form (`yyyymmdd-hh:mm:ss`) is documented as
+        // implicit-UTC but at server v178 we see the gateway rejecting
+        // it with error 391 — sticking to the explicit-tz form.
         (TimeInForce::Gtd, Some(t)) => t.format("%Y%m%d %H:%M:%S UTC").to_string(),
         (TimeInForce::Gtd, None) => {
             return Err(BrokerError::InvalidRequest(
@@ -970,7 +992,7 @@ fn contract_to_request(c: &corsair_broker_api::Contract) -> ContractRequest {
         primary_exchange: String::new(),
         currency: currency_to_str(c.currency).into(),
         local_symbol: c.local_symbol.clone(),
-        trading_class: String::new(),
+        trading_class: c.trading_class.clone(),
     }
 }
 
@@ -1162,7 +1184,16 @@ impl Broker for NativeBroker {
                 // off and retry rather than treating this as a fatal
                 // Internal error. Caller should also reconcile via
                 // open_orders() to discover the orphaned order.
-                self.state.lock().pending_place_acks.remove(&order_id);
+                //
+                // Audit T1-3: also evict wire_send_ns + wire_ack_ns to
+                // prevent slow leak of timing entries on chronic
+                // timeout (each leaked entry = ~24B; over months of
+                // FUT-ack issues this would build up).
+                let mut s = self.state.lock();
+                s.pending_place_acks.remove(&order_id);
+                s.wire_send_ns.remove(&order_id);
+                s.wire_ack_ns.remove(&order_id);
+                drop(s);
                 Err(BrokerError::Protocol {
                     code: None,
                     message: format!("place_order ack timeout (orderId={order_id})"),
@@ -1390,7 +1421,18 @@ impl Broker for NativeBroker {
 
         match tokio::time::timeout(Duration::from_secs(10), rx).await {
             Ok(Ok(Ok(mut contracts))) if !contracts.is_empty() => {
-                Ok(contracts.swap_remove(0))
+                let mut c = contracts.swap_remove(0);
+                // IBKR's contractDetails reply for FOP doesn't always
+                // include multiplier in the field position our decoder
+                // reads (depends on serverVersion). Fall back to the
+                // query's multiplier (which the caller pulled from
+                // product config) so place_order has a non-zero value
+                // — sending "0" here causes IBKR to reject with
+                // cryptic errors like "VOL volatility required".
+                if c.multiplier <= 0.0 {
+                    c.multiplier = q.multiplier;
+                }
+                Ok(c)
             }
             Ok(Ok(Ok(_))) => Err(BrokerError::ContractNotFound(format!(
                 "no match for {} {} {} {:?}",
@@ -1477,7 +1519,12 @@ impl Broker for NativeBroker {
         // con_id always comes from the subscription's instrument_id —
         // authoritative even when the caller passed a stale Contract.
         cr.con_id = sub.instrument_id.0 as i64;
-        let frame = req_mkt_data(req_id, &cr, "", false, false);
+        // Generic tick types we want IBKR to push:
+        //   100 = Option Volume (call/put split)
+        //   101 = Option Open Interest (call/put split)
+        // Without this list, reqMktData only returns BBO + last —
+        // dashboard shows blank OI/volume columns.
+        let frame = req_mkt_data(req_id, &cr, "100,101", false, false);
         self.client
             .send_raw(&frame)
             .await

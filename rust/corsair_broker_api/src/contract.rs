@@ -92,6 +92,13 @@ pub struct Contract {
     pub multiplier: f64,
     pub exchange: Exchange,
     pub currency: Currency,
+    /// IBKR tradingClass — required on place_order at server v178+ for
+    /// FUT contracts under FA accounts (audit T1-1). For OPT, IBKR
+    /// usually resolves by conId so this can be empty, but populating
+    /// it is harmless. For HG: futures = "HG", options = "HXE".
+    /// Returned by IBKR's contractDetails response.
+    #[serde(default)]
+    pub trading_class: String,
 }
 
 // ── Query types ─────────────────────────────────────────────────────

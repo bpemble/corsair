@@ -5,7 +5,7 @@
 //! methods byte-for-byte — IBKR's TWS server silently rejects
 //! malformed requests (or worse, accepts them with weird semantics).
 
-use crate::codec::{encode_bool, encode_f64, encode_int, encode_int64, encode_owned, encode_unset};
+use crate::codec::{encode_bool, encode_f64, encode_int, encode_int64, encode_owned, encode_qty, encode_unset};
 use crate::messages::*;
 
 /// Helper: build a frame from owned strings.
@@ -192,14 +192,20 @@ pub fn place_order(
         encode_unset(), // secId
         // Order body
         params.action.clone(),
-        encode_f64(params.total_quantity),
+        encode_qty(params.total_quantity),
         params.order_type.clone(),
         encode_f64(params.lmt_price),
-        encode_f64(params.aux_price),
+        // aux_price: ib_insync sends UNSET_DOUBLE (empty) when 0; only
+        // populated for STP/TRAIL/STP LMT.
+        if params.aux_price == 0.0 {
+            encode_unset()
+        } else {
+            encode_f64(params.aux_price)
+        },
         params.tif.clone(),
         encode_unset(), // ocaGroup
         params.account.clone(),
-        encode_unset(), // openClose
+        "O".into(),     // openClose (default 'O' = open)
         encode_int(0),  // origin (0 = customer)
         params.order_ref.clone(),
         encode_bool(true),  // transmit
@@ -213,14 +219,16 @@ pub fn place_order(
         // No combo legs / smart combo routing.
         encode_unset(), // sharesAllocation (deprecated)
         encode_f64(0.0), // discretionaryAmt
-        params.good_till_date.clone(),
-        encode_unset(), // goodAfterTime
+        // ib_insync field order: goodAfterTime FIRST, then goodTillDate.
+        // Reverse caused IBKR error 391 "End Time invalid".
+        encode_unset(),                    // goodAfterTime
+        params.good_till_date.clone(),     // goodTillDate
         encode_unset(), // faGroup
         encode_unset(), // faMethod
         encode_unset(), // faPercentage
         encode_unset(), // faProfile
         encode_unset(), // modelCode
-        encode_unset(), // shortSaleSlot
+        "0".into(),     // shortSaleSlot (default 0, not unset)
         encode_unset(), // designatedLocation
         encode_int(-1), // exemptCode
         encode_int(0),  // ocaType
@@ -243,35 +251,31 @@ pub fn place_order(
         encode_unset(), // volatilityType
         encode_unset(), // deltaNeutralOrderType
         encode_unset(), // deltaNeutralAuxPrice
-        // ... server >= 100 onwards
-        encode_unset(), // continuousUpdate
+        encode_bool(false), // continuousUpdate ('0' not unset)
         encode_unset(), // referencePriceType
         encode_unset(), // trailStopPrice
         encode_unset(), // trailingPercent
         encode_unset(), // scaleInitLevelSize
         encode_unset(), // scaleSubsLevelSize
         encode_unset(), // scalePriceIncrement
-        // Conditional scale_* extras (only emitted when
-        // scalePriceIncrement is set and != UNSET) — we never
-        // populate scalePriceIncrement so this block is omitted.
         encode_unset(), // scaleTable
         encode_unset(), // activeStartTime
         encode_unset(), // activeStopTime
         encode_unset(), // hedgeType
-        encode_unset(), // optOutSmartRouting
+        encode_bool(false), // optOutSmartRouting ('0' not unset)
         encode_unset(), // clearingAccount
         encode_unset(), // clearingIntent
         encode_bool(false), // notHeld
-        encode_bool(false), // delta-neutral contract: false → no further fields
+        encode_bool(false), // delta-neutral contract: false
         encode_unset(), // algoStrategy
+        encode_unset(), // algoId — was MISSING; caused parser misalignment
         encode_bool(false), // whatIf
-        encode_unset(), // orderMiscOptions (TagValue list)
-        encode_unset(), // solicited
+        encode_unset(), // orderMiscOptions
+        encode_bool(false), // solicited ('0' not unset)
         encode_bool(false), // randomizeSize
         encode_bool(false), // randomizePrice
-        // Pegged-to-benchmark fields are conditional on
-        // order_type == "PEG BENCH" — we use LMT/IOC so they're
-        // omitted entirely.
+        // PEG BENCH fields are conditional on orderType == "PEG BENCH";
+        // we use LMT/IOC so they're omitted.
         encode_int(0),  // conditionsCount
         encode_unset(), // adjustedOrderType
         encode_unset(), // triggerPrice
@@ -281,12 +285,9 @@ pub fn place_order(
         encode_unset(), // adjustedTrailingAmount
         encode_int(0),  // adjustableTrailingUnit
         encode_unset(), // extOperator
-        // Soft-dollar tier
         encode_unset(), // softDollarTier.name
         encode_unset(), // softDollarTier.value
-        // server >= MIN_SERVER_VER_CASH_QTY (151)
         encode_unset(), // cashQty
-        // server >= MIN_SERVER_VER_DECISION_MAKER (158)
         encode_unset(), // mifid2DecisionMaker
         encode_unset(), // mifid2DecisionAlgo
         encode_unset(), // mifid2ExecutionTrader
@@ -294,16 +295,12 @@ pub fn place_order(
         encode_bool(false), // dontUseAutoPriceForHedge
         encode_bool(false), // isOmsContainer
         encode_bool(false), // discretionaryUpToLimitPrice
-        encode_unset(), // usePriceMgmtAlgo (true/false/None)
-        // server >= 173
-        encode_int(0), // duration
-        // server >= 174
-        encode_int(0), // postToAts
-        // server >= 176
-        encode_unset(), // autoCancelParent
-        encode_unset(), // advancedErrorOverride
-        encode_unset(), // manualOrderTime
-        // server >= MIN_SERVER_VER_PEGBEST_PEGMID_OFFSETS (180) — skipped
+        encode_bool(false), // usePriceMgmtAlgo (default False, not unset)
+        encode_unset(), // duration (server >= 158, default UNSET_INT)
+        encode_unset(), // postToAts (server >= 160, default UNSET_INT)
+        encode_bool(false), // autoCancelParent (server >= 162, default False)
+        encode_unset(), // advancedErrorOverride (server >= 166)
+        encode_unset(), // manualOrderTime (server >= 169)
     ];
     // Trim trailing unsets that the server doesn't expect — for our
     // server version 178 the order-format is known. Keep all fields

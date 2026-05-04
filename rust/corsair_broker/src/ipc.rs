@@ -387,7 +387,7 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
     let contract = {
         let md = runtime.market_data.lock().unwrap();
         let products = runtime.portfolio.lock().unwrap().registry().products();
-        let mut found = None;
+        let mut found_iid: Option<corsair_broker_api::InstrumentId> = None;
         for prod in products {
             for t in md.options_for_product(&prod) {
                 let t_right_char = match t.right {
@@ -399,27 +399,26 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
                     && t_expiry_str == cmd.expiry
                     && t_right_char == r_norm
                 {
-                    found = Some((prod, t.strike, t.expiry, t.right, t.instrument_id));
+                    found_iid = t.instrument_id;
                     break;
                 }
             }
-            if found.is_some() {
+            if found_iid.is_some() {
                 break;
             }
         }
-        match found {
-            Some((prod, strike, expiry, right, iid)) => corsair_broker_api::Contract {
-                instrument_id: iid.unwrap_or(corsair_broker_api::InstrumentId(0)),
-                kind: ContractKind::Option,
-                symbol: format!("HXE{}", chrono::Local::now().format("%y%m")),
-                local_symbol: format!("{}{}{}{:.3}", prod, expiry, right.as_char(), strike),
-                expiry,
-                strike: Some(strike),
-                right: Some(right),
-                multiplier: 25_000.0,
-                exchange: Exchange::Comex,
-                currency: Currency::Usd,
-            },
+        // Look up the FULL qualified Contract (with IBKR-canonical
+        // local_symbol + trading_class). This is what subscribe_product
+        // populated when it called qualify_option. Synthesizing the
+        // Contract from scratch caused IBKR to reject every place_order
+        // with cryptic errors like 110 "VOL volatility" because the
+        // server cross-checks fields against conId and our placeholder
+        // values didn't match.
+        let cached = found_iid.and_then(|iid| {
+            runtime.qualified_contracts.lock().unwrap().get(&iid).cloned()
+        });
+        match cached {
+            Some(c) => c,
             None => {
                 log::warn!(
                     "ipc place_order: no contract cached for {}{:.4} {} {}",
@@ -903,7 +902,24 @@ async fn periodic_risk_state(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
         let hedge_delta: i64 = {
             let h = runtime.hedge.lock().unwrap();
             // Sum hedge_qty across products. i64 matches trader.
-            h.managers().iter().map(|m| m.hedge_qty() as i64).sum()
+            // Audit T1-5: fail closed if any manager's state is stale
+            // (>300s without reconcile/fill). Effective-delta gating
+            // depends on this being a trustworthy IBKR-confirmed view.
+            const HEDGE_STATE_MAX_AGE_NS: u64 = 300_000_000_000;
+            let now = now_ns();
+            h.managers()
+                .iter()
+                .map(|m| {
+                    if m.state().is_fresh(now, HEDGE_STATE_MAX_AGE_NS) {
+                        m.hedge_qty() as i64
+                    } else {
+                        // Stale — pretend hedge_qty is 0 so combined
+                        // gate falls back to options-only (the safe
+                        // pre-§14 behavior).
+                        0
+                    }
+                })
+                .sum()
         };
         let effective_delta = options_delta + (hedge_delta as f64);
 
@@ -956,3 +972,4 @@ fn now_ns() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
+

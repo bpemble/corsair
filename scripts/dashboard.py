@@ -98,12 +98,12 @@ st.set_page_config(
 
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# Auto-refresh — page-level rerun every 500ms. Combined with the chain
-# fragment's faster cadence (defined further down) and corsair writing the
-# snapshot at 4Hz, this keeps visible state ≤500ms stale. Single-user
-# dashboard so the rerun rate is well within Streamlit's comfort zone.
+# Auto-refresh — page-level rerun every 1500ms (3× original 500ms).
+# The chain fragment further down stays at 250ms for the quote table.
+# Bottom-of-page reflow flicker is fixed via CSS (min-height on the
+# chain section), not by slowing the rerun further.
 if _HAS_AUTOREFRESH:
-    st_autorefresh(interval=500, limit=None, key="page_refresh")
+    st_autorefresh(interval=1500, limit=None, key="page_refresh")
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -640,7 +640,10 @@ if snapshot is not None:
     calls_positions = [p for p in positions if p.get("right") == "Call"]
     puts_positions = [p for p in positions if p.get("right") == "Put"]
 
-    if calls_b or puts_b or positions:
+    # Always render the section even on a zero-position book — operator
+    # wants to see the hedge tile + a "No open positions" placeholder
+    # rather than a blank page when flattened.
+    if True:
         # Hedge tile — futures hedge state from HedgeManager. Surfaces
         # expiry, qty, avg entry, mark, and MTM P&L. Hidden when the
         # snapshot has no hedge block (older snapshots, or hedge

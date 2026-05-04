@@ -83,6 +83,16 @@ pub struct Runtime {
     pub market_data: Mutex<MarketDataState>,
     pub snapshot: Mutex<SnapshotPublisher>,
 
+    /// Qualified Contract cache, keyed by InstrumentId (IBKR conId).
+    /// Populated on every qualify_option/qualify_future. Consumers
+    /// (e.g. ipc::handle_place) need the actual local_symbol +
+    /// trading_class IBKR returned, not a synthesized stand-in —
+    /// IBKR's place_order parser cross-checks these against conId
+    /// and rejects mismatches with cryptic errors like 110 "VOL
+    /// volatility" when fields don't line up.
+    pub qualified_contracts:
+        Mutex<std::collections::HashMap<corsair_broker_api::InstrumentId, corsair_broker_api::Contract>>,
+
     /// Cached account snapshot from `Broker::account_values()`. Updated
     /// every ~5min by `periodic_account_poll`. Read by
     /// `periodic_risk_check` so margin_kill has a real number to gate
@@ -185,6 +195,7 @@ impl Runtime {
             oms: Mutex::new(oms),
             market_data: Mutex::new(market_data),
             snapshot: Mutex::new(snapshot),
+            qualified_contracts: Mutex::new(std::collections::HashMap::new()),
             account: Mutex::new(corsair_broker_api::AccountSnapshot {
                 net_liquidation: 0.0,
                 maintenance_margin: 0.0,
