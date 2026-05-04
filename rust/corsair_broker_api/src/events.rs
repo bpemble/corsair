@@ -29,6 +29,27 @@ pub struct Fill {
     pub commission: Option<f64>,
 }
 
+/// L2 market depth update. Emitted on the depth stream when IBKR
+/// pushes a book operation. Consumers (e.g. broker daemon's depth
+/// book aggregator) maintain per-leg L2 state from these.
+///
+/// Each update describes ONE level on ONE side: e.g. "delete level 2
+/// on bid side". Adapters do not maintain the book themselves; they
+/// just relay raw IBKR ops with the request's instrument_id attached.
+#[derive(Debug, Clone)]
+pub struct DepthUpdate {
+    pub instrument_id: InstrumentId,
+    /// Level (0=top of book).
+    pub position: i32,
+    /// 0=insert, 1=update, 2=delete.
+    pub operation: i32,
+    /// True for bid side, false for ask.
+    pub is_bid: bool,
+    pub price: f64,
+    pub size: u64,
+    pub timestamp_ns: u64,
+}
+
 /// Connection state. Emitted on the connection stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectionState {

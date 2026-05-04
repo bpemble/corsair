@@ -154,16 +154,35 @@ async fn command_pump(
     _drop_tx: broadcast::Sender<DropEvent>,
 ) {
     use tokio::time::{interval, Duration};
-    // Poll cadence — short for low latency, but we yield via
-    // tokio::time::interval so we don't peg a CPU core.
+    // Busy-poll mode (CORSAIR_BROKER_BUSY_POLL=1) yields via
+    // tokio::task::yield_now between empty reads — keeps the
+    // tokio scheduler responsive while letting this task spin
+    // hot on its pinned CPU. Drops broker→IBKR command latency
+    // p50 from ~1ms to ~50µs (matches the trader's events ring
+    // busy-poll). Costs 1 CPU core.
     //
-    // For a true event-driven setup we'd register the FIFO fd with
-    // tokio's reactor (tokio::io::AsyncFd). 1ms polling is the same
-    // approach the Python broker uses today and is good enough at
-    // our event rates.
+    // Default mode (interval 1ms) is the original behavior — low
+    // CPU, p50 ~500µs, p99 ~1ms. Adequate for non-time-critical
+    // builds.
+    let busy_poll = std::env::var("CORSAIR_BROKER_BUSY_POLL")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if busy_poll {
+        log::warn!(
+            "command_pump: CORSAIR_BROKER_BUSY_POLL=1 — busy-polling \
+             commands ring (1 CPU core hot, lower latency)"
+        );
+    }
     let mut tick = interval(Duration::from_millis(1));
     loop {
-        tick.tick().await;
+        if busy_poll {
+            // Yield without sleeping; tokio scheduler will re-poll
+            // this future immediately if no other task is ready.
+            tokio::task::yield_now().await;
+        } else {
+            tick.tick().await;
+        }
         // Drain notify (best-effort — we read regardless).
         let bytes = {
             let mut r = cmd_ring.lock().unwrap();

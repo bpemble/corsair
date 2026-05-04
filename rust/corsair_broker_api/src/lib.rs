@@ -211,6 +211,42 @@ pub trait Broker: Send + Sync + 'static {
     /// Maps to: `IB.cancelMktData()`.
     async fn unsubscribe_ticks(&self, h: TickStreamHandle) -> Result<()>;
 
+    /// Subscribe to L2 market depth for a contract. IBKR caps
+    /// concurrent depth requests at ~3-5 per account; the broker
+    /// daemon rotates active subscriptions across the quoted strike
+    /// set. `num_rows` is how many price levels per side IBKR
+    /// returns (typical: 5).
+    ///
+    /// Depth updates land on `subscribe_depth_stream()`. Returns a
+    /// handle for unsubscribing.
+    async fn subscribe_market_depth(
+        &self,
+        sub: tick::TickSubscription,
+        num_rows: i32,
+    ) -> Result<TickStreamHandle> {
+        let _ = (sub, num_rows);
+        Err(BrokerError::Internal(
+            "subscribe_market_depth not implemented".into(),
+        ))
+    }
+
+    async fn unsubscribe_market_depth(&self, h: TickStreamHandle) -> Result<()> {
+        let _ = h;
+        Err(BrokerError::Internal(
+            "unsubscribe_market_depth not implemented".into(),
+        ))
+    }
+
+    /// Stream of all depth updates. Single channel; consumers filter
+    /// by `instrument_id`.
+    fn subscribe_depth_stream(&self) -> broadcast::Receiver<events::DepthUpdate> {
+        // Default: empty channel that closes immediately. Real
+        // implementations override.
+        let (tx, rx) = broadcast::channel(1);
+        drop(tx);
+        rx
+    }
+
     // ── Push streams (broker → runtime) ────────────────────────────
 
     /// Subscribe to fill events. Multiple consumers can subscribe; each

@@ -153,6 +153,123 @@ async fn subscribe_product(
     Ok(())
 }
 
+/// Periodic depth-subscription rotator. Mirrors the Python broker's
+/// `rotate_depth_subscriptions` (CLAUDE.md note from market_data.py).
+/// Every CADENCE_SEC, picks the K options closest to ATM that have
+/// L1 data, cancels any active depth subs not in the set, and adds
+/// new ones. K is capped to MAX_ACTIVE so we never exceed IBKR's
+/// concurrent reqMktDepth limit (~3 free, more with quote booster).
+///
+/// Without L2 the trader can't see what's behind us when we're the
+/// BBO; quoting compresses to our own min-edge spread on those
+/// strikes. With L2 the trader's external_best_bid/ask call returns
+/// the next-best after subtracting our resting size, so tick-jumping
+/// targets external incumbents instead of self-quotes.
+pub async fn run_depth_rotator(runtime: Arc<Runtime>) {
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use corsair_broker_api::TickStreamHandle;
+
+    const CADENCE_SEC: u64 = 30;
+    const MAX_ACTIVE: usize = 5; // IBKR concurrent reqMktDepth limit
+    const NUM_ROWS: i32 = 5;     // depth levels per side
+
+    // Map (instrument_id) → handle, so we can unsubscribe later.
+    let mut active: std::collections::HashMap<corsair_broker_api::InstrumentId, TickStreamHandle> =
+        std::collections::HashMap::new();
+    let mut t = tokio::time::interval(Duration::from_secs(CADENCE_SEC));
+    // First tick fires immediately — let market_data accumulate first.
+    t.tick().await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    log::info!("depth_rotator: cadence {CADENCE_SEC}s, max_active={MAX_ACTIVE}");
+    loop {
+        t.tick().await;
+        // Pick target instruments: strikes nearest ATM with valid L1
+        // mid, capped at MAX_ACTIVE (call+put treated separately so
+        // we cover both sides of ATM).
+        let target: Vec<(corsair_broker_api::InstrumentId, corsair_broker_api::Contract)> = {
+            let md = runtime.market_data.lock().unwrap();
+            let qc = runtime.qualified_contracts.lock().unwrap();
+            let products = runtime.portfolio.lock().unwrap().registry().products();
+            let mut candidates: Vec<(f64, corsair_broker_api::InstrumentId, corsair_broker_api::Contract)> =
+                Vec::new();
+            for prod in &products {
+                let und = match corsair_position::MarketView::underlying_price(&*md, prod) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                for opt in md.options_for_product(prod) {
+                    if opt.bid <= 0.0 && opt.ask <= 0.0 {
+                        continue;
+                    }
+                    let iid = match opt.instrument_id {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    if let Some(c) = qc.get(&iid) {
+                        let dist = (opt.strike - und).abs();
+                        candidates.push((dist, iid, c.clone()));
+                    }
+                }
+            }
+            candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            candidates
+                .into_iter()
+                .take(MAX_ACTIVE)
+                .map(|(_, iid, c)| (iid, c))
+                .collect()
+        };
+
+        let want: HashSet<corsair_broker_api::InstrumentId> =
+            target.iter().map(|(iid, _)| *iid).collect();
+
+        // Cancel ones no longer wanted.
+        let to_cancel: Vec<corsair_broker_api::InstrumentId> = active
+            .keys()
+            .copied()
+            .filter(|iid| !want.contains(iid))
+            .collect();
+        for iid in to_cancel {
+            if let Some(h) = active.remove(&iid) {
+                let b = runtime.broker.lock().await;
+                if let Err(e) = b.unsubscribe_market_depth(h).await {
+                    log::warn!("depth_rotator: unsubscribe {:?} failed: {}", iid, e);
+                }
+            }
+        }
+
+        // Add new ones.
+        for (iid, c) in target {
+            if active.contains_key(&iid) {
+                continue;
+            }
+            let b = runtime.broker.lock().await;
+            match b
+                .subscribe_market_depth(
+                    corsair_broker_api::TickSubscription {
+                        instrument_id: iid,
+                        tick_by_tick: false,
+                        consumer_tag: Some(format!("depth {}", c.local_symbol)),
+                        contract: Some(c),
+                    },
+                    NUM_ROWS,
+                )
+                .await
+            {
+                Ok(h) => {
+                    active.insert(iid, h);
+                }
+                Err(e) => {
+                    log::warn!("depth_rotator: subscribe {:?} failed: {}", iid, e);
+                }
+            }
+        }
+        if !active.is_empty() {
+            log::info!("depth_rotator: {} active L2 subs", active.len());
+        }
+    }
+}
+
 /// Resolve the front-month underlying contract.
 async fn resolve_underlying(
     runtime: &Arc<Runtime>,

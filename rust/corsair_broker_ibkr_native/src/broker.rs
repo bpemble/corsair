@@ -53,8 +53,9 @@ use corsair_broker_api::{
 use crate::client::{NativeClient, NativeClientConfig};
 use crate::error::NativeError;
 use crate::requests::{
-    cancel_mkt_data, cancel_order, place_order, req_account_updates, req_contract_details,
-    req_executions, req_mkt_data, req_open_orders, req_positions, ContractRequest,
+    cancel_mkt_data, cancel_mkt_depth, cancel_order, place_order, req_account_updates,
+    req_contract_details, req_executions, req_mkt_data, req_mkt_depth, req_open_orders,
+    req_positions, ContractRequest,
     ExecutionFilter, PlaceOrderParams,
 };
 use crate::types::{
@@ -120,8 +121,15 @@ struct BrokerState {
     /// reqId → InstrumentId for tick routing.
     tick_routes: HashMap<i32, InstrumentId>,
 
+    /// reqId → InstrumentId for L2 depth routing. Separate from
+    /// tick_routes because reqMktDepth uses a different reqId space
+    /// per IBKR (and we want fast disambiguation in route()).
+    depth_routes: HashMap<i32, InstrumentId>,
+
     /// handle → reqId for unsubscribe.
     handle_to_req_id: HashMap<TickStreamHandle, i32>,
+    /// handle → reqId for L2 depth unsubscribe.
+    handle_to_depth_req_id: HashMap<TickStreamHandle, i32>,
 
     /// Tracks bootstrap-time seeding.
     seeding: SeedingProgress,
@@ -152,6 +160,7 @@ struct BrokerChannels {
     fills: broadcast::Sender<Fill>,
     status: broadcast::Sender<OrderStatusUpdate>,
     ticks: broadcast::Sender<Tick>,
+    depth: broadcast::Sender<corsair_broker_api::events::DepthUpdate>,
     errors: broadcast::Sender<BrokerError>,
     connection: broadcast::Sender<ConnectionEvent>,
 }
@@ -162,6 +171,7 @@ impl BrokerChannels {
             fills: broadcast::channel(FILL_CHANNEL_CAP).0,
             status: broadcast::channel(STATUS_CHANNEL_CAP).0,
             ticks: broadcast::channel(TICK_CHANNEL_CAP).0,
+            depth: broadcast::channel(TICK_CHANNEL_CAP).0,
             errors: broadcast::channel(ERROR_CHANNEL_CAP).0,
             connection: broadcast::channel(CONNECTION_CHANNEL_CAP).0,
         }
@@ -565,6 +575,22 @@ impl NativeBroker {
                         }
                         let _ = channels.ticks.send(tick);
                     }
+                }
+            }
+            InboundMsg::MarketDepth(d) => {
+                let iid_opt = state.lock().depth_routes.get(&d.req_id).copied();
+                if let Some(iid) = iid_opt {
+                    let upd = corsair_broker_api::events::DepthUpdate {
+                        instrument_id: iid,
+                        position: d.position,
+                        operation: d.operation,
+                        // IBKR convention: side 0=ask, 1=bid.
+                        is_bid: d.side == 1,
+                        price: d.price,
+                        size: d.size as u64,
+                        timestamp_ns: recv_ns,
+                    };
+                    let _ = channels.depth.send(upd);
                 }
             }
             InboundMsg::Error(e) => {
@@ -1556,6 +1582,56 @@ impl Broker for NativeBroker {
                 .map_err(Self::map_native_err)?;
         }
         Ok(())
+    }
+
+    async fn subscribe_market_depth(
+        &self,
+        sub: TickSubscription,
+        num_rows: i32,
+    ) -> BResult<TickStreamHandle> {
+        let req_id = self.alloc_req_id();
+        let handle = self.alloc_handle();
+        {
+            let mut s = self.state.lock();
+            s.depth_routes.insert(req_id, sub.instrument_id);
+            s.handle_to_depth_req_id.insert(handle, req_id);
+        }
+        let mut cr = match &sub.contract {
+            Some(c) => contract_to_request(c),
+            None => empty_contract_request("", ""),
+        };
+        cr.con_id = sub.instrument_id.0 as i64;
+        let frame = req_mkt_depth(req_id, &cr, num_rows);
+        self.client
+            .send_raw(&frame)
+            .await
+            .map_err(Self::map_native_err)?;
+        Ok(handle)
+    }
+
+    async fn unsubscribe_market_depth(&self, h: TickStreamHandle) -> BResult<()> {
+        let req_id = {
+            let mut s = self.state.lock();
+            let req_id = s.handle_to_depth_req_id.remove(&h);
+            if let Some(rid) = req_id {
+                s.depth_routes.remove(&rid);
+            }
+            req_id
+        };
+        if let Some(rid) = req_id {
+            let frame = cancel_mkt_depth(rid);
+            self.client
+                .send_raw(&frame)
+                .await
+                .map_err(Self::map_native_err)?;
+        }
+        Ok(())
+    }
+
+    fn subscribe_depth_stream(
+        &self,
+    ) -> broadcast::Receiver<corsair_broker_api::events::DepthUpdate> {
+        self.channels.depth.subscribe()
     }
 
     fn subscribe_fills(&self) -> broadcast::Receiver<Fill> {

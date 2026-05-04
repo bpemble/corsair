@@ -144,6 +144,50 @@ pub fn cancel_mkt_data(req_id: i32) -> Vec<u8> {
     ])
 }
 
+/// Request market depth (level 2) for a contract.
+/// IBKR caps concurrent depth requests at ~3-5 per account; the
+/// broker daemon rotates active subscriptions across the quoted
+/// strike set.
+///
+/// Server delivers IN_MARKET_DEPTH (single-mkt-maker) or
+/// IN_MARKET_DEPTH_L2 messages keyed by req_id. We don't
+/// distinguish smart-routing from direct (isSmartDepth=false).
+pub fn req_mkt_depth(
+    req_id: i32,
+    c: &ContractRequest,
+    num_rows: i32,
+) -> Vec<u8> {
+    frame(&[
+        encode_int(OUT_REQ_MKT_DEPTH),
+        "5".into(), // version
+        encode_int(req_id),
+        encode_int64(c.con_id),
+        c.symbol.clone(),
+        c.sec_type.clone(),
+        c.last_trade_date.clone(),
+        encode_f64(c.strike),
+        c.right.clone(),
+        c.multiplier.clone(),
+        c.exchange.clone(),
+        c.primary_exchange.clone(),
+        c.currency.clone(),
+        c.local_symbol.clone(),
+        c.trading_class.clone(),
+        encode_int(num_rows),
+        encode_bool(false), // isSmartDepth
+        encode_unset(),     // mktDepthOptions (TagValue list)
+    ])
+}
+
+pub fn cancel_mkt_depth(req_id: i32) -> Vec<u8> {
+    frame(&[
+        encode_int(OUT_CANCEL_MKT_DEPTH),
+        "1".into(), // version
+        encode_int(req_id),
+        encode_bool(false), // isSmartDepth
+    ])
+}
+
 // ─── Orders ───────────────────────────────────────────────────────
 
 /// Place-order parameters. Mirrors ib_insync's Order struct subset

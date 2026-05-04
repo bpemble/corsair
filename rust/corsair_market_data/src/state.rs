@@ -181,6 +181,28 @@ impl MarketDataState {
         }
     }
 
+    /// Apply an IBKR depth operation to the option's L2 book.
+    /// `is_bid` is true when IBKR sent side=1 (bid), false for side=0
+    /// (ask). `op` is 0=insert, 1=update, 2=delete. No-op for non-
+    /// options or unregistered instruments.
+    pub fn apply_depth(
+        &mut self,
+        iid: InstrumentId,
+        is_bid: bool,
+        position: i32,
+        op: i32,
+        price: f64,
+        size: u64,
+        ts_ns: u64,
+    ) {
+        if let Some(k) = self.by_instrument.get(&iid).cloned() {
+            if let Some(t) = self.options.get_mut(&k) {
+                t.depth.apply(is_bid, position, op, price, size);
+                t.last_updated_ns = ts_ns;
+            }
+        }
+    }
+
     /// Update option open interest for the leg keyed by instrument id.
     /// Pushed by IBKR's generic tick "101". No-op if not an option.
     pub fn update_open_interest(&mut self, iid: InstrumentId, oi: u64, ts_ns: u64) {

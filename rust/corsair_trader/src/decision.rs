@@ -174,13 +174,45 @@ pub fn decide_on_tick(
     };
 
     // Bid/ask + sizes for the dark-book guards.
-    let bid = tick.bid.unwrap_or(0.0);
-    let ask = tick.ask.unwrap_or(0.0);
+    let raw_bid = tick.bid.unwrap_or(0.0);
+    let raw_ask = tick.ask.unwrap_or(0.0);
     let bid_size = tick.bid_size.unwrap_or(0);
     let ask_size = tick.ask_size.unwrap_or(0);
 
-    // Two-sided market check.
-    if bid <= 0.0 || ask <= 0.0 {
+    // Self-fill filter: IBKR's L1 BBO includes our resting orders. If
+    // our_bid is at the displayed bid (and our qty matches the
+    // displayed size), we ARE the bid — comparing target against our
+    // own price for tick-jumping is a no-op at best, a runaway
+    // 1-tick-better loop at worst. Treat the BBO as "no external
+    // incumbent" on that side; the naive theo-derived target stands.
+    //
+    // This is a depth-1 approximation. Without a level-2 feed we can't
+    // see the next-best bid/ask. The conservative assumption is that
+    // when we appear to be the BBO, there's no useful external
+    // incumbent to improve over — fall through with raw_*-equivalent
+    // value of 0 so the tick-jump branch is skipped.
+    let bid = {
+        let buy_key = (TraderState::strike_key(strike), expiry.clone(), r_char, 'B');
+        let our_bid = state.our_orders.get(&buy_key).map(|o| o.price);
+        if let Some(p) = our_bid {
+            if (p - raw_bid).abs() < 1e-9 { 0.0 } else { raw_bid }
+        } else {
+            raw_bid
+        }
+    };
+    let ask = {
+        let sell_key = (TraderState::strike_key(strike), expiry.clone(), r_char, 'S');
+        let our_ask = state.our_orders.get(&sell_key).map(|o| o.price);
+        if let Some(p) = our_ask {
+            if (p - raw_ask).abs() < 1e-9 { 0.0 } else { raw_ask }
+        } else {
+            raw_ask
+        }
+    };
+
+    // Two-sided market check (uses raw — even if WE are the BBO, we
+    // still need real two-sided market on each side to enter).
+    if raw_bid <= 0.0 || raw_ask <= 0.0 {
         counters.skip_one_sided_or_dark += 2;
         return out;
     }
@@ -214,30 +246,40 @@ pub fn decide_on_tick(
         // whether naive or jumped.
         match side {
             Side::Buy => {
-                let jumped = bid + state.tick_size;
-                // Only jump if naive is at-or-behind incumbent AND
-                // jumping still keeps min_edge_ticks of edge.
-                if target < jumped && (theo - jumped) >= edge {
-                    target = jumped;
+                // Only jump if there's an EXTERNAL incumbent bid
+                // (filtered bid > 0 means external liquidity exists).
+                // When `bid == 0` the self-fill filter zeroed it out
+                // because we're the BBO ourselves — no need to jump
+                // 1-tick "ahead" of our own resting order.
+                if bid > 0.0 {
+                    let jumped = bid + state.tick_size;
+                    if target < jumped && (theo - jumped) >= edge {
+                        target = jumped;
+                    }
                 }
             }
             Side::Sell => {
-                let jumped = ask - state.tick_size;
-                if target > jumped && (jumped - theo) >= edge {
-                    target = jumped;
+                if ask > 0.0 {
+                    let jumped = ask - state.tick_size;
+                    if target > jumped && (jumped - theo) >= edge {
+                        target = jumped;
+                    }
                 }
             }
         }
-        // Cross-protect: don't cross existing best on the opposite side.
+        // Cross-protect: don't cross existing best on the opposite
+        // side. Use the FILTERED bid/ask — if we are the contra-side
+        // BBO (e.g., filtered ask=0 because our_ask matches), there's
+        // no external incumbent on that side and we shouldn't gate.
         match side {
             Side::Buy => {
-                if target >= ask {
+                if ask > 0.0 && target >= ask {
                     counters.skip_would_cross_ask += 1;
                     continue;
                 }
             }
             Side::Sell => {
-                if target <= bid {
+                if bid > 0.0 && target <= bid {
                     counters.skip_would_cross_bid += 1;
                     continue;
                 }

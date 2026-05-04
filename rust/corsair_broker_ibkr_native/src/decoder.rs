@@ -24,6 +24,8 @@ pub fn parse_inbound(fields: &[String]) -> Result<InboundMsg, NativeError> {
         IN_TICK_PRICE => parse_tick_price(fields),
         IN_TICK_SIZE => parse_tick_size(fields),
         IN_TICK_OPTION_COMPUTATION => parse_tick_option_computation(fields),
+        IN_MARKET_DEPTH => parse_market_depth(fields, false),
+        IN_MARKET_DEPTH_L2 => parse_market_depth(fields, true),
         IN_ORDER_STATUS => parse_order_status(fields),
         IN_ERR_MSG => parse_error(fields),
         IN_OPEN_ORDER => parse_open_order(fields),
@@ -105,6 +107,55 @@ fn parse_tick_size(fields: &[String]) -> Result<InboundMsg, NativeError> {
         tick_type: parse_int(&fields[3])?,
         size: parse_f64(&fields[4])?,
     }))
+}
+
+/// Market depth update.
+///
+/// Layout (no version field — that's normal for these msg types):
+///   IN_MARKET_DEPTH (12, single mkt-maker / smart):
+///     `[12, reqId, position, operation, side, price, size]`
+///   IN_MARKET_DEPTH_L2 (13, level-2 with mkt-maker code):
+///     `[13, reqId, position, marketMaker, operation, side, price, size,
+///      isSmartDepth]` (isSmartDepth at server >= MIN_SERVER_VER_SMART_DEPTH)
+///
+/// Operations: 0=insert, 1=update, 2=delete.
+/// Sides:      0=ask, 1=bid.
+fn parse_market_depth(fields: &[String], is_l2: bool) -> Result<InboundMsg, NativeError> {
+    let needed = if is_l2 { 8 } else { 7 };
+    if fields.len() < needed {
+        return Err(NativeError::Malformed(format!(
+            "marketDepth (L2={}) fields={}", is_l2, fields.len()
+        )));
+    }
+    if is_l2 {
+        // [13, reqId, pos, mm, op, side, price, size, smart]
+        Ok(InboundMsg::MarketDepth(MarketDepthMsg {
+            req_id: parse_int(&fields[1])?,
+            position: parse_int(&fields[2])?,
+            market_maker: Some(fields[3].clone()),
+            operation: parse_int(&fields[4])?,
+            side: parse_int(&fields[5])?,
+            price: parse_f64(&fields[6])?,
+            size: parse_f64(&fields[7])?,
+            is_smart_depth: fields
+                .get(8)
+                .and_then(|s| s.parse::<i32>().ok())
+                .map(|v| v == 1)
+                .unwrap_or(false),
+        }))
+    } else {
+        // [12, reqId, pos, op, side, price, size]
+        Ok(InboundMsg::MarketDepth(MarketDepthMsg {
+            req_id: parse_int(&fields[1])?,
+            position: parse_int(&fields[2])?,
+            market_maker: None,
+            operation: parse_int(&fields[3])?,
+            side: parse_int(&fields[4])?,
+            price: parse_f64(&fields[5])?,
+            size: parse_f64(&fields[6])?,
+            is_smart_depth: false,
+        }))
+    }
 }
 
 /// Server >= 173: tickOptionComputation has an attrib field after

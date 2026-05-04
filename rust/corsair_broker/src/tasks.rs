@@ -17,11 +17,15 @@ pub fn spawn_all(runtime: Arc<Runtime>) -> Vec<tokio::task::JoinHandle<()>> {
     handles.push(tokio::spawn(pump_fills(runtime.clone())));
     handles.push(tokio::spawn(pump_status(runtime.clone())));
     handles.push(tokio::spawn(pump_ticks(runtime.clone())));
+    handles.push(tokio::spawn(pump_depth(runtime.clone())));
     handles.push(tokio::spawn(pump_errors(runtime.clone())));
     handles.push(tokio::spawn(pump_connection(runtime.clone())));
 
     handles.push(tokio::spawn(periodic_greek_refresh(runtime.clone())));
     handles.push(tokio::spawn(periodic_risk_check(runtime.clone())));
+    handles.push(tokio::spawn(crate::subscriptions::run_depth_rotator(
+        runtime.clone(),
+    )));
     handles.push(tokio::spawn(periodic_hedge(runtime.clone())));
     handles.push(tokio::spawn(periodic_snapshot(runtime.clone())));
     handles.push(tokio::spawn(periodic_account_poll(runtime.clone())));
@@ -199,6 +203,38 @@ async fn pump_status(runtime: Arc<Runtime>) {
             }
             Err(RecvError::Lagged(n)) => log::warn!("pump_status: lagged {n}"),
             Err(RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Drain L2 depth updates from the broker and apply to MarketDataState.
+/// Each update describes ONE level (insert/update/delete) on ONE side.
+/// MarketDataState's depth book aggregates the ops into a 5-level
+/// per-leg book that the trader can query for "external best".
+async fn pump_depth(runtime: Arc<Runtime>) {
+    let mut rx = {
+        let b = runtime.broker.lock().await;
+        b.subscribe_depth_stream()
+    };
+    log::info!("pump_depth: subscribed");
+    loop {
+        match rx.recv().await {
+            Ok(d) => {
+                let mut md = runtime.market_data.lock().unwrap();
+                md.apply_depth(
+                    d.instrument_id,
+                    d.is_bid,
+                    d.position,
+                    d.operation,
+                    d.price,
+                    d.size,
+                    d.timestamp_ns,
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                log::warn!("pump_depth: lagged {n}");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 }

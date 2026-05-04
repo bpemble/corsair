@@ -139,6 +139,23 @@ pub struct TickOptionComputationMsg {
     pub und_price: f64,
 }
 
+/// Market depth update (level 2 / order book). Per IBKR protocol,
+/// `operation` is 0=insert, 1=update, 2=delete; `side` is 0=ask,
+/// 1=bid. Position is the level (0=top of book).
+#[derive(Debug, Clone)]
+pub struct MarketDepthMsg {
+    pub req_id: i32,
+    pub position: i32,
+    pub operation: i32,
+    pub side: i32,
+    pub price: f64,
+    pub size: f64,
+    /// Market maker code (only set for L2 messages, type 13).
+    pub market_maker: Option<String>,
+    /// Smart-routing flag (L2 only). Always false for our use.
+    pub is_smart_depth: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ErrorMsg {
     pub req_id: i32,
@@ -168,6 +185,7 @@ pub enum InboundMsg {
     TickPrice(TickPriceMsg),
     TickSize(TickSizeMsg),
     TickOptionComputation(TickOptionComputationMsg),
+    MarketDepth(MarketDepthMsg),
     Error(ErrorMsg),
     NextValidId(i32),
     ManagedAccounts(Vec<String>),
