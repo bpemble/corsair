@@ -4,6 +4,7 @@
 use crate::messages::VolParams;
 use ahash::AHashMap;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// Slim option state cached per (strike, expiry, right). Drops the
 /// expiry/right strings that the TickMsg carries (they're already in
@@ -49,13 +50,19 @@ pub struct OurOrder {
 }
 
 pub struct TraderState {
-    /// Latest tick per (strike-bits, expiry, right-char). Stores the
-    /// slim OptionState (no redundant strings). Bounded by quoted
+    /// Latest tick per (strike-bits, expiry-arc, right-char). Stores
+    /// the slim OptionState (no redundant strings). Bounded by quoted
     /// strikes (≤60 in production).
-    pub options: AHashMap<(u64, String, char), OptionState>,
+    ///
+    /// Expiry uses `Arc<str>` interned via `intern_expiry` — production
+    /// has ~4 unique expiries, so all clones become Arc bumps (~5ns)
+    /// instead of String heap allocations (~70ns each). The keys for
+    /// `options`, `vol_surfaces`, `theo_cache`, `our_orders`, and
+    /// `orderid_to_key` all share the same Arcs.
+    pub options: AHashMap<(u64, Arc<str>, char), OptionState>,
 
     /// Vol surface params per (expiry, right-char). Bounded by ~4 entries.
-    pub vol_surfaces: AHashMap<(String, char), VolSurfaceEntry>,
+    pub vol_surfaces: AHashMap<(Arc<str>, char), VolSurfaceEntry>,
 
     /// Optimization #3 — SVI/SABR theo cache, keyed by
     /// (strike_bits, expiry, right_char, fit_ts_ns). theo is a pure
@@ -65,7 +72,7 @@ pub struct TraderState {
     /// entry when fit_ts_ns changes (new SABR fit landed). Saves
     /// ~80µs per tick (SVI/SABR + Black76) in the steady-state amend
     /// loop where the same key sees many ticks per second.
-    pub theo_cache: AHashMap<(u64, String, char, u64), f64>,
+    pub theo_cache: AHashMap<(u64, Arc<str>, char, u64), f64>,
 
     /// Underlying spot. Updated from underlying_tick.
     pub underlying_price: f64,
@@ -73,10 +80,16 @@ pub struct TraderState {
     /// Resting orders we've placed, keyed by
     /// (strike-bits, expiry, right-char, side-char).
     /// side-char: 'B' for BUY, 'S' for SELL.
-    pub our_orders: AHashMap<(u64, String, char, char), OurOrder>,
+    pub our_orders: AHashMap<(u64, Arc<str>, char, char), OurOrder>,
 
     /// orderId → key reverse map, for terminal-status cleanup.
-    pub orderid_to_key: AHashMap<i64, (u64, String, char, char)>,
+    pub orderid_to_key: AHashMap<i64, (u64, Arc<str>, char, char)>,
+
+    /// Expiry interning table. Production sees ~4 unique expiries; the
+    /// table is essentially immortal after warmup. Key is `String` so
+    /// lookups can use `&str` via `Borrow<str>` without allocating a
+    /// new String per query.
+    pub expiry_intern: AHashMap<String, Arc<str>>,
 
     /// Trader-side risk state from broker (1Hz publish).
     pub risk_effective_delta: Option<f64>,
@@ -113,6 +126,7 @@ impl TraderState {
             underlying_price: 0.0,
             our_orders: AHashMap::new(),
             orderid_to_key: AHashMap::new(),
+            expiry_intern: AHashMap::new(),
             risk_effective_delta: None,
             risk_margin_pct: None,
             risk_hedge_delta: None,
@@ -136,6 +150,19 @@ impl TraderState {
     #[inline(always)]
     pub fn strike_key(strike: f64) -> u64 {
         strike.to_bits()
+    }
+
+    /// Return the interned `Arc<str>` for `expiry`; allocate on first
+    /// sight, Arc-bump thereafter. Production tops out at ~4 unique
+    /// expiries; the table never grows large.
+    #[inline]
+    pub fn intern_expiry(&mut self, expiry: &str) -> Arc<str> {
+        if let Some(arc) = self.expiry_intern.get(expiry) {
+            return Arc::clone(arc);
+        }
+        let arc: Arc<str> = Arc::from(expiry);
+        self.expiry_intern.insert(expiry.to_string(), Arc::clone(&arc));
+        arc
     }
 }
 

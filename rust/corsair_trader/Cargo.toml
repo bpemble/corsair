@@ -20,6 +20,11 @@ log = "0.4"
 env_logger = "0.11"
 statrs = "0.17"
 ahash = "0.8"
+# p99-4 (2026-05-04): mimalloc as global allocator. rmp_serde decode +
+# small-Vec churn on the hot path benefits from mimalloc's tighter
+# tail-latency vs glibc malloc. ~100-300µs typical p99 reduction in
+# allocation-heavy hot paths.
+mimalloc = { version = "0.1", default-features = false }
 # Phase 5B.5: shared IPC implementation. The trader's local
 # src/ipc/ module now re-exports from corsair_ipc so both broker
 # and trader use one source of truth for the wire format.

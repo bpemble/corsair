@@ -12,17 +12,57 @@
 
 use serde::{Deserialize, Serialize};
 
-/// All inbound events deserialize via this catch-all then dispatch
-/// on the `type` field. Rmp-serde handles map-style msgpack messages.
+/// Lightweight first-pass header. Hot path parses ONLY this, then
+/// re-parses the body bytes directly into the typed message struct
+/// for the matched variant. Avoids the `serde_json::Value`-tree round
+/// trip the previous `GenericMsg` carried via `#[serde(flatten)] extra`.
+///
+/// rmp_serde silently ignores unknown msgpack-map keys when a
+/// `#[derive(Deserialize)]` struct doesn't declare `deny_unknown_fields`,
+/// so this header skips every other field cheaply (no Value allocations).
 #[derive(Debug, Deserialize)]
-pub struct GenericMsg {
+pub struct MsgHeader {
     #[serde(rename = "type")]
     pub msg_type: String,
     #[serde(default)]
     pub ts_ns: Option<u64>,
-    // All other fields are kept as a Value tree for flexible access.
-    #[serde(flatten)]
-    pub extra: serde_json::Value,
+}
+
+/// Typed kill / resume — replaces ad-hoc `extra.get("source")` lookups.
+#[derive(Debug, Deserialize)]
+pub struct KillMsg {
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WeekendPauseMsg {
+    #[serde(default)]
+    pub paused: bool,
+}
+
+/// Hello config (broker → trader on connect). Subset of fields the
+/// trader actually reads; broker may emit more (silently ignored).
+#[derive(Debug, Deserialize)]
+pub struct HelloConfig {
+    #[serde(default)]
+    pub min_edge_ticks: Option<i64>,
+    #[serde(default)]
+    pub tick_size: Option<f64>,
+    #[serde(default)]
+    pub delta_ceiling: Option<f64>,
+    #[serde(default)]
+    pub delta_kill: Option<f64>,
+    #[serde(default)]
+    pub margin_ceiling_pct: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HelloMsg {
+    #[serde(default)]
+    pub config: Option<HelloConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

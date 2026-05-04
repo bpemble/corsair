@@ -4,6 +4,8 @@
 //!
 //! Returns a `Decision` enum the caller acts on.
 
+use std::sync::Arc;
+
 use crate::messages::{TickMsg, VolParams};
 use crate::pricing::{black76_price, sabr_implied_vol, svi_implied_vol};
 use crate::state::{DecisionCounters, TraderState};
@@ -100,10 +102,15 @@ impl Side {
 /// Top-level decision entry point. Mirrors `_decide_on_tick` flow
 /// in Python. Returns a Vec because each tick produces up to 2
 /// decisions (BUY + SELL).
+///
+/// `expiry_arc` is the interned `Arc<str>` for `tick.expiry`; the
+/// caller owns interning so all downstream HashMap keys share one Arc
+/// and clones are bumps, not allocations.
 pub fn decide_on_tick(
     state: &mut TraderState,
     counters: &mut DecisionCounters,
     tick: &TickMsg,
+    expiry_arc: &Arc<str>,
     now_monotonic_ns: u64,
 ) -> Vec<Decision> {
     let mut out = Vec::with_capacity(2);
@@ -112,7 +119,6 @@ pub fn decide_on_tick(
         return out;
     }
     let strike = tick.strike;
-    let expiry = &tick.expiry;
     let right = &tick.right;
 
     // Don't quote into a halt
@@ -165,12 +171,13 @@ pub fn decide_on_tick(
     }
 
     // Vol surface lookup: try (expiry, right_char) then either side.
+    // Lookups clone the expiry Arc (bump, not alloc).
     let r_char = right.chars().next().unwrap_or('C').to_ascii_uppercase();
     let vp_msg = state
         .vol_surfaces
-        .get(&(expiry.clone(), r_char))
-        .or_else(|| state.vol_surfaces.get(&(expiry.clone(), 'C')))
-        .or_else(|| state.vol_surfaces.get(&(expiry.clone(), 'P')));
+        .get(&(Arc::clone(expiry_arc), r_char))
+        .or_else(|| state.vol_surfaces.get(&(Arc::clone(expiry_arc), 'C')))
+        .or_else(|| state.vol_surfaces.get(&(Arc::clone(expiry_arc), 'P')));
     let vp_msg = match vp_msg {
         Some(v) => v.clone(),
         None => {
@@ -180,7 +187,7 @@ pub fn decide_on_tick(
     };
 
     let fit_forward = vp_msg.forward;
-    let tte = match time_to_expiry_years(expiry) {
+    let tte = match time_to_expiry_years(expiry_arc) {
         Some(t) if t > 0.0 => t,
         _ => return out,
     };
@@ -216,7 +223,7 @@ pub fn decide_on_tick(
     // tick on the SVI implied_vol + Black76 chain in the amend loop.
     let theo_key = (
         TraderState::strike_key(strike),
-        expiry.clone(),
+        Arc::clone(expiry_arc),
         r_char,
         vp_msg.fit_ts_ns,
     );
@@ -251,8 +258,8 @@ pub fn decide_on_tick(
 
     // Look up our resting orders (used by both the L2-aware path and
     // the depth-1 self-fill fallback below).
-    let buy_key = (TraderState::strike_key(strike), expiry.clone(), r_char, 'B');
-    let sell_key = (TraderState::strike_key(strike), expiry.clone(), r_char, 'S');
+    let buy_key = (TraderState::strike_key(strike), Arc::clone(expiry_arc), r_char, 'B');
+    let sell_key = (TraderState::strike_key(strike), Arc::clone(expiry_arc), r_char, 'S');
     let our_bid = state.our_orders.get(&buy_key).map(|o| o.price);
     let our_ask = state.our_orders.get(&sell_key).map(|o| o.price);
 
@@ -382,12 +389,11 @@ pub fn decide_on_tick(
             _ => {}
         }
 
-        // Compact key: strike-bits + expiry (one String) + right-char +
-        // side-char. Saves 2 String allocations per key construction
-        // vs the previous all-strings form.
+        // Compact key: strike-bits + expiry-arc + right-char +
+        // side-char. Arc bump per clone, no String alloc.
         let key = (
             TraderState::strike_key(strike),
-            expiry.clone(),
+            Arc::clone(expiry_arc),
             r_char,
             side.as_char(),
         );
@@ -588,8 +594,9 @@ mod tests {
     }
 
     fn install_svi_surface(state: &mut TraderState, expiry: &str, side: char) {
+        let expiry_arc = state.intern_expiry(expiry);
         state.vol_surfaces.insert(
-            (expiry.to_string(), side),
+            (expiry_arc, side),
             VolSurfaceEntry {
                 forward: 6.0,
                 params: VolParams {
@@ -632,7 +639,8 @@ mod tests {
         let mut state = fresh_state(6.0);
         let mut counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
         assert!(counters.skip_no_vol_surface > 0);
     }
@@ -643,7 +651,8 @@ mod tests {
         install_svi_surface(&mut state, "20260526", 'C');
         let mut counters = DecisionCounters::default();
         let tick = make_tick(7.0, "20260526", "C", 0.01, 0.02);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_off_atm, 1);
     }
@@ -654,7 +663,8 @@ mod tests {
         install_svi_surface(&mut state, "20260526", 'C');
         let mut counters = DecisionCounters::default();
         let tick = make_tick(5.85, "20260526", "C", 0.20, 0.22);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_itm, 1);
     }
@@ -665,7 +675,8 @@ mod tests {
         install_svi_surface(&mut state, "20260526", 'P');
         let mut counters = DecisionCounters::default();
         let tick = make_tick(6.15, "20260526", "P", 0.20, 0.22);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_itm, 1);
     }
@@ -677,7 +688,8 @@ mod tests {
         let mut counters = DecisionCounters::default();
         let mut tick = make_tick(6.0, "20260526", "C", 0.0, 0.10);
         tick.bid = Some(0.0);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_one_sided_or_dark, 2);
     }
@@ -689,7 +701,8 @@ mod tests {
         let mut counters = DecisionCounters::default();
         let mut tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         tick.bid_size = Some(0);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_thin_book, 2);
     }
@@ -702,7 +715,8 @@ mod tests {
         install_svi_surface(&mut state, "20260526", 'C');
         let mut counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
         assert_eq!(counters.risk_block, 2);
     }
@@ -715,7 +729,8 @@ mod tests {
         install_svi_surface(&mut state, "20260526", 'C');
         let mut counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
         assert_eq!(counters.risk_block, 2);
     }
@@ -727,7 +742,8 @@ mod tests {
         install_svi_surface(&mut state, "20260526", 'C');
         let mut counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
     }
 
@@ -738,7 +754,8 @@ mod tests {
         install_svi_surface(&mut state, "20260526", 'C');
         let mut counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, 1_000_000_000);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
     }
 }
