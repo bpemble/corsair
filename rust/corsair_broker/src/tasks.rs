@@ -638,12 +638,22 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
                 ibkr_scale: cc.ibkr_scale(),
             }
         };
+        // Pull open_orders from broker BEFORE entering the snapshot
+        // critical section. open_orders() returns the broker's
+        // in-memory cache (no IO), populated by route() on every
+        // OpenOrder/OrderStatus event from IBKR. Used by the chain
+        // payload to populate our_bid / our_ask per strike so the
+        // dashboard's chain table can highlight our resting prices.
+        let open_orders_snapshot = {
+            let b = runtime.broker.lock().await;
+            b.open_orders().await.unwrap_or_default()
+        };
         let result = {
             let p = runtime.portfolio.lock().unwrap();
             let r = runtime.risk.lock().unwrap();
             let h = runtime.hedge.lock().unwrap();
             let md = runtime.market_data.lock().unwrap();
-            let chain_build = build_chain_payload(&runtime, &md, &p);
+            let chain_build = build_chain_payload(&runtime, &md, &p, &open_orders_snapshot);
             let mut s = runtime.snapshot.lock().unwrap();
             s.publish(&p, &r, &h, &*md, acct_payload, chain_build)
         };
@@ -743,13 +753,12 @@ fn build_chain_payload(
     _runtime: &Arc<Runtime>,
     md: &corsair_market_data::MarketDataState,
     portfolio: &corsair_position::PortfolioState,
+    open_orders: &[corsair_broker_api::OpenOrder],
 ) -> corsair_snapshot::ChainBuild {
-    use corsair_broker_api::Right;
+    use corsair_broker_api::{Right, Side};
     use corsair_snapshot::{ChainExpirySnapshot, SideBlockSnapshot, StrikeBlockSnapshot};
     use std::collections::HashMap;
     let mut chains: HashMap<String, HashMap<String, StrikeBlockSnapshot>> = HashMap::new();
-    // Use the portfolio we already hold (caller has the lock); avoids
-    // re-locking runtime.portfolio inside the publisher critical section.
     let products = portfolio.registry().products();
     let mut underlying_price = 0.0_f64;
     for prod in &products {
@@ -776,6 +785,24 @@ fn build_chain_payload(
                 })
                 .map(|p| p.quantity)
                 .unwrap_or(0);
+            // Look up our resting orders for this leg. Take the LAST
+            // (most recent) order on each side; cancel-before-replace
+            // means earlier ones for the same key are aging-out.
+            let mut our_bid: Option<f64> = None;
+            let mut our_ask: Option<f64> = None;
+            for o in open_orders.iter().filter(|o| {
+                o.contract.kind == corsair_broker_api::ContractKind::Option
+                    && o.contract.right == Some(opt.right)
+                    && o.contract.expiry == opt.expiry
+                    && (o.contract.strike.unwrap_or(0.0) - opt.strike).abs() < 1e-6
+            }) {
+                if let Some(p) = o.price {
+                    match o.side {
+                        Side::Buy => our_bid = Some(p),
+                        Side::Sell => our_ask = Some(p),
+                    }
+                }
+            }
             let side = SideBlockSnapshot {
                 market_bid: opt.bid,
                 market_ask: opt.ask,
@@ -783,6 +810,9 @@ fn build_chain_payload(
                 ask_size: opt.ask_size,
                 last: opt.last,
                 pos: pos_qty,
+                our_bid,
+                our_ask,
+                theo: None, // TODO: compute via vol_surface fitter
             };
             match opt.right {
                 Right::Call => strike_block.call = Some(side),

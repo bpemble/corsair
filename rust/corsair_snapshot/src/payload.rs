@@ -60,6 +60,18 @@ pub struct SideBlockSnapshot {
     pub last: f64,
     /// Position quantity (signed; long > 0, short < 0). 0 when none.
     pub pos: i32,
+    /// Our resting bid price (Some(p) if we have a working BUY order
+    /// for this leg). Read by the dashboard chain table to highlight
+    /// rows where we're quoting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub our_bid: Option<f64>,
+    /// Our resting ask price (Some(p) if we have a working SELL order
+    /// for this leg).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub our_ask: Option<f64>,
+    /// SVI/SABR theo price for this leg, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theo: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

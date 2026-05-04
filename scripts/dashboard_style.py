@@ -188,14 +188,7 @@ CUSTOM_CSS = f"""
 
     /* ── Chain Table ────────────────────────────────────── */
     .chain-scroll {{
-        /* min + max same so the container is a fixed height. Otherwise
-        the chain table re-renders at 4Hz with potentially varying row
-        counts (some strikes momentarily missing data → fewer rows
-        rendered) and the bottom of the page reflows visibly. Lock
-        the height so the surrounding layout never shifts. */
-        min-height: 820px;
         max-height: 820px;
-        height: 820px;
         overflow-y: auto;
         border: 1px solid {BG_CARD_BORDER};
         border-radius: 8px;
