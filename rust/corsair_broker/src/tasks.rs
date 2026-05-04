@@ -240,6 +240,16 @@ async fn pump_ticks(runtime: Arc<Runtime>) {
                             md.update_last(tick.instrument_id, p, tick.timestamp_ns);
                         }
                     }
+                    TickKind::OptionOpenInterest => {
+                        if let Some(s) = tick.size {
+                            md.update_open_interest(tick.instrument_id, s, tick.timestamp_ns);
+                        }
+                    }
+                    TickKind::OptionVolume => {
+                        if let Some(s) = tick.size {
+                            md.update_option_volume(tick.instrument_id, s, tick.timestamp_ns);
+                        }
+                    }
                     _ => {} // BidSize/AskSize/Volume — handled implicitly via update_bid/ask args
                 }
             }
@@ -773,7 +783,7 @@ fn now_ns() -> u64 {
 /// and current position. ATM strike picked relative to the underlying
 /// price; expiries sorted ascending; front_month_expiry is the first.
 fn build_chain_payload(
-    _runtime: &Arc<Runtime>,
+    runtime: &Arc<Runtime>,
     md: &corsair_market_data::MarketDataState,
     portfolio: &corsair_position::PortfolioState,
     open_orders: &[corsair_broker_api::OpenOrder],
@@ -784,6 +794,9 @@ fn build_chain_payload(
     let mut chains: HashMap<String, HashMap<String, StrikeBlockSnapshot>> = HashMap::new();
     let products = portfolio.registry().products();
     let mut underlying_price = 0.0_f64;
+    // Snapshot vol_surface cache once for theo computation. Keyed by
+    // (product, expiry_str). Empty when no fit has run yet.
+    let vol_cache = runtime.vol_surface_cache.lock().unwrap().clone();
     for prod in &products {
         if let Some(p) = corsair_position::MarketView::underlying_price(md, prod) {
             underlying_price = p;
@@ -791,11 +804,32 @@ fn build_chain_payload(
         for opt in md.options_for_product(prod) {
             let expiry_str = opt.expiry.format("%Y%m%d").to_string();
             let strike_str = format!("{:.4}", opt.strike);
-            let block = chains.entry(expiry_str).or_default();
+            let block = chains.entry(expiry_str.clone()).or_default();
             let strike_block = block.entry(strike_str).or_insert(StrikeBlockSnapshot {
                 call: None,
                 put: None,
             });
+            // Per-leg theo from cached SABR fit + Black76. None if no
+            // fit yet for this expiry, or if the fit math degenerates.
+            let theo: Option<f64> = vol_cache
+                .get(&(prod.clone(), expiry_str.clone()))
+                .and_then(|e| {
+                    let iv = corsair_pricing::sabr_implied_vol(
+                        e.forward, opt.strike, e.tte,
+                        e.alpha, e.beta, e.rho, e.nu,
+                    );
+                    if !iv.is_finite() || iv <= 0.0 {
+                        return None;
+                    }
+                    let right_char = match opt.right {
+                        Right::Call => 'C',
+                        Right::Put => 'P',
+                    };
+                    let p = corsair_pricing::black76_price_inner(
+                        e.forward, opt.strike, e.tte, iv, 0.0, right_char,
+                    );
+                    if p.is_finite() && p > 0.0 { Some(p) } else { None }
+                });
             // Position quantity for this leg (may be 0).
             let pos_qty: i32 = portfolio
                 .positions()
@@ -835,7 +869,9 @@ fn build_chain_payload(
                 pos: pos_qty,
                 our_bid,
                 our_ask,
-                theo: None, // TODO: compute via vol_surface fitter
+                theo,
+                open_interest: opt.open_interest,
+                volume: opt.volume,
             };
             match opt.right {
                 Right::Call => strike_block.call = Some(side),

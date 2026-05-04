@@ -98,6 +98,12 @@ pub struct SideBlockSnapshot {
     /// SVI/SABR theo price for this leg, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theo: Option<f64>,
+    /// Option open interest. Pushed by IBKR generic tick "101".
+    #[serde(default)]
+    pub open_interest: u64,
+    /// Option session volume. Pushed by IBKR generic tick "100".
+    #[serde(default)]
+    pub volume: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

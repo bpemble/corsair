@@ -39,7 +39,7 @@ fn black76_price(f: f64, k: f64, t: f64, sigma: f64, r: f64, right: &str) -> f64
 /// Inner Black-76 used by span/greeks modules — takes a char to skip
 /// the str-parse on every call. Identical numerics to black76_price.
 #[inline]
-pub(crate) fn black76_price_inner(f: f64, k: f64, t: f64, sigma: f64, r: f64, right: char) -> f64 {
+pub fn black76_price_inner(f: f64, k: f64, t: f64, sigma: f64, r: f64, right: char) -> f64 {
     let is_call = right == 'C' || right == 'c';
     if t <= 0.0 || sigma <= 0.0 || f <= 0.0 || k <= 0.0 {
         return if is_call {
@@ -199,7 +199,7 @@ fn svi_implied_vol(
 
 /// |F-K| < 1e-7 * F (matches the Python `eps = 1e-7` branch).
 #[pyfunction]
-pub(crate) fn sabr_implied_vol(
+pub fn sabr_implied_vol(
     f: f64, k: f64, t: f64,
     alpha: f64, beta: f64, rho: f64, nu: f64,
 ) -> f64 {

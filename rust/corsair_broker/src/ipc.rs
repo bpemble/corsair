@@ -538,16 +538,26 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
 
     // Push latency samples for the dashboard's TTT/RTT pill. Only on
     // successful acks — rejected orders skew the rolling window.
+    //
+    // Definitions (match the Python broker / industry convention):
+    //   TTT = trigger tick recv → broker SENDS place_order to IBKR
+    //         (purely our hot-path work: trader decide + IPC + broker
+    //         frame build + TCP write_all). Tens of µs in steady state.
+    //   RTT = broker sends → broker receives ack
+    //         (purely IBKR's network + processing). Tens of ms.
+    //
+    // TTT < RTT is the expected ordering: our internal compute is much
+    // faster than the network round-trip to IBKR. (An earlier version
+    // accidentally computed TTT = tick → ACK, which inverted the
+    // ordering by including the RTT inside the TTT measurement.)
     if matches!(result, Ok(_)) {
         let place_rtt_us = (broker_order_ack_marker_ns
             .saturating_sub(broker_order_send_marker_ns))
             / 1000;
-        // TTT = trigger tick → ack. Falls back to broker_order_recv if
-        // no triggering tick (boot orders, cancel-replace).
         let trigger_ns = cmd
             .triggering_tick_broker_recv_ns
             .unwrap_or(broker_order_recv_ns);
-        let ttt_us = (broker_order_ack_marker_ns.saturating_sub(trigger_ns)) / 1000;
+        let ttt_us = (broker_order_send_marker_ns.saturating_sub(trigger_ns)) / 1000;
         let mut s = runtime.latency_samples.lock().unwrap();
         s.push_ttt(ttt_us);
         s.push_place_rtt(place_rtt_us);

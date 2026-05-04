@@ -17,6 +17,15 @@ pub struct OptionTick {
     pub last: f64,
     /// Implied vol from brentq solve on mid; updated on bid/ask change.
     pub iv: f64,
+    /// Option open interest for this strike+right. Pushed by IBKR
+    /// generic tick "101" (tick types 27=call OI, 28=put OI). 0 if
+    /// not yet received.
+    #[serde(default)]
+    pub open_interest: u64,
+    /// Option session volume for this strike+right. Pushed by IBKR
+    /// generic tick "100" (tick types 29=call volume, 30=put volume).
+    #[serde(default)]
+    pub volume: u64,
     pub last_updated_ns: u64,
 }
 
@@ -33,6 +42,8 @@ impl OptionTick {
             ask_size: 0,
             last: 0.0,
             iv: 0.0,
+            open_interest: 0,
+            volume: 0,
             last_updated_ns: 0,
         }
     }

@@ -157,6 +157,28 @@ impl MarketDataState {
         }
     }
 
+    /// Update option open interest for the leg keyed by instrument id.
+    /// Pushed by IBKR's generic tick "101". No-op if not an option.
+    pub fn update_open_interest(&mut self, iid: InstrumentId, oi: u64, ts_ns: u64) {
+        if let Some(k) = self.by_instrument.get(&iid).cloned() {
+            if let Some(t) = self.options.get_mut(&k) {
+                t.open_interest = oi;
+                t.last_updated_ns = ts_ns;
+            }
+        }
+    }
+
+    /// Update option session volume. Pushed by IBKR's generic tick
+    /// "100". No-op if not an option.
+    pub fn update_option_volume(&mut self, iid: InstrumentId, vol: u64, ts_ns: u64) {
+        if let Some(k) = self.by_instrument.get(&iid).cloned() {
+            if let Some(t) = self.options.get_mut(&k) {
+                t.volume = vol;
+                t.last_updated_ns = ts_ns;
+            }
+        }
+    }
+
     /// Direct lookup for OptionTick.
     pub fn option(
         &self,

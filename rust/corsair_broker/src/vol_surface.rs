@@ -132,6 +132,20 @@ fn fit_and_publish(runtime: &Arc<Runtime>, server: &Arc<SHMServer>) {
             let fit = calibrate_sabr(forward, tte, &ks, &ivs, None, 0.5, 0.05);
             match fit {
                 Some(f) => {
+                    // Cache for build_chain_payload's per-leg theo
+                    // computation. Key by (product, expiry_str) so the
+                    // chain looks them up directly.
+                    runtime.vol_surface_cache.lock().unwrap().insert(
+                        (product.clone(), expiry_str.clone()),
+                        crate::runtime::VolSurfaceCacheEntry {
+                            forward,
+                            tte,
+                            alpha: f.alpha,
+                            beta: f.beta,
+                            rho: f.rho,
+                            nu: f.nu,
+                        },
+                    );
                     let ev = VolSurfaceEvent {
                         ty: "vol_surface",
                         expiry: expiry_str.clone(),

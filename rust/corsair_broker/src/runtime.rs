@@ -109,6 +109,21 @@ pub struct Runtime {
     /// Pushed on every successful place_order in `handle_place`;
     /// read by `periodic_snapshot` to compute p50/p99 every tick.
     pub latency_samples: Mutex<crate::latency::LatencySamples>,
+
+    /// Most recent SABR fit per (product, expiry_str). Populated by
+    /// the vol_surface fitter; consumed by build_chain_payload to
+    /// compute per-leg theo prices for the dashboard.
+    pub vol_surface_cache: Mutex<std::collections::HashMap<(String, String), VolSurfaceCacheEntry>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VolSurfaceCacheEntry {
+    pub forward: f64,
+    pub tte: f64,
+    pub alpha: f64,
+    pub beta: f64,
+    pub rho: f64,
+    pub nu: f64,
 }
 
 impl Runtime {
@@ -202,6 +217,7 @@ impl Runtime {
             snapshot: Mutex::new(snapshot),
             qualified_contracts: Mutex::new(std::collections::HashMap::new()),
             latency_samples: Mutex::new(crate::latency::LatencySamples::new()),
+            vol_surface_cache: Mutex::new(std::collections::HashMap::new()),
             account: Mutex::new(corsair_broker_api::AccountSnapshot {
                 net_liquidation: 0.0,
                 maintenance_margin: 0.0,

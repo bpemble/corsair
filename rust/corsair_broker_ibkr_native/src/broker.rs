@@ -536,6 +536,13 @@ impl NativeBroker {
                     0 => Some(TickKind::BidSize),
                     3 => Some(TickKind::AskSize),
                     8 => Some(TickKind::Volume),
+                    // Generic tick "101" → option open interest. The
+                    // tick_type split (27=call, 28=put) is informational
+                    // only — our subscription is per-leg so we already
+                    // know the right from the contract.
+                    27 | 28 => Some(TickKind::OptionOpenInterest),
+                    // Generic tick "100" → option session volume.
+                    29 | 30 => Some(TickKind::OptionVolume),
                     // Delayed-data size tick types.
                     69 => Some(TickKind::BidSize),
                     70 => Some(TickKind::AskSize),

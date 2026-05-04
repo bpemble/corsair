@@ -26,6 +26,14 @@ pub enum TickKind {
     AskSize,
     /// Cumulative session volume.
     Volume,
+    /// Option open interest. Only emitted for option subscriptions
+    /// that requested IBKR's generic tick "101" (tick types 27/28).
+    OptionOpenInterest,
+    /// Option session volume per right. Only emitted for option
+    /// subscriptions that requested IBKR's generic tick "100"
+    /// (tick types 29/30). Distinct from `Volume` (which is the
+    /// underlying / total contract volume).
+    OptionVolume,
 }
 
 /// A single market data update. Adapters MUST emit at least Bid+Ask+
