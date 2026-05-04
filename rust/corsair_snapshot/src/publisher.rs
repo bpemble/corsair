@@ -61,6 +61,7 @@ impl SnapshotPublisher {
         market: &dyn MarketView,
         account: AccountSnapshot,
         chain_build: ChainBuild,
+        latency: Option<crate::payload::LatencySnapshot>,
     ) -> Snapshot {
         let agg = portfolio.aggregate();
 
@@ -188,6 +189,7 @@ impl SnapshotPublisher {
             atm_strike: chain_build.atm_strike,
             expiries: chain_build.expiries,
             front_month_expiry: chain_build.front_month_expiry,
+            latency,
         }
     }
 
@@ -203,8 +205,9 @@ impl SnapshotPublisher {
         market: &dyn MarketView,
         account: AccountSnapshot,
         chain_build: ChainBuild,
+        latency: Option<crate::payload::LatencySnapshot>,
     ) -> std::io::Result<()> {
-        let snap = self.build(portfolio, risk, hedge, market, account, chain_build);
+        let snap = self.build(portfolio, risk, hedge, market, account, chain_build, latency);
         let json = serde_json::to_vec_pretty(&snap)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         atomic_write(&self.cfg.snapshot_path, &json)?;
@@ -285,7 +288,7 @@ mod tests {
         let pub_ = SnapshotPublisher::new(SnapshotConfig {
             snapshot_path: "/tmp/_snap_test.json".into(),
         });
-        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default());
+        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default(), None);
         assert_eq!(snap.schema_version, SCHEMA_VERSION);
         assert!(!snap.kill.killed);
         assert_eq!(snap.portfolio.gross_positions, 0);
@@ -301,7 +304,7 @@ mod tests {
         let p = portfolio_empty();
         let r = risk_healthy();
         let h = fanout_empty();
-        pub_.publish(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default())
+        pub_.publish(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default(), None)
             .expect("publish");
         assert!(path.exists());
         let bytes = std::fs::read(&path).unwrap();
@@ -321,7 +324,7 @@ mod tests {
         let r = risk_healthy();
         let h = fanout_empty();
         for _ in 0..3 {
-            pub_.publish(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default())
+            pub_.publish(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default(), None)
                 .expect("publish");
         }
         assert_eq!(pub_.write_count(), 3);
@@ -340,7 +343,7 @@ mod tests {
         let pub_ = SnapshotPublisher::new(SnapshotConfig {
             snapshot_path: "/tmp/_killed_test.json".into(),
         });
-        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default());
+        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default(), None);
         assert!(snap.kill.killed);
         assert_eq!(snap.kill.source.as_deref(), Some("daily_halt"));
     }
@@ -366,7 +369,7 @@ mod tests {
         let pub_ = SnapshotPublisher::new(SnapshotConfig {
             snapshot_path: "/tmp/_hedge_snap_test.json".into(),
         });
-        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default());
+        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default(), None);
         assert_eq!(snap.hedges.len(), 1);
         assert_eq!(snap.hedges[0].product, "HG");
         assert_eq!(snap.hedges[0].mode, "execute");

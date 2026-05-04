@@ -648,6 +648,29 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
             let b = runtime.broker.lock().await;
             b.open_orders().await.unwrap_or_default()
         };
+        // Pull latency stats from the rolling sample buffer.
+        let latency_snapshot = {
+            let s = runtime.latency_samples.lock().unwrap();
+            let (ttt_n, ttt_p50, ttt_p99) = s.ttt_stats();
+            let (rtt_n, rtt_p50, rtt_p99) = s.place_rtt_stats();
+            if ttt_n > 0 || rtt_n > 0 {
+                Some(corsair_snapshot::payload::LatencySnapshot {
+                    ttt_us: corsair_snapshot::payload::LatencyStats {
+                        n: ttt_n,
+                        p50: ttt_p50,
+                        p99: ttt_p99,
+                    },
+                    place_rtt_us: corsair_snapshot::payload::LatencyStats {
+                        n: rtt_n,
+                        p50: rtt_p50,
+                        p99: rtt_p99,
+                    },
+                    amend_us: corsair_snapshot::payload::LatencyStats::default(),
+                })
+            } else {
+                None
+            }
+        };
         let result = {
             let p = runtime.portfolio.lock().unwrap();
             let r = runtime.risk.lock().unwrap();
@@ -655,7 +678,7 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
             let md = runtime.market_data.lock().unwrap();
             let chain_build = build_chain_payload(&runtime, &md, &p, &open_orders_snapshot);
             let mut s = runtime.snapshot.lock().unwrap();
-            s.publish(&p, &r, &h, &*md, acct_payload, chain_build)
+            s.publish(&p, &r, &h, &*md, acct_payload, chain_build, latency_snapshot)
         };
         if let Err(e) = result {
             log::warn!("snapshot publish failed: {e}");

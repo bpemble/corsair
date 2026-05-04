@@ -33,6 +33,32 @@ pub struct Snapshot {
     /// Default expiry shown when dashboard first loads.
     #[serde(default)]
     pub front_month_expiry: Option<String>,
+    /// Latency stats: rolling p50/p99 for TTT (tick→place_order ack)
+    /// and place_rtt (broker→IBKR→broker). Surfaced to dashboard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<LatencySnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LatencySnapshot {
+    /// Tick→trader_decide→place_order_ack (microseconds).
+    /// Captures the entire client-side hot path.
+    pub ttt_us: LatencyStats,
+    /// Broker→IBKR→broker round-trip on place_order (microseconds).
+    pub place_rtt_us: LatencyStats,
+    /// Broker→IBKR→broker round-trip on modify (microseconds). Will
+    /// be empty in trader-driven mode (trader cancels+replaces rather
+    /// than modifies); kept for legacy dashboard pill compatibility.
+    pub amend_us: LatencyStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LatencyStats {
+    pub n: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p50: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p99: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

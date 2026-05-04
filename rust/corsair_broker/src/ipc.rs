@@ -536,6 +536,23 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
     });
     runtime.wire_timing.write(row);
 
+    // Push latency samples for the dashboard's TTT/RTT pill. Only on
+    // successful acks — rejected orders skew the rolling window.
+    if matches!(result, Ok(_)) {
+        let place_rtt_us = (broker_order_ack_marker_ns
+            .saturating_sub(broker_order_send_marker_ns))
+            / 1000;
+        // TTT = trigger tick → ack. Falls back to broker_order_recv if
+        // no triggering tick (boot orders, cancel-replace).
+        let trigger_ns = cmd
+            .triggering_tick_broker_recv_ns
+            .unwrap_or(broker_order_recv_ns);
+        let ttt_us = (broker_order_ack_marker_ns.saturating_sub(trigger_ns)) / 1000;
+        let mut s = runtime.latency_samples.lock().unwrap();
+        s.push_ttt(ttt_us);
+        s.push_place_rtt(place_rtt_us);
+    }
+
     match result {
         Ok(oid) => log::info!(
             "ipc place_order placed: oid={} for ref='{}'",

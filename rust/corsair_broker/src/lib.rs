@@ -44,6 +44,7 @@
 pub mod config;
 pub mod ipc;
 pub mod jsonl;
+pub mod latency;
 pub mod runtime;
 pub mod subscriptions;
 pub mod tasks;

@@ -104,6 +104,11 @@ pub struct Runtime {
     /// (logs-paper/wire_timing-YYYY-MM-DD.jsonl). One row per
     /// place_order outcome with the five broker-edge timestamps.
     pub wire_timing: crate::jsonl::JsonlWriter,
+
+    /// Rolling-window samples for the dashboard's TTT/RTT pill.
+    /// Pushed on every successful place_order in `handle_place`;
+    /// read by `periodic_snapshot` to compute p50/p99 every tick.
+    pub latency_samples: Mutex<crate::latency::LatencySamples>,
 }
 
 impl Runtime {
@@ -196,6 +201,7 @@ impl Runtime {
             market_data: Mutex::new(market_data),
             snapshot: Mutex::new(snapshot),
             qualified_contracts: Mutex::new(std::collections::HashMap::new()),
+            latency_samples: Mutex::new(crate::latency::LatencySamples::new()),
             account: Mutex::new(corsair_broker_api::AccountSnapshot {
                 net_liquidation: 0.0,
                 maintenance_margin: 0.0,

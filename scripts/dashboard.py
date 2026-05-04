@@ -250,9 +250,16 @@ snapshot = load_snapshot(_active_snap_path)
 # ---------------------------------------------------------------------------
 
 if snapshot is not None:
+    # The Rust broker writes `timestamp_ns` (u64 nanos since epoch);
+    # the legacy Python broker wrote `timestamp` ISO strings. Accept
+    # either so the live/stale/offline pill works in both eras.
+    ts_ns = snapshot.get("timestamp_ns")
     ts = snapshot.get("timestamp", "")
     try:
-        snap_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if ts_ns:
+            snap_time = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
+        else:
+            snap_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         age = (datetime.now(timezone.utc) - snap_time).total_seconds()
         if age < 10:
             status_class = "live"
