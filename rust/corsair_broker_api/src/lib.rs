@@ -117,6 +117,17 @@ pub trait Broker: Send + Sync + 'static {
     /// `hedge_manager.py:_place_or_log` (execute branch).
     async fn place_order(&self, req: PlaceOrderReq) -> Result<OrderId>;
 
+    /// v2 wire-timing — drain the per-orderId precise broker
+    /// timestamps captured inside `place_order` (just before TCP send)
+    /// and the dispatcher (on OpenOrder/OrderStatus ack). Returns
+    /// `(send_ns, ack_ns)` if both were captured. Adapters that don't
+    /// instrument this return None (default impl); NativeBroker
+    /// overrides. Removes ~30 µs of place_order setup overhead from
+    /// the wire_timing histogram vs the call-boundary "marker" times.
+    fn drain_wire_timing(&self, _order_id: u64) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Cancel an existing order. Returns Ok(()) on successful submission
     /// of the cancel; the order may still fill before the cancel is
     /// processed.

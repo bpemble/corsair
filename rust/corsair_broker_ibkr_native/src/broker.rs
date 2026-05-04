@@ -101,6 +101,15 @@ struct BrokerState {
     /// (P0-4 + CLAUDE.md §14 hedge_qty trust concern).
     pending_place_acks: HashMap<i32, oneshot::Sender<Result<(), BrokerError>>>,
 
+    /// v2 wire-timing — broker-internal precise timestamps per orderId.
+    /// `place_order` populates `send_ns` immediately before client.send_raw;
+    /// the dispatcher (route) populates `ack_ns` on OpenOrder/OrderStatus
+    /// removal of pending_place_acks. handle_place reads + drains after
+    /// place_order returns. Replaces the call-boundary "marker" timestamps
+    /// that included ~30 µs of place_order setup overhead.
+    pub wire_send_ns: HashMap<i32, u64>,
+    pub wire_ack_ns: HashMap<i32, u64>,
+
     /// Cached place_order contract templates keyed by InstrumentId.
     /// Avoids re-encoding the 14 contract-fixed fields on every
     /// place_order. See `place_template::ContractTemplate`. Volume
@@ -182,7 +191,7 @@ pub struct NativeBroker {
     next_req_id: Arc<AtomicI32>,
     next_handle: Arc<AtomicI32>,
     connected: Arc<AtomicBool>,
-    rx_holder: Mutex<Option<mpsc::Receiver<Vec<String>>>>,
+    rx_holder: Mutex<Option<mpsc::Receiver<(Vec<String>, u64)>>>,
     /// Optional fast-path tick publisher. When set, the dispatcher
     /// writes tick events directly to the underlying SHM ring AS WELL
     /// AS broadcasting on the in-process channel. corsair_broker
@@ -282,13 +291,17 @@ impl NativeBroker {
         }
     }
 
-    fn spawn_dispatcher(&self, mut rx: mpsc::Receiver<Vec<String>>) {
+    fn spawn_dispatcher(&self, mut rx: mpsc::Receiver<(Vec<String>, u64)>) {
         let state = Arc::clone(&self.state);
         let channels = self.channels.clone();
         let connected = Arc::clone(&self.connected);
         let tick_publisher_arc = Arc::clone(&self.tick_publisher);
         tokio::spawn(async move {
-            while let Some(fields) = rx.recv().await {
+            while let Some((fields, recv_ns)) = rx.recv().await {
+                // v2 wire-timing — recv_ns now comes from the recv
+                // task's SCM_TIMESTAMPNS cmsg (kernel RX ingress on
+                // the gateway socket). Falls back to user-space
+                // now_ns() if SO_TIMESTAMPNS wasn't enabled.
                 let parsed = match crate::parse_inbound(&fields) {
                     Ok(p) => p,
                     Err(e) => {
@@ -300,7 +313,7 @@ impl NativeBroker {
                 // None until `set_tick_publisher` is called by the
                 // corsair_broker daemon during boot.
                 let tp = tick_publisher_arc.lock().clone();
-                Self::route(&state, &channels, parsed, tp.as_deref());
+                Self::route(&state, &channels, parsed, tp.as_deref(), recv_ns);
             }
             connected.store(false, Ordering::SeqCst);
             let _ = channels.connection.send(ConnectionEvent {
@@ -314,11 +327,19 @@ impl NativeBroker {
     /// Route a single parsed inbound message. Sync (parking_lot
     /// state, no awaits inside). The dispatcher task awaits the
     /// recv channel; route itself is straight-line.
+    ///
+    /// `recv_ns` is the broker-edge wall-clock at the moment the
+    /// frame was pulled from the recv channel — the closest broker-
+    /// internal proxy for "this tick arrived on the wire" (within
+    /// ~5 µs of TCP recv). Used to stamp Tick.timestamp_ns for
+    /// downstream consumers; the v2 wire_timing JSONL pulls it from
+    /// there via TickEvent.broker_recv_ns.
     fn route(
         state: &Arc<PMutex<BrokerState>>,
         channels: &BrokerChannels,
         msg: InboundMsg,
         tick_publisher: Option<&(dyn Fn(&Tick) + Send + Sync)>,
+        recv_ns: u64,
     ) {
         match msg {
             InboundMsg::Position(p) => {
@@ -360,6 +381,10 @@ impl NativeBroker {
                     if let Some(open) = parsed {
                         s.open_orders.insert(order_id, open);
                     }
+                    // v2 wire-timing — first ack signal, stamp the
+                    // moment we observe it. OrderStatus may also
+                    // arrive; whichever lands first sets ack_ns.
+                    s.wire_ack_ns.entry(order_id).or_insert_with(now_ns);
                     s.pending_place_acks.remove(&order_id)
                 };
                 if let Some(tx) = ack {
@@ -391,6 +416,9 @@ impl NativeBroker {
                         open.status = parsed_status;
                         open.filled_qty = o.filled as u32;
                     }
+                    // v2 wire-timing — first ack signal lands here
+                    // when OrderStatus precedes OpenOrder.
+                    s.wire_ack_ns.entry(o.order_id).or_insert_with(now_ns);
                     s.pending_place_acks.remove(&o.order_id)
                 } else {
                     let mut s = state.lock();
@@ -471,6 +499,13 @@ impl NativeBroker {
                     1 => Some(TickKind::Bid),
                     2 => Some(TickKind::Ask),
                     4 => Some(TickKind::Last),
+                    // Delayed-data tick types — IBKR sends these instead
+                    // of live (1/2/4) when account entitlements lack
+                    // real-time market data. Paper accounts typically
+                    // have delayed-only for some products.
+                    66 => Some(TickKind::Bid),
+                    67 => Some(TickKind::Ask),
+                    68 => Some(TickKind::Last),
                     _ => None,
                 };
                 if let Some(kind) = kind {
@@ -481,7 +516,8 @@ impl NativeBroker {
                             kind,
                             price: Some(t.price),
                             size: None,
-                            timestamp_ns: now_ns(),
+                            // v2 wire-timing — channel-recv time, not now().
+                            timestamp_ns: recv_ns,
                         };
                         // Fast path: write directly to SHM via the
                         // tick publisher closure. Bypasses the
@@ -500,6 +536,10 @@ impl NativeBroker {
                     0 => Some(TickKind::BidSize),
                     3 => Some(TickKind::AskSize),
                     8 => Some(TickKind::Volume),
+                    // Delayed-data size tick types.
+                    69 => Some(TickKind::BidSize),
+                    70 => Some(TickKind::AskSize),
+                    71 => Some(TickKind::Volume),
                     _ => None,
                 };
                 if let Some(kind) = kind {
@@ -510,7 +550,8 @@ impl NativeBroker {
                             kind,
                             price: None,
                             size: Some(t.size as u64),
-                            timestamp_ns: now_ns(),
+                            // v2 wire-timing — channel-recv time, not now().
+                            timestamp_ns: recv_ns,
                         };
                         if let Some(publish) = tick_publisher {
                             publish(&tick);
@@ -618,8 +659,16 @@ fn error_to_broker_error(e: &ErrorMsg) -> BrokerError {
 }
 
 fn native_to_contract(cd: &ContractDetailsMsg) -> Option<Contract> {
-    let expiry = NaiveDate::parse_from_str(&cd.contract.last_trade_date, "%Y%m%d")
-        .or_else(|_| NaiveDate::parse_from_str(&cd.contract.last_trade_date, "%Y%m"))
+    // IBKR's `lastTradeDateOrContractMonth` is sent as e.g.
+    // "20260527 13:00:00 US/Eastern" — full datetime+tz. Strip the
+    // tz/time suffix before parsing. Plain YYYYMMDD also lands here
+    // (some products) — split-on-space leaves it untouched.
+    let date_str = cd.contract.last_trade_date
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    let expiry = NaiveDate::parse_from_str(date_str, "%Y%m%d")
+        .or_else(|_| NaiveDate::parse_from_str(date_str, "%Y%m"))
         .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
     Some(Contract {
         instrument_id: InstrumentId(cd.contract.con_id as u64),
@@ -640,13 +689,19 @@ fn native_to_contract(cd: &ContractDetailsMsg) -> Option<Contract> {
 }
 
 fn native_to_position(p: &PositionMsg) -> Option<Position> {
+    // Same datetime+tz suffix possibility as native_to_contract.
+    let date_str = p.contract.last_trade_date
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
     Some(Position {
         contract: Contract {
             instrument_id: InstrumentId(p.contract.con_id as u64),
             kind: parse_kind(&p.contract.sec_type)?,
             symbol: p.contract.symbol.clone(),
             local_symbol: p.contract.local_symbol.clone(),
-            expiry: NaiveDate::parse_from_str(&p.contract.last_trade_date, "%Y%m%d")
+            expiry: NaiveDate::parse_from_str(date_str, "%Y%m%d")
+                .or_else(|_| NaiveDate::parse_from_str(date_str, "%Y%m"))
                 .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
             strike: if p.contract.strike > 0.0 {
                 Some(p.contract.strike)
@@ -889,6 +944,36 @@ fn build_place_params(
     })
 }
 
+/// Build a ContractRequest from the broker_api Contract for use in
+/// reqMktData/reqContractDetails. The opposite of native_to_contract.
+fn contract_to_request(c: &corsair_broker_api::Contract) -> ContractRequest {
+    let sec_type = match c.kind {
+        ContractKind::Future => "FUT",
+        ContractKind::Option => "FOP",
+    };
+    ContractRequest {
+        con_id: c.instrument_id.0 as i64,
+        symbol: c.symbol.clone(),
+        sec_type: sec_type.into(),
+        last_trade_date: c.expiry.format("%Y%m%d").to_string(),
+        strike: c.strike.unwrap_or(0.0),
+        right: c.right.map(|r| match r {
+            corsair_broker_api::Right::Call => "C",
+            corsair_broker_api::Right::Put => "P",
+        }).unwrap_or("").into(),
+        multiplier: if c.multiplier > 0.0 {
+            format!("{}", c.multiplier as u64)
+        } else {
+            String::new()
+        },
+        exchange: exchange_to_str(c.exchange).into(),
+        primary_exchange: String::new(),
+        currency: currency_to_str(c.currency).into(),
+        local_symbol: c.local_symbol.clone(),
+        trading_class: String::new(),
+    }
+}
+
 fn empty_contract_request(symbol: &str, sec_type: &str) -> ContractRequest {
     ContractRequest {
         con_id: 0,
@@ -929,15 +1014,33 @@ impl Broker for NativeBroker {
             .ok_or_else(|| BrokerError::Internal("rx already taken".into()))?;
         self.spawn_dispatcher(rx);
 
-        for frame in [
+        // CLAUDE.md §1: when clientId=0 (FA master client mode),
+        // call reqAutoOpenOrders(True) so IBKR forwards OpenOrder /
+        // OrderStatus / execDetails for orders placed by ANY client
+        // on the connection. Without this, place_order goes out and
+        // IBKR processes it but never sends back the OpenOrder /
+        // OrderStatus, causing every place to time out at 2s with
+        // `place_order ack timeout`. Sent AFTER wait_for_bootstrap
+        // so we don't race the gateway's startup pipeline (per §5
+        // historical note: pre-bootstrap reqs cause silent disconnects).
+        let mut bootstrap_frames: Vec<Vec<u8>> = vec![
             req_account_updates(true, &self.cfg.account),
             req_positions(),
             req_open_orders(),
-        ] {
+        ];
+        if self.cfg.client.client_id == 0 {
+            bootstrap_frames.push(crate::requests::req_auto_open_orders(true));
+        }
+        for frame in bootstrap_frames {
             self.client
                 .send_raw(&frame)
                 .await
                 .map_err(Self::map_native_err)?;
+        }
+        if self.cfg.client.client_id == 0 {
+            log::warn!(
+                "broker: reqAutoOpenOrders(true) sent (clientId=0 master mode)"
+            );
         }
 
         self.connected.store(true, Ordering::SeqCst);
@@ -1027,9 +1130,17 @@ impl Broker for NativeBroker {
                 });
             crate::place_template::place_order_fast(order_id, template, &params)
         };
+        // v2 wire-timing — stamp send_ns immediately before the TCP
+        // write. Pairs with ack_ns set in route() on OpenOrder/OrderStatus.
+        {
+            let mut s = self.state.lock();
+            s.wire_send_ns.insert(order_id, now_ns());
+        }
         if let Err(e) = self.client.send_raw(&frame).await {
             // Send failed; clean up waiter.
-            self.state.lock().pending_place_acks.remove(&order_id);
+            let mut s = self.state.lock();
+            s.pending_place_acks.remove(&order_id);
+            s.wire_send_ns.remove(&order_id);
             return Err(Self::map_native_err(e));
         }
 
@@ -1066,6 +1177,18 @@ impl Broker for NativeBroker {
             .send_raw(&frame)
             .await
             .map_err(Self::map_native_err)
+    }
+
+    /// v2 wire-timing — drain the (send_ns, ack_ns) pair captured
+    /// inside place_order + the dispatcher. Returns None if either
+    /// is missing (uncommon — would mean place_order never reached
+    /// send_raw, or ack hasn't arrived yet). Removes the entries
+    /// from state so the maps don't grow unbounded.
+    fn drain_wire_timing(&self, order_id: u64) -> Option<(u64, u64)> {
+        let mut s = self.state.lock();
+        let send = s.wire_send_ns.remove(&(order_id as i32))?;
+        let ack = s.wire_ack_ns.remove(&(order_id as i32))?;
+        Some((send, ack))
     }
 
     // modify_order continues to use the slow encoder; modify is a
@@ -1243,14 +1366,22 @@ impl Broker for NativeBroker {
         }
         let mut cr = empty_contract_request(&q.symbol, "FOP");
         cr.last_trade_date = q.expiry.format("%Y%m%d").to_string();
-        cr.strike = q.strike;
+        // Round strike to 4 decimals to scrub IEEE-754 accumulation
+        // (e.g. 0.05 + 0.05 + ... = 5.8500000000000005). IBKR's contract
+        // DB matches on exact decimal strikes; ryu serializes the noisy
+        // float verbatim → "No security definition has been found".
+        cr.strike = (q.strike * 10_000.0).round() / 10_000.0;
         cr.right = match q.right {
             Right::Call => "C".into(),
             Right::Put => "P".into(),
         };
-        cr.multiplier = format!("{}", q.multiplier as i64);
+        // Per IBKR FOP convention, omit multiplier when tradingClass is
+        // specified — server infers from class. Including both can
+        // trigger "No security definition" if our value (e.g. "25000")
+        // disagrees with their canonical store.
         cr.exchange = exchange_to_str(q.exchange).into();
         cr.currency = currency_to_str(q.currency).into();
+        cr.trading_class = q.symbol.clone();
 
         self.client
             .send_raw(&req_contract_details(req_id, &cr))
@@ -1304,7 +1435,13 @@ impl Broker for NativeBroker {
             .await
             .map_err(Self::map_native_err)?;
 
-        match tokio::time::timeout(Duration::from_secs(15), rx).await {
+        // 60s timeout (was 15s). IBKR's contract details endpoint is
+        // slower than the live feed, especially during weekend / pre-
+        // open windows when the contract DB hasn't warmed up. 15s was
+        // too short — repeatedly timed out on Sun reopen 2026-05-03.
+        // 60s gives more headroom; on success the call returns within
+        // 1-5s, so this is purely a tail-latency budget.
+        match tokio::time::timeout(Duration::from_secs(60), rx).await {
             Ok(Ok(Ok(mut contracts))) => {
                 if let Some(min_expiry) = q.min_expiry {
                     contracts.retain(|c| c.expiry >= min_expiry);
@@ -1329,11 +1466,16 @@ impl Broker for NativeBroker {
             s.tick_routes.insert(req_id, sub.instrument_id);
             s.handle_to_req_id.insert(handle, req_id);
         }
-        // Phase 6.6: subscribe by conId only. The native client encodes
-        // the contract via reqMktData which expects the full contract
-        // descriptor — for round-trip subscription you must qualify first
-        // so the InstrumentId is a real conId.
-        let mut cr = empty_contract_request("", "");
+        // Build the full contract descriptor. IBKR rejects reqMktData
+        // for futures/options if exchange is missing (`Error validating
+        // request: Please enter exchange`). Caller passes the Contract
+        // we resolved via list_chain so we have the canonical exchange.
+        let mut cr = match &sub.contract {
+            Some(c) => contract_to_request(c),
+            None => empty_contract_request("", ""),
+        };
+        // con_id always comes from the subscription's instrument_id —
+        // authoritative even when the caller passed a stale Contract.
         cr.con_id = sub.instrument_id.0 as i64;
         let frame = req_mkt_data(req_id, &cr, "", false, false);
         self.client

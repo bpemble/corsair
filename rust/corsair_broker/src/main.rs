@@ -21,13 +21,41 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/app/config/runtime.yaml"))
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Init logging first so build_pinner's startup log lands.
+    // (RUST_LOG dominates; runtime config-driven log level is
+    // applied in async_main once the config is loaded.)
+    init_logger("info");
+
+    // Build a multi-thread tokio runtime with worker threads pinned
+    // to specific CPUs. Pinning is honored within the container's
+    // cpuset (sched_getaffinity), so docker compose `cpuset:` carries
+    // through automatically. Default 4 workers; clamps to allowed
+    // CPU count on smaller hosts (4-core dev VPS gets 4 workers,
+    // 12-core bare-metal where broker has cpuset 2,3,8,9 also gets 4).
+    // CORSAIR_BROKER_WORKERS env var overrides if set.
+    let desired = std::env::var("CORSAIR_BROKER_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4);
+    let (workers, pinner) =
+        corsair_ipc::cpu_affinity::build_pinner("corsair_broker", desired);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .on_thread_start(pinner)
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = config_path();
     let cfg = BrokerDaemonConfig::load(&cfg_path)
         .map_err(|e| format!("config load {}: {}", cfg_path.display(), e))?;
 
-    init_logger(&cfg.runtime.log_level);
+    // Logger already initialized in main() before runtime build so
+    // build_pinner's WARN logs appear; config-driven log level is
+    // a future enhancement (would need log::set_max_level dynamic).
 
     log::warn!(
         "corsair_broker {} starting (config={})",

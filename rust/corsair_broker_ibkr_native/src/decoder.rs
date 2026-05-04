@@ -41,6 +41,11 @@ pub fn parse_inbound(fields: &[String]) -> Result<InboundMsg, NativeError> {
             Ok(InboundMsg::NextValidId(oid))
         }
         IN_CONTRACT_DATA => parse_contract_details(fields),
+        IN_CONTRACT_DATA_END => {
+            // [52, version=1, reqId]
+            let req_id = parse_int(fields.get(2).map(|s| s.as_str()).unwrap_or("0"))?;
+            Ok(InboundMsg::ContractDetailsEnd(req_id))
+        }
         IN_EXECUTION_DATA => parse_execution(fields),
         IN_MANAGED_ACCTS => {
             // [15, 1, "DFP...,DUP...,..."]

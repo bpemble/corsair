@@ -93,6 +93,14 @@ impl MarketDataState {
             .insert(instrument_id, product.to_string());
     }
 
+    /// Reverse lookup: which product (if any) does this instrument
+    /// represent the underlying of? Used by the broker's tick fast-path
+    /// to fork underlying ticks into a separate "underlying_tick"
+    /// event for the trader.
+    pub fn product_for_underlying(&self, iid: InstrumentId) -> Option<String> {
+        self.underlying_instruments.get(&iid).cloned()
+    }
+
     pub fn underlying_price(&self, product: &str) -> Option<f64> {
         self.underlying.get(product).copied().filter(|&p| p > 0.0)
     }

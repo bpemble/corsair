@@ -55,6 +55,12 @@ pub struct TickSubscription {
     /// Optional subscription tag for the consumer's own tracking.
     /// Round-tripped on the handle but not interpreted by the adapter.
     pub consumer_tag: Option<String>,
+    /// IBKR-specific: full contract descriptor for the reqMktData
+    /// request. Required for futures/options where IBKR rejects
+    /// con_id-only subscriptions with `Error validating request: Please
+    /// enter exchange`. Stocks/SMART-routed instruments can leave None.
+    /// Adapters that key purely on instrument_id (mock, FIX) ignore.
+    pub contract: Option<crate::Contract>,
 }
 
 /// Opaque handle returned by `subscribe_ticks`. Consumers pass this

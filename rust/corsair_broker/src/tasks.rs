@@ -303,8 +303,13 @@ async fn pump_connection(runtime: Arc<Runtime>) {
 // ─── Periodic tasks ──────────────────────────────────────────────
 
 async fn periodic_greek_refresh(runtime: Arc<Runtime>) {
-    let mut t = interval(Duration::from_secs(300)); // 5 min
-    log::info!("periodic_greek_refresh: cadence 300s");
+    // Was 300s — way too slow for the dashboard's mark column.
+    // refresh_greeks updates Position.current_price from market_data
+    // (mid price), which the snapshot writer reads at 250ms cadence.
+    // 5s gives the dashboard near-live position marks at negligible
+    // CPU cost (the loop is just a hashmap lookup per position).
+    let mut t = interval(Duration::from_secs(5));
+    log::info!("periodic_greek_refresh: cadence 5s");
     loop {
         t.tick().await;
         let mut p = runtime.portfolio.lock().unwrap();
@@ -638,8 +643,9 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
             let r = runtime.risk.lock().unwrap();
             let h = runtime.hedge.lock().unwrap();
             let md = runtime.market_data.lock().unwrap();
+            let chain_build = build_chain_payload(&runtime, &md, &p);
             let mut s = runtime.snapshot.lock().unwrap();
-            s.publish(&p, &r, &h, &*md, acct_payload)
+            s.publish(&p, &r, &h, &*md, acct_payload, chain_build)
         };
         if let Err(e) = result {
             log::warn!("snapshot publish failed: {e}");
@@ -727,6 +733,84 @@ fn now_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// Build the chain payload for the snapshot from market_data state +
+/// portfolio. Per-expiry blocks of strikes, with call/put market quotes
+/// and current position. ATM strike picked relative to the underlying
+/// price; expiries sorted ascending; front_month_expiry is the first.
+fn build_chain_payload(
+    _runtime: &Arc<Runtime>,
+    md: &corsair_market_data::MarketDataState,
+    portfolio: &corsair_position::PortfolioState,
+) -> corsair_snapshot::ChainBuild {
+    use corsair_broker_api::Right;
+    use corsair_snapshot::{ChainExpirySnapshot, SideBlockSnapshot, StrikeBlockSnapshot};
+    use std::collections::HashMap;
+    let mut chains: HashMap<String, HashMap<String, StrikeBlockSnapshot>> = HashMap::new();
+    // Use the portfolio we already hold (caller has the lock); avoids
+    // re-locking runtime.portfolio inside the publisher critical section.
+    let products = portfolio.registry().products();
+    let mut underlying_price = 0.0_f64;
+    for prod in &products {
+        if let Some(p) = corsair_position::MarketView::underlying_price(md, prod) {
+            underlying_price = p;
+        }
+        for opt in md.options_for_product(prod) {
+            let expiry_str = opt.expiry.format("%Y%m%d").to_string();
+            let strike_str = format!("{:.4}", opt.strike);
+            let block = chains.entry(expiry_str).or_default();
+            let strike_block = block.entry(strike_str).or_insert(StrikeBlockSnapshot {
+                call: None,
+                put: None,
+            });
+            // Position quantity for this leg (may be 0).
+            let pos_qty: i32 = portfolio
+                .positions()
+                .iter()
+                .find(|p| {
+                    p.product == *prod
+                        && (p.strike - opt.strike).abs() < 1e-6
+                        && p.expiry == opt.expiry
+                        && p.right == opt.right
+                })
+                .map(|p| p.quantity)
+                .unwrap_or(0);
+            let side = SideBlockSnapshot {
+                market_bid: opt.bid,
+                market_ask: opt.ask,
+                bid_size: opt.bid_size,
+                ask_size: opt.ask_size,
+                last: opt.last,
+                pos: pos_qty,
+            };
+            match opt.right {
+                Right::Call => strike_block.call = Some(side),
+                Right::Put => strike_block.put = Some(side),
+            }
+        }
+    }
+    // Convert nested map to ChainExpirySnapshot.
+    let chains_typed: HashMap<String, ChainExpirySnapshot> = chains
+        .into_iter()
+        .map(|(exp, strikes)| (exp, ChainExpirySnapshot { strikes }))
+        .collect();
+    let mut expiries: Vec<String> = chains_typed.keys().cloned().collect();
+    expiries.sort();
+    let front_month_expiry = expiries.first().cloned();
+    // ATM strike: round underlying_price to nearest 0.05 (HG grid).
+    // Could be product-aware in future; HG-only for now.
+    let atm_strike = if underlying_price > 0.0 {
+        (underlying_price * 20.0).round() / 20.0
+    } else {
+        0.0
+    };
+    corsair_snapshot::ChainBuild {
+        chains: chains_typed,
+        atm_strike,
+        expiries,
+        front_month_expiry,
+    }
 }
 
 /// Compute raw synthetic SPAN margin for the current portfolio.

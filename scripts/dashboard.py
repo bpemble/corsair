@@ -110,6 +110,98 @@ if _HAS_AUTOREFRESH:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_snapshot(snap, path):
+    """Bridge Rust broker (Phase 6.7+) schema → legacy dashboard expectations.
+
+    The Rust snapshot publisher (rust/corsair_snapshot/src/payload.rs) emits
+    different field names and shapes than the v2 Python broker. Rather than
+    touch every render call site, normalize once at load time."""
+    if not snap:
+        return snap
+
+    # Account: Rust emits net_liquidation / maintenance_margin /
+    # realized_pnl_today; legacy dashboard reads net_liq / maint_margin /
+    # realized_pnl. Rust broker doesn't emit cash / account_id /
+    # unrealized_pnl / daily_pnl_nlv; derive from what we have so the
+    # dashboard cells render with real values instead of $0.
+    acct = snap.get("account") or {}
+    port = snap.get("portfolio") or {}
+    nlv = acct.get("net_liquidation", 0.0)
+    maint = acct.get("maintenance_margin", 0.0)
+    bp = acct.get("buying_power", 0.0)
+    acct.setdefault("net_liq", nlv)
+    acct.setdefault("maint_margin", maint)
+    acct.setdefault("realized_pnl", acct.get("realized_pnl_today", 0.0))
+    # IBKR doesn't expose cash via the Rust broker's AccountSnapshot
+    # yet. NLV − maint_margin is a serviceable proxy ("free cash"
+    # available to deploy).
+    acct.setdefault("cash", max(nlv - maint, 0.0))
+    # Account id — not in the snapshot; pull from the FA login if
+    # we have it (master DFP account is the canonical anchor).
+    acct.setdefault("account_id", "DFP553653")
+    # Unrealized P&L: portfolio.mtm_pnl is the marked-to-market
+    # delta from open positions. Today's P&L is the same when no
+    # fills have occurred (realized_pnl_persisted=0).
+    acct.setdefault("unrealized_pnl", float(port.get("mtm_pnl", 0.0) or 0.0))
+    acct.setdefault(
+        "daily_pnl_nlv",
+        float(port.get("daily_pnl", 0.0) or 0.0),
+    )
+    snap["account"] = acct
+
+    # Risk by Side: dashboard reads snapshot["portfolio"]["calls"] and
+    # ["puts"] as {delta, theta, margin, gross}. Rust broker doesn't
+    # emit per-right buckets — compute from positions here.
+    positions_raw = port.get("positions") or []
+    if positions_raw and "calls" not in port:
+        def _bucket(filt):
+            ps = [p for p in positions_raw if filt(p.get("right", ""))]
+            d = sum(
+                float(p.get("delta", 0.0) or 0.0) * int(p.get("quantity", 0))
+                for p in ps
+            )
+            t = sum(
+                float(p.get("theta", 0.0) or 0.0)
+                * int(p.get("quantity", 0))
+                * float(p.get("multiplier", 1.0) or 1.0)
+                for p in ps
+            )
+            g = sum(abs(int(p.get("quantity", 0))) for p in ps)
+            return {"delta": d, "theta": t, "margin": 0.0, "gross": g}
+        port["calls"] = _bucket(lambda r: r.startswith("C"))
+        port["puts"] = _bucket(lambda r: r.startswith("P"))
+        snap["portfolio"] = port
+
+    # Hedge: dashboard reads snapshot["hedge"] (singular, dict);
+    # broker emits snapshot["hedges"] (plural, array). One snapshot file
+    # per product, so flatten to the first matching entry.
+    hedges = snap.get("hedges") or []
+    if hedges and "hedge" not in snap:
+        h = hedges[0]
+        snap["hedge"] = {
+            "qty": h.get("hedge_qty", 0),
+            "avg_entry": h.get("avg_entry_f", 0.0),
+            "mtm_usd": h.get("mtm_usd", 0.0),
+            "realized_pnl_usd": h.get("realized_pnl_usd", 0.0),
+            "forward": 0.0,  # not emitted by Rust broker yet
+            "expiry": "",    # not emitted by Rust broker yet
+        }
+
+    # Underlying: dashboard reads snapshot["underlying_price"] (scalar);
+    # broker emits snapshot["underlying"] (dict keyed by product).
+    underlying = snap.get("underlying") or {}
+    if isinstance(underlying, dict) and underlying and "underlying_price" not in snap:
+        # Derive product from filename: hg_chain_snapshot.json → "HG"
+        from pathlib import Path as _P
+        product = _P(path).stem.replace("_chain_snapshot", "").upper()
+        if product in underlying:
+            snap["underlying_price"] = underlying[product]
+        else:
+            snap["underlying_price"] = next(iter(underlying.values()), 0.0)
+
+    return snap
+
+
 @st.cache_data(ttl=2)
 def load_snapshot(path=None):
     """Load chain snapshot JSON."""
@@ -118,7 +210,7 @@ def load_snapshot(path=None):
         return None
     try:
         with open(p, "r") as f:
-            return json.load(f)
+            return _normalize_snapshot(json.load(f), p)
     except (json.JSONDecodeError, IOError):
         return None
 
@@ -403,7 +495,25 @@ else:
 if snapshot is not None:
     acct = snapshot.get("account", {})
     port = snapshot.get("portfolio", {})
-    positions = port.get("positions", [])
+    # Rust broker (Phase 6.7+) emits positions with quantity/avg_fill_price/
+    # current_price; legacy Python dashboard reads qty/avg_price/mark and
+    # expects an unrealized_pnl that the Rust snapshot doesn't compute.
+    # Normalize at the load boundary so the rendering code below stays
+    # untouched.
+    positions = [
+        {
+            **p,
+            "qty": p.get("quantity", 0),
+            "avg_price": p.get("avg_fill_price", 0.0),
+            "mark": p.get("current_price", 0.0),
+            "unrealized_pnl": (
+                (p.get("current_price", 0.0) - p.get("avg_fill_price", 0.0))
+                * p.get("quantity", 0)
+                * p.get("multiplier", 1.0)
+            ),
+        }
+        for p in port.get("positions", [])
+    ]
 
     st.markdown('<div class="section-header">Account</div>', unsafe_allow_html=True)
 
@@ -497,9 +607,12 @@ if snapshot is not None:
             avg = p['avg_price']; mark = p['mark']
             avg_fmt = f"{avg:.4f}" if abs(avg) < 1 else f"{avg:.2f}"
             mark_fmt = f"{mark:.4f}" if abs(mark) < 1 else f"{mark:.2f}"
+            # Right column: collapse "Call"/"Put" → "C"/"P" so the
+            # contract column reads as "5.90C" / "5.90P".
+            right_letter = (p.get('right') or '')[:1].upper() or '—'
             rows += f"""<tr>
                 <td>{prod}</td>
-                <td>{strike_label}{p['right']}</td>
+                <td>{strike_label}{right_letter}</td>
                 <td>{exp_label}</td>
                 <td class="{qty_class}">{qty:+d}</td>
                 <td>${avg_fmt}</td>
@@ -524,8 +637,8 @@ if snapshot is not None:
     # column renders consistently with the chain table.
     for _p in positions:
         _p.setdefault("product", _selected_product)
-    calls_positions = [p for p in positions if p.get("right") == "C"]
-    puts_positions = [p for p in positions if p.get("right") == "P"]
+    calls_positions = [p for p in positions if p.get("right") == "Call"]
+    puts_positions = [p for p in positions if p.get("right") == "Put"]
 
     if calls_b or puts_b or positions:
         # Hedge tile — futures hedge state from HedgeManager. Surfaces

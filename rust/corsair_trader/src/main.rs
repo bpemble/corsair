@@ -52,12 +52,59 @@ fn places_orders() -> bool {
         .unwrap_or(false)
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
 
+    // Multi-thread tokio runtime with pinned workers. Default 2
+    // workers (per CLAUDE.md §17 — busy-poll hot loop + helpers).
+    // CORSAIR_TRADER_WORKERS overrides. Pinning honors docker
+    // cpuset; on bare-metal trader gets cpuset 4,5,10,11 and pins
+    // workers to first two of those.
+    let desired = std::env::var("CORSAIR_TRADER_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2);
+    let (workers, pinner) =
+        corsair_ipc::cpu_affinity::build_pinner("corsair_trader", desired);
+    let main_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .on_thread_start(pinner)
+        .build()?;
+
+    // Background runtime — staleness sweep (10Hz) + telemetry (10s)
+    // live here, off the hot loop's cores. Removes scheduler
+    // preemption of the hot loop from these periodic tasks (the
+    // mutex contention itself remains until #7 lock-shards
+    // TraderState.options out of the single mutex). Single-thread
+    // current-thread runtime on a dedicated std thread, pinned to
+    // the next CPU after the main runtime's workers.
+    let allowed = corsair_ipc::cpu_affinity::allowed_cpus();
+    let bg_cpu = allowed.get(workers).copied();
+    let bg_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let bg_handle = bg_rt.handle().clone();
+    let _bg_thread = std::thread::Builder::new()
+        .name("corsair-bg".into())
+        .spawn(move || {
+            if let Some(cpu) = bg_cpu {
+                log::warn!("corsair_trader: bg runtime pinning to cpu {}", cpu);
+                corsair_ipc::cpu_affinity::pin_thread_to_cpu(cpu);
+            } else {
+                log::warn!(
+                    "corsair_trader: bg runtime — no spare cpu past workers, sharing"
+                );
+            }
+            bg_rt.block_on(std::future::pending::<()>());
+        })?;
+
+    main_rt.block_on(async_main(bg_handle))
+}
+
+async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
     log::warn!("corsair_trader (Rust) {} starting", VERSION);
 
     let transport = std::env::var("CORSAIR_IPC_TRANSPORT")
@@ -132,11 +179,13 @@ async fn main() -> std::io::Result<()> {
     // staleness_loop. Without it, an order placed at theo-edge can sit
     // through a theo move and become uncompetitive (or worse, become
     // adverse). Runs at 10Hz (matches Python's STALENESS_INTERVAL_S).
+    // Spawned on the bg runtime so its 10Hz wake-up doesn't preempt
+    // the hot loop on the main runtime's pinned cores.
     {
         let state = Arc::clone(&state);
         let counters = Arc::clone(&counters);
         let commands_ring = Arc::clone(&commands_ring);
-        tokio::spawn(async move {
+        bg_handle.spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 if !places_orders() {
@@ -147,12 +196,12 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
-    // Spawn telemetry loop (10s cadence).
+    // Spawn telemetry loop (10s cadence). Also on bg runtime.
     {
         let state = Arc::clone(&state);
         let counters = Arc::clone(&counters);
         let commands_ring = Arc::clone(&commands_ring);
-        tokio::spawn(async move {
+        bg_handle.spawn(async move {
             let mut total_events: u64 = 0;
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -282,6 +331,7 @@ fn process_event(
         Ok(g) => g,
         Err(e) => {
             log::debug!("malformed msg, ignoring: {}", e);
+            counters.lock().unwrap().dropped_parse_errors += 1;
             return;
         }
     };
@@ -310,7 +360,10 @@ fn process_event(
         "tick" => {
             let mut tick: TickMsg = match serde_json::from_value(generic.extra.clone()) {
                 Ok(t) => t,
-                Err(_) => return,
+                Err(_) => {
+                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    return;
+                }
             };
             // ts_ns lives at the outer-message level in the wire format
             // (broker_ipc.py emits it there); copy it down so on_tick's
@@ -323,14 +376,20 @@ fn process_event(
         "underlying_tick" => {
             let ut: UnderlyingTickMsg = match serde_json::from_value(generic.extra.clone()) {
                 Ok(t) => t,
-                Err(_) => return,
+                Err(_) => {
+                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    return;
+                }
             };
             state.lock().unwrap().underlying_price = ut.price;
         }
         "vol_surface" => {
             let vs: VolSurfaceMsg = match serde_json::from_value(generic.extra.clone()) {
                 Ok(t) => t,
-                Err(_) => return,
+                Err(_) => {
+                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    return;
+                }
             };
             // Side comes as "C"/"P"; intern as char for the map key
             // to avoid an allocation per lookup later.
@@ -340,23 +399,31 @@ fn process_event(
                 crate::state::VolSurfaceEntry {
                     forward: vs.forward,
                     params: vs.params,
+                    fit_ts_ns: vs.ts_ns.unwrap_or(0),
                 },
             );
         }
         "risk_state" => {
             let r: RiskStateMsg = match serde_json::from_value(generic.extra.clone()) {
                 Ok(t) => t,
-                Err(_) => return,
+                Err(_) => {
+                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    return;
+                }
             };
             let mut s = state.lock().unwrap();
             s.risk_effective_delta = Some(r.effective_delta);
             s.risk_margin_pct = Some(r.margin_pct);
+            s.risk_hedge_delta = Some(r.hedge_delta);
             s.risk_state_age_monotonic_ns = now_ns_monotonic();
         }
         "place_ack" => {
             let p: PlaceAckMsg = match serde_json::from_value(generic.extra.clone()) {
                 Ok(t) => t,
-                Err(_) => return,
+                Err(_) => {
+                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    return;
+                }
             };
             let r_char = p.right.chars().next().unwrap_or('C').to_ascii_uppercase();
             let s_char = match p.side.as_str() {
@@ -389,7 +456,10 @@ fn process_event(
         "order_ack" => {
             let a: OrderAckMsg = match serde_json::from_value(generic.extra.clone()) {
                 Ok(t) => t,
-                Err(_) => return,
+                Err(_) => {
+                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    return;
+                }
             };
             let oid = match a.order_id {
                 Some(o) => o,
@@ -479,6 +549,7 @@ fn on_tick(
             bid_size: tick.bid_size,
             ask_size: tick.ask_size,
             ts_ns: tick.ts_ns,
+            broker_recv_ns: tick.broker_recv_ns,
         };
         s.options.insert(
             (TraderState::strike_key(tick.strike), tick.expiry.clone(), r_char),
@@ -557,6 +628,7 @@ fn on_tick(
                 qty: 1,
                 price,
                 order_ref: "corsair_trader_rust".into(),
+                triggering_tick_broker_recv_ns: tick.broker_recv_ns,
             };
             if let Ok(body) = rmp_serde::to_vec_named(&p) {
                 frames.push(ipc::protocol::pack_frame(&body));

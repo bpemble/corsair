@@ -1,11 +1,10 @@
 //! Append-only JSONL writer with daily + size-based rotation.
-//! Mirror of src/trader/main.py:JSONLWriter.
+//! Mirror of corsair_trader::jsonl. Used for wire_timing-YYYY-MM-DD.jsonl.
 //!
-//! Background-thread design: the hot path sends serde_json::Value over
-//! an mpsc channel; a tokio task drains and writes. Hot path never
-//! blocks on disk I/O. Channel is bounded (10k); on overflow we drop
-//! the message and bump a counter (preferred over backpressuring the
-//! decision loop).
+//! Background-task design: hot path sends serde_json::Value over a
+//! bounded mpsc channel; a tokio task drains and writes. Hot path
+//! never blocks on disk I/O. On overflow we drop the message and
+//! bump a counter (preferred over backpressuring handle_place).
 
 use chrono::{Datelike, Utc};
 use std::fs::{File, OpenOptions};
@@ -15,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-const MAX_BYTES_PER_FILE: u64 = 256 * 1024 * 1024; // 256 MiB
+const MAX_BYTES_PER_FILE: u64 = 256 * 1024 * 1024;
 const CHANNEL_CAPACITY: usize = 10_000;
 
 pub struct JsonlWriter {
@@ -24,8 +23,6 @@ pub struct JsonlWriter {
 }
 
 impl JsonlWriter {
-    /// Spawn the background writer task and return a handle. The
-    /// returned `JsonlWriter::write` method enqueues into the channel.
     pub fn start(log_dir: PathBuf, prefix: &'static str) -> Self {
         let (tx, rx) = mpsc::channel::<serde_json::Value>(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -36,8 +33,7 @@ impl JsonlWriter {
         Self { sender: tx, dropped }
     }
 
-    /// Hot-path entry. Non-blocking: drops on full channel and bumps
-    /// the dropped counter. Returns false if dropped.
+    /// Hot-path entry. Non-blocking: drops on full channel.
     pub fn write(&self, value: serde_json::Value) -> bool {
         match self.sender.try_send(value) {
             Ok(()) => true,
@@ -68,9 +64,9 @@ async fn writer_task(
     let mut writes_since_flush: u32 = 0;
     const WRITES_PER_FLUSH: u32 = 100;
     // Reusable serialization buffer — saves one Vec<u8> alloc per
-    // line at trader_decisions/trader_events rates (~1 kHz under
-    // load). Single 4 KiB reservation amortizes; full lines fit.
-    let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
+    // line at the cost of a single 1 KiB heap reservation. For
+    // wire_timing rows (~250 bytes) the buffer never reallocs.
+    let mut line_buf: Vec<u8> = Vec::with_capacity(1024);
 
     while let Some(value) = rx.recv().await {
         let today = Utc::now();
@@ -81,7 +77,6 @@ async fn writer_task(
             today.day()
         );
 
-        // Roll on day change OR size cap.
         let need_roll = match &current_day {
             None => true,
             Some(d) if d != &day_str => {
@@ -95,7 +90,6 @@ async fn writer_task(
             _ => false,
         };
         if need_roll {
-            // Close existing.
             if let Some(mut w) = writer.take() {
                 let _ = w.flush();
             }

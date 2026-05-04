@@ -40,6 +40,12 @@ pub struct TickMsg {
     pub ask_size: Option<i32>,
     #[serde(default)]
     pub ts_ns: Option<u64>,
+    /// v2 wire-timing: broker's local clock when it published this tick
+    /// frame. Trader caches the latest per-key value and echoes it back
+    /// on PlaceOrder.triggering_tick_broker_recv_ns. Optional for
+    /// forward-compat with pre-v2 broker builds.
+    #[serde(default)]
+    pub broker_recv_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +54,11 @@ pub struct VolSurfaceMsg {
     pub side: String,
     pub forward: f64,
     pub params: VolParams,
+    /// Broker fit timestamp (CLOCK_REALTIME ns). Used by the
+    /// trader's HI-002 staleness gate — if no refresh in 120s,
+    /// skip quoting (SVI extrapolation isn't safe with stale anchor).
+    #[serde(default)]
+    pub ts_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,6 +156,11 @@ pub struct PlaceOrder {
     pub price: f64,
     #[serde(rename = "orderRef")]
     pub order_ref: String,
+    /// v2 wire-timing: TickMsg.broker_recv_ns of the tick that drove
+    /// this decision (latest tick the trader had cached for this key
+    /// at decide_quote time). Skipped on the wire when None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggering_tick_broker_recv_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

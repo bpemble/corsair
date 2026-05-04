@@ -251,6 +251,12 @@ pub fn place_order(
         encode_unset(), // scaleInitLevelSize
         encode_unset(), // scaleSubsLevelSize
         encode_unset(), // scalePriceIncrement
+        // Conditional scale_* extras (only emitted when
+        // scalePriceIncrement is set and != UNSET) — we never
+        // populate scalePriceIncrement so this block is omitted.
+        encode_unset(), // scaleTable
+        encode_unset(), // activeStartTime
+        encode_unset(), // activeStopTime
         encode_unset(), // hedgeType
         encode_unset(), // optOutSmartRouting
         encode_unset(), // clearingAccount
@@ -263,15 +269,10 @@ pub fn place_order(
         encode_unset(), // solicited
         encode_bool(false), // randomizeSize
         encode_bool(false), // randomizePrice
-        // Pegged-to-benchmark fields not used.
-        encode_unset(), // referenceContractId
-        encode_bool(false), // isPeggedChangeAmountDecrease
-        encode_unset(), // peggedChangeAmount
-        encode_unset(), // referenceChangeAmount
-        encode_unset(), // referenceExchangeId
+        // Pegged-to-benchmark fields are conditional on
+        // order_type == "PEG BENCH" — we use LMT/IOC so they're
+        // omitted entirely.
         encode_int(0),  // conditionsCount
-        encode_unset(), // conditionsIgnoreRth
-        encode_unset(), // conditionsCancelOrder
         encode_unset(), // adjustedOrderType
         encode_unset(), // triggerPrice
         encode_unset(), // lmtPriceOffset

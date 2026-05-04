@@ -79,6 +79,7 @@ async fn subscribe_product(
             instrument_id: underlying.instrument_id,
             tick_by_tick: false,
             consumer_tag: Some("underlying".into()),
+            contract: Some(underlying.clone()),
         })
         .await?;
     }
@@ -107,16 +108,45 @@ async fn subscribe_product(
     );
 
     // 5. Qualify + subscribe each option (both calls and puts).
-    let expiry = pick_option_expiry(runtime, symbol, &underlying);
-    for strike in strikes {
+    //
+    // We subscribe TWO expiry sets:
+    //   (a) front_expiry's full ATM±range strike grid — used for
+    //       fresh quoting decisions (decide_on_tick reads vol_surface
+    //       fitted on these strikes).
+    //   (b) ALL unique (expiry, strike, right) tuples from existing
+    //       positions — needed for marking those positions to market.
+    //       Without this, positions on a back-month expiry sit with
+    //       current_price=0 in the dashboard.
+    let front_expiry = pick_option_expiry(runtime, symbol, &underlying);
+    let mut planned: std::collections::HashSet<
+        (chrono::NaiveDate, u64 /* strike bits */, Right)
+    > = std::collections::HashSet::new();
+    for strike in &strikes {
         for right in [Right::Call, Right::Put] {
-            match qualify_and_subscribe(runtime, product, strike, expiry, right).await {
-                Ok(()) => {}
-                Err(e) => log::warn!(
-                    "subscribe[{symbol}] {} {:?} {}: {}",
-                    strike, right, expiry, e
-                ),
-            }
+            planned.insert((front_expiry, strike.to_bits(), right));
+        }
+    }
+    // Add position-derived (expiry, strike, right) tuples.
+    {
+        let p = runtime.portfolio.lock().unwrap();
+        for pos in p.positions_for_product(symbol) {
+            planned.insert((pos.expiry, pos.strike.to_bits(), pos.right));
+        }
+    }
+    log::warn!(
+        "subscribe[{symbol}]: ATM={} → subscribing {} (strike, right) on front + position legs (total {} unique tuples)",
+        atm,
+        strikes.len() * 2,
+        planned.len(),
+    );
+    for (expiry, strike_bits, right) in planned {
+        let strike = f64::from_bits(strike_bits);
+        match qualify_and_subscribe(runtime, product, strike, expiry, right).await {
+            Ok(()) => {}
+            Err(e) => log::warn!(
+                "subscribe[{symbol}] {} {:?} {}: {}",
+                strike, right, expiry, e
+            ),
         }
     }
     log::warn!("subscribe[{symbol}]: done");
@@ -248,6 +278,7 @@ async fn qualify_and_subscribe(
                 "{} {} {} {:?}",
                 product.name, strike, expiry, right
             )),
+            contract: Some(qualified.clone()),
         })
         .await?;
     }

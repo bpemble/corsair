@@ -37,6 +37,12 @@ pub const IN_PORTFOLIO_VALUE: i32 = 7;
 pub const IN_ACCT_UPDATE_TIME: i32 = 8;
 pub const IN_NEXT_VALID_ID: i32 = 9;
 pub const IN_CONTRACT_DATA: i32 = 10;
+/// `contractDataEnd` — terminator for a `reqContractDetails` response
+/// stream. IBKR API sends ContractData (id=10) zero-or-more times then
+/// ContractDataEnd (id=52). list_chain's oneshot waits for End; without
+/// the decoder handling 52 it timed out forever (latent since cutover
+/// 2026-05-02; first surfaced when markets re-opened 2026-05-03).
+pub const IN_CONTRACT_DATA_END: i32 = 52;
 pub const IN_EXECUTION_DATA: i32 = 11;
 pub const IN_MANAGED_ACCTS: i32 = 15;
 pub const IN_TICK_OPTION_COMPUTATION: i32 = 21;

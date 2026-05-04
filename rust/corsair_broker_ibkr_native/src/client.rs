@@ -5,6 +5,7 @@
 //! `corsair_broker_api::Broker` trait impl.
 
 use bytes::BytesMut;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +20,96 @@ use crate::messages::{
     IN_MANAGED_ACCTS, IN_NEXT_VALID_ID, MAX_CLIENT_VERSION, MIN_SERVER_VERSION,
     OUT_START_API,
 };
+
+/// Enable SO_TIMESTAMPNS on a TCP socket so subsequent recvmsg() calls
+/// return a CLOCK_REALTIME nanosecond timestamp via SCM_TIMESTAMPNS in
+/// the cmsg ancillary data. Returns true on success.
+///
+/// The timestamp is captured by the kernel when a packet leaves the
+/// driver's RX queue, before user-space dispatch — much closer to NIC
+/// ingress than the moment our recv() syscall returns. On loopback
+/// (gateway → broker) the gap to user-space is small (~µs); on a real
+/// NIC at colo it can be tens of µs.
+fn enable_so_timestampns(fd: std::os::unix::io::RawFd) -> bool {
+    unsafe {
+        let on: libc::c_int = 1;
+        let r = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as u32,
+        );
+        if r != 0 {
+            log::warn!(
+                "SO_TIMESTAMPNS enable failed on fd={}: {}",
+                fd,
+                std::io::Error::last_os_error()
+            );
+            false
+        } else {
+            true
+        }
+    }
+}
+
+/// Non-blocking recvmsg that also extracts the kernel's CLOCK_REALTIME
+/// SCM_TIMESTAMPNS ingress timestamp. Returns (bytes_read, timestamp_ns).
+/// timestamp_ns is None when SO_TIMESTAMPNS wasn't enabled (caller
+/// should fall back to now_ns()).
+///
+/// Currently unused — the recv loop reverted to tokio's read API
+/// after a readiness-clear bug caused 100% CPU spin (readable() didn't
+/// auto-clear when we bypassed try_read). Re-introduce later via
+/// `try_io(Interest::READABLE, |_| recvmsg(...))` so tokio handles
+/// WouldBlock signaling. Kept for that future migration.
+#[allow(dead_code)]
+fn recvmsg_with_kernel_ts(
+    fd: std::os::unix::io::RawFd,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, Option<u64>)> {
+    unsafe {
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        // Reserve cmsg space for SCM_TIMESTAMPNS (one timespec).
+        let cmsg_capacity =
+            libc::CMSG_SPACE(std::mem::size_of::<libc::timespec>() as u32) as usize;
+        let mut cmsg_buf = vec![0u8; cmsg_capacity];
+        let mut hdr = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
+            msg_controllen: cmsg_capacity,
+            msg_flags: 0,
+        };
+        let n = libc::recvmsg(fd, &mut hdr, libc::MSG_DONTWAIT);
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Walk cmsg list looking for SCM_TIMESTAMPNS.
+        let mut ts_ns: Option<u64> = None;
+        let mut cmsg = libc::CMSG_FIRSTHDR(&hdr);
+        while !cmsg.is_null() {
+            let c = &*cmsg;
+            if c.cmsg_level == libc::SOL_SOCKET
+                && c.cmsg_type == libc::SCM_TIMESTAMPNS
+            {
+                let data = libc::CMSG_DATA(cmsg) as *const libc::timespec;
+                let ts = *data;
+                ts_ns = Some(
+                    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64,
+                );
+                break;
+            }
+            cmsg = libc::CMSG_NXTHDR(&hdr, cmsg);
+        }
+        Ok((n as usize, ts_ns))
+    }
+}
 
 /// Configuration for a NativeClient.
 #[derive(Debug, Clone)]
@@ -67,7 +158,11 @@ pub struct NativeClient {
     /// Managed accounts list reported by the server. Useful for FA.
     managed_accounts: Arc<Mutex<Vec<String>>>,
     /// Inbound message dispatch — Phase 6.5+ consumers subscribe.
-    msg_tx: mpsc::Sender<Vec<String>>,
+    /// Tuple is (parsed fields, kernel_recv_ns). kernel_recv_ns is
+    /// the SCM_TIMESTAMPNS from the recvmsg that produced these
+    /// bytes (CLOCK_REALTIME). Falls back to user-space now_ns()
+    /// if SO_TIMESTAMPNS wasn't enabled or cmsg was missing.
+    msg_tx: mpsc::Sender<(Vec<String>, u64)>,
     /// Telemetry: number of messages sent / received / dropped.
     msgs_sent: Arc<std::sync::atomic::AtomicU64>,
     msgs_recv: Arc<std::sync::atomic::AtomicU64>,
@@ -88,7 +183,7 @@ impl NativeClient {
     /// Returns the client handle plus an mpsc::Receiver of decoded
     /// inbound messages — the runtime spawns its own task that
     /// dispatches based on the first field (message type id).
-    pub fn new(cfg: NativeClientConfig) -> (Self, mpsc::Receiver<Vec<String>>) {
+    pub fn new(cfg: NativeClientConfig) -> (Self, mpsc::Receiver<(Vec<String>, u64)>) {
         let (tx, rx) = mpsc::channel(DISPATCH_CHANNEL_CAP);
         let client = Self {
             cfg,
@@ -147,6 +242,17 @@ impl NativeClient {
         .map_err(|_| NativeError::HandshakeTimeout)?
         .map_err(NativeError::Io)?;
         stream.set_nodelay(true)?;
+        // Enable SO_TIMESTAMPNS so the recv loop can stamp each frame
+        // with the kernel's RX ingress time (much closer to NIC arrival
+        // than the moment recv() returns). Both halves share the same
+        // underlying socket, so setting the option pre-split is fine.
+        let ts_enabled = enable_so_timestampns(stream.as_raw_fd());
+        if ts_enabled {
+            log::warn!(
+                "native client: SO_TIMESTAMPNS enabled on gateway fd={}",
+                stream.as_raw_fd()
+            );
+        }
         let (read_half, mut write_half) = stream.into_split();
 
         // 2. Send the API version handshake.
@@ -351,7 +457,7 @@ async fn read_handshake_reply(
 /// the raw fields onto the msg_tx channel for general consumers.
 fn spawn_recv_task(
     mut read_half: tokio::net::tcp::OwnedReadHalf,
-    msg_tx: mpsc::Sender<Vec<String>>,
+    msg_tx: mpsc::Sender<(Vec<String>, u64)>,
     next_order_id: Arc<Mutex<i32>>,
     managed_accounts: Arc<Mutex<Vec<String>>>,
     msgs_recv: Arc<std::sync::atomic::AtomicU64>,
@@ -361,6 +467,14 @@ fn spawn_recv_task(
         let mut buf = BytesMut::with_capacity(64 * 1024);
         let mut tmp = [0u8; 64 * 1024];
         loop {
+            // Reverted to tokio's read API. The recvmsg+SO_TIMESTAMPNS
+            // path had a tokio readiness-clearing bug — readable()
+            // didn't auto-clear since we bypassed try_read, leading to
+            // 100% CPU spin once data flow paused. Re-introduce later
+            // via try_io(Interest::READABLE, |_| recvmsg(...)) so
+            // tokio's machinery handles WouldBlock/clear_ready.
+            // Channel-recv `now_ns()` (in dispatcher) gives the recv_ns
+            // proxy in the meantime — close enough for non-colo use.
             let n = match read_half.read(&mut tmp).await {
                 Ok(0) => {
                     log::warn!("native recv: EOF");
@@ -372,6 +486,7 @@ fn spawn_recv_task(
                     break;
                 }
             };
+            let recv_ns = now_ns();
             buf.extend_from_slice(&tmp[..n]);
             match try_decode_all(&mut buf) {
                 Ok(frames) => {
@@ -417,10 +532,8 @@ fn spawn_recv_task(
                         // try_send to avoid awaiting (which would
                         // back up the recv loop). On Full we drop the
                         // frame and increment the counter — better to
-                        // lose a tick than to block ingestion. On
-                        // Closed the channel went away (broker shut
-                        // down).
-                        match msg_tx.try_send(fields) {
+                        // lose a tick than to block ingestion.
+                        match msg_tx.try_send((fields, recv_ns)) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 let dropped = msgs_dropped
@@ -447,6 +560,14 @@ fn spawn_recv_task(
         }
         log::warn!("native recv task: exiting");
     });
+}
+
+fn now_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -22,12 +22,18 @@ pub struct OptionState {
     pub bid_size: Option<i32>,
     pub ask_size: Option<i32>,
     pub ts_ns: Option<u64>,
+    /// v2 wire-timing: broker_recv_ns from the latest TickMsg. Echoed
+    /// back on PlaceOrder so the broker can compute tick→ack latency.
+    pub broker_recv_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct VolSurfaceEntry {
     pub forward: f64,
     pub params: VolParams,
+    /// Broker fit timestamp (CLOCK_REALTIME ns). Used to gate quoting
+    /// when the surface is stale (HI-002).
+    pub fit_ts_ns: u64,
 }
 
 /// Per-resting-order metadata; keyed by (strike, expiry, right, side).
@@ -65,6 +71,11 @@ pub struct TraderState {
     /// Trader-side risk state from broker (1Hz publish).
     pub risk_effective_delta: Option<f64>,
     pub risk_margin_pct: Option<f64>,
+    /// LOW-004: cached hedge delta from the broker's 1Hz risk_state
+    /// publish. Telemetry surfaces the latest value for observability
+    /// alongside risk_effective_delta. None until the first
+    /// risk_state event arrives.
+    pub risk_hedge_delta: Option<i64>,
     pub risk_state_age_monotonic_ns: u64,
 
     /// Configured limits (from broker hello).
@@ -93,6 +104,7 @@ impl TraderState {
             orderid_to_key: AHashMap::new(),
             risk_effective_delta: None,
             risk_margin_pct: None,
+            risk_hedge_delta: None,
             risk_state_age_monotonic_ns: 0,
             // Defaults; broker hello overrides.
             min_edge_ticks: 2,
@@ -122,6 +134,20 @@ impl TraderState {
 pub struct DecisionCounters {
     pub place: u64,
     pub skip_no_vol_surface: u64,
+    /// HI-002: vol surface fit_ts_ns is >120s old; broker likely
+    /// disconnected or fitter stalled.
+    pub skip_vol_surface_stale: u64,
+    /// HI-003: previous place at this key is still unack'd
+    /// (order_id is None) and within the cooldown floor. Skip rather
+    /// than fire a duplicate that would orphan the first.
+    pub skip_unack_inflight: u64,
+    /// MED-005: inbound IPC frames whose msgpack body failed to
+    /// deserialize as the expected typed event. Bumps when broker
+    /// schema drifts vs trader schema (e.g. a new required field on
+    /// either side that the other doesn't know about). Surfaces in
+    /// 10s telemetry alongside other counters; non-zero rate means
+    /// recompile/redeploy needed.
+    pub dropped_parse_errors: u64,
     pub skip_off_atm: u64,
     pub skip_itm: u64,
     pub skip_thin_book: u64,

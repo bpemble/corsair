@@ -138,6 +138,21 @@ pub fn decide_on_tick(
         _ => return out,
     };
 
+    // HI-002: vol-surface staleness gate. Broker refits every 60s;
+    // if we haven't seen a refresh in 120s the SVI extrapolation
+    // anchor is stale (forward has likely drifted, market regime
+    // could have shifted). Fail-safe.
+    if vp_msg.fit_ts_ns > 0 {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        if now_ns.saturating_sub(vp_msg.fit_ts_ns) > 120_000_000_000 {
+            counters.skip_vol_surface_stale += 1;
+            return out;
+        }
+    }
+
     // Forward-drift guard.
     let drift = (forward - fit_forward).abs();
     let max_drift = MAX_FORWARD_DRIFT_TICKS as f64 * state.tick_size;
@@ -259,6 +274,20 @@ pub fn decide_on_tick(
         // Dead-band + GTD-refresh check.
         let existing = state.our_orders.get(&key).cloned();
         if let Some(ref ex) = existing {
+            // HI-003: no place while previous order is still unack'd
+            // (order_id is None until place_ack arrives). Without this
+            // gate, GTD-refresh path can fire a second place at the same
+            // key while the first is in-flight, leaving the first to
+            // expire via GTD-5s and bloating IBKR's order book.
+            // Tolerance: only enforce this BEFORE the cooldown floor
+            // expires; if cooldown has elapsed (>250 ms), the place_ack
+            // path failed silently and we must replace.
+            if ex.order_id.is_none()
+                && (now_monotonic_ns - ex.place_monotonic_ns) < COOLDOWN_NS
+            {
+                counters.skip_unack_inflight += 1;
+                continue;
+            }
             let age_s = (now_monotonic_ns - ex.place_monotonic_ns) as f64 / 1e9;
             let in_band = (target_q - ex.price).abs()
                 < DEAD_BAND_TICKS as f64 * state.tick_size;
@@ -335,6 +364,14 @@ pub fn compute_risk_gates(state: &TraderState, now_monotonic_ns: u64) -> (bool, 
     if eff - 1.0 <= -state.delta_ceiling {
         sell = true;
     }
+    // The `-1.0` is an intentional grace buffer (MED-004): a fill can
+    // push effective_delta over the kill threshold between the broker's
+    // 1Hz risk_state publish and the trader's next decision. Without
+    // the buffer, that fill would slip through one extra place at the
+    // ceiling. With it, we pre-emptively block placements when within
+    // 1 contract-delta of the kill, giving risk_state propagation a
+    // round trip to catch up. delta_kill ceiling is documented
+    // unbuffered (e.g. 5.0); the trader self-blocks at 4.0.
     if eff.abs() >= state.delta_kill - 1.0 {
         all = true;
     }

@@ -10,9 +10,20 @@ use corsair_position::{PortfolioState, MarketView};
 use corsair_risk::{KillSource, RiskMonitor};
 
 use crate::payload::{
-    AccountSnapshot, HedgeSnapshot, KillSnapshot, PortfolioPerProduct, PortfolioSnapshot,
-    PositionSnapshot, Snapshot, SCHEMA_VERSION,
+    AccountSnapshot, ChainExpirySnapshot, HedgeSnapshot, KillSnapshot,
+    PortfolioPerProduct, PortfolioSnapshot, PositionSnapshot, Snapshot,
+    SCHEMA_VERSION,
 };
+
+/// Pre-built chain data passed by the caller. Decouples the publisher
+/// from the broker's market_data crate so this crate stays tree-light.
+#[derive(Debug, Default, Clone)]
+pub struct ChainBuild {
+    pub chains: std::collections::HashMap<String, ChainExpirySnapshot>,
+    pub atm_strike: f64,
+    pub expiries: Vec<String>,
+    pub front_month_expiry: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct SnapshotConfig {
@@ -49,6 +60,7 @@ impl SnapshotPublisher {
         hedge: &HedgeFanout,
         market: &dyn MarketView,
         account: AccountSnapshot,
+        chain_build: ChainBuild,
     ) -> Snapshot {
         let agg = portfolio.aggregate();
 
@@ -88,11 +100,20 @@ impl SnapshotPublisher {
         let mtm_pnl = portfolio.compute_mtm_pnl(market);
         let daily_pnl = portfolio.realized_pnl_persisted + mtm_pnl;
 
+        // MED-002: surface options_delta / hedge_delta / effective_delta
+        // separately so the dashboard's net-delta tile can show the
+        // hedge-masking breakdown per CLAUDE.md §14.
+        let options_delta = agg.total.net_delta;
+        let hedge_delta: i64 = hedge.managers().iter().map(|m| m.hedge_qty() as i64).sum();
+        let effective_delta = options_delta + (hedge_delta as f64);
         let portfolio_s = PortfolioSnapshot {
             net_delta: agg.total.net_delta,
             net_theta: agg.total.net_theta,
             net_vega: agg.total.net_vega,
             net_gamma: agg.total.net_gamma,
+            options_delta,
+            hedge_delta,
+            effective_delta,
             long_count: agg.total.long_count,
             short_count: agg.total.short_count,
             gross_positions: agg.total.gross_positions,
@@ -127,6 +148,10 @@ impl SnapshotPublisher {
             .map(|m| {
                 let cfg = m.config();
                 let f = market.underlying_price(&cfg.product).unwrap_or(0.0);
+                let (expiry, forward) = match m.hedge_contract() {
+                    Some(c) => (c.expiry.format("%Y%m%d").to_string(), f),
+                    None => (String::new(), f),
+                };
                 HedgeSnapshot {
                     product: cfg.product.clone(),
                     hedge_qty: m.hedge_qty(),
@@ -137,6 +162,8 @@ impl SnapshotPublisher {
                         HedgeMode::Observe => "observe".into(),
                         HedgeMode::Execute => "execute".into(),
                     },
+                    expiry,
+                    forward,
                 }
             })
             .collect();
@@ -157,6 +184,10 @@ impl SnapshotPublisher {
             hedges,
             account,
             underlying,
+            chains: chain_build.chains,
+            atm_strike: chain_build.atm_strike,
+            expiries: chain_build.expiries,
+            front_month_expiry: chain_build.front_month_expiry,
         }
     }
 
@@ -171,8 +202,9 @@ impl SnapshotPublisher {
         hedge: &HedgeFanout,
         market: &dyn MarketView,
         account: AccountSnapshot,
+        chain_build: ChainBuild,
     ) -> std::io::Result<()> {
-        let snap = self.build(portfolio, risk, hedge, market, account);
+        let snap = self.build(portfolio, risk, hedge, market, account, chain_build);
         let json = serde_json::to_vec_pretty(&snap)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         atomic_write(&self.cfg.snapshot_path, &json)?;
@@ -253,7 +285,7 @@ mod tests {
         let pub_ = SnapshotPublisher::new(SnapshotConfig {
             snapshot_path: "/tmp/_snap_test.json".into(),
         });
-        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default());
+        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default());
         assert_eq!(snap.schema_version, SCHEMA_VERSION);
         assert!(!snap.kill.killed);
         assert_eq!(snap.portfolio.gross_positions, 0);
@@ -269,7 +301,7 @@ mod tests {
         let p = portfolio_empty();
         let r = risk_healthy();
         let h = fanout_empty();
-        pub_.publish(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default())
+        pub_.publish(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default())
             .expect("publish");
         assert!(path.exists());
         let bytes = std::fs::read(&path).unwrap();
@@ -289,7 +321,7 @@ mod tests {
         let r = risk_healthy();
         let h = fanout_empty();
         for _ in 0..3 {
-            pub_.publish(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default())
+            pub_.publish(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default())
                 .expect("publish");
         }
         assert_eq!(pub_.write_count(), 3);
@@ -308,7 +340,7 @@ mod tests {
         let pub_ = SnapshotPublisher::new(SnapshotConfig {
             snapshot_path: "/tmp/_killed_test.json".into(),
         });
-        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default());
+        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default());
         assert!(snap.kill.killed);
         assert_eq!(snap.kill.source.as_deref(), Some("daily_halt"));
     }
@@ -334,7 +366,7 @@ mod tests {
         let pub_ = SnapshotPublisher::new(SnapshotConfig {
             snapshot_path: "/tmp/_hedge_snap_test.json".into(),
         });
-        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default());
+        let snap = pub_.build(&p, &r, &h, &NoOpMarketView, AccountSnapshot::default(), ChainBuild::default());
         assert_eq!(snap.hedges.len(), 1);
         assert_eq!(snap.hedges[0].product, "HG");
         assert_eq!(snap.hedges[0].mode, "execute");

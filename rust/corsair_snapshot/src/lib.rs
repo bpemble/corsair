@@ -12,6 +12,7 @@ pub mod payload;
 pub mod publisher;
 
 pub use payload::{
-    HedgeSnapshot, KillSnapshot, PortfolioSnapshot, PositionSnapshot, Snapshot,
+    ChainExpirySnapshot, HedgeSnapshot, KillSnapshot, PortfolioSnapshot, PositionSnapshot,
+    SideBlockSnapshot, Snapshot, StrikeBlockSnapshot,
 };
-pub use publisher::{SnapshotConfig, SnapshotPublisher};
+pub use publisher::{ChainBuild, SnapshotConfig, SnapshotPublisher};

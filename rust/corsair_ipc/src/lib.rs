@@ -21,6 +21,7 @@
 //!     rings and the receive task. Trader-side, [`ring::Ring::open_client`]
 //!     is used directly from `corsair_trader` (no client wrapper crate).
 
+pub mod cpu_affinity;
 pub mod protocol;
 pub mod ring;
 pub mod server;

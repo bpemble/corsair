@@ -43,6 +43,7 @@
 
 pub mod config;
 pub mod ipc;
+pub mod jsonl;
 pub mod runtime;
 pub mod subscriptions;
 pub mod tasks;

@@ -101,12 +101,58 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
     // Per-instrument bid/ask/size cache shared across publisher invocations.
     // Mutex lock is brief (HashMap entry update + msgpack encode) and the
     // tick rate is low enough that contention isn't a concern.
+    //
+    // LOW-005: The publisher is invoked from a SINGLE tokio task —
+    // NativeBroker's spawn_dispatcher. If that ever becomes
+    // multi-threaded (e.g. broadcast-fanout to multiple consumers
+    // running in parallel tasks), this cache needs the per-instrument
+    // bid/ask/size state to be atomically updated together. Today the
+    // single-task invariant guarantees we never observe a torn state.
     let cache: Arc<std::sync::Mutex<std::collections::HashMap<u64, ConsolidatedTick>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let publisher: std::sync::Arc<dyn for<'a> Fn(&'a corsair_broker_api::Tick) + Send + Sync + 'static> =
         std::sync::Arc::new(move |tick: &corsair_broker_api::Tick| {
             // Trader only consumes bid/ask + sizes (consolidates them into
-            // OptionState). Skip last/volume.
+            // OptionState). Skip volume.
+            if !matches!(
+                tick.kind,
+                TickKind::Bid | TickKind::Ask | TickKind::Last | TickKind::BidSize | TickKind::AskSize
+            ) {
+                return;
+            }
+            // Underlying-tick fork: if this instrument is registered as
+            // an underlying for some product, emit "underlying_tick"
+            // with the price and return. The trader's UnderlyingTickMsg
+            // consumer drives state.underlying_price, which gates
+            // decide_on_tick (forward must be > 0). Without this fork
+            // the trader stays at forward=0 forever (latent since
+            // cutover; broker.market_data populated correctly for the
+            // hedge subsystem, but no IPC emission to the trader).
+            let underlying_product = {
+                let md = runtime_for_closure.market_data.lock().unwrap();
+                md.product_for_underlying(tick.instrument_id)
+            };
+            if underlying_product.is_some() {
+                if matches!(tick.kind, TickKind::Bid | TickKind::Ask | TickKind::Last) {
+                    if let Some(price) = tick.price {
+                        if price > 0.0 {
+                            let ev = UnderlyingTickEvent {
+                                ty: "underlying_tick",
+                                price,
+                                ts_ns: tick.timestamp_ns,
+                            };
+                            if let Ok(body) = rmp_serde::to_vec_named(&ev) {
+                                if !server_for_closure.publish(&body) {
+                                    log::debug!("underlying tick fastpath: events ring full");
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            // BidSize/AskSize on options need to update the cache too,
+            // but option_meta lookup below filters them. Same as before.
             if !matches!(
                 tick.kind,
                 TickKind::Bid | TickKind::Ask | TickKind::BidSize | TickKind::AskSize
@@ -149,7 +195,11 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
                 ask: entry.ask,
                 bid_size: entry.bid_size,
                 ask_size: entry.ask_size,
+                // ts_ns is the broker dispatcher's channel-recv time
+                // (closest broker-internal proxy for TCP recv); same
+                // value reused for v2 wire-timing's broker_recv_ns.
                 ts_ns: tick.timestamp_ns,
+                broker_recv_ns: tick.timestamp_ns,
             };
             if let Ok(body) = rmp_serde::to_vec_named(&ev) {
                 if !server_for_closure.publish(&body) {
@@ -171,16 +221,31 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
 
 // ─── Wire types — must match what the trader expects ─────────────
 
-/// Trader → broker: place_order command. Field names mirror the
-/// Python BrokerIPC.set_order_dispatchers protocol.
+/// Trader → broker: place_order command.
+///
+/// Schema mirrors what the Rust trader's `PlaceOrder` struct serializes
+/// (rust/corsair_trader/src/messages.rs). The trader doesn't carry an
+/// instrument_id (broker→trader TickEvent was de-instrument_id'd in
+/// commit f85cb7c to consolidate around strike/expiry/right) — so the
+/// broker resolves the contract by (strike, expiry, right) at decode
+/// time. The pre-f85cb7c instrument_id-keyed schema was a latent
+/// regression that would have blocked all trader-driven orders at the
+/// next market open.
 #[derive(Debug, Deserialize)]
 struct PlaceOrderCmd {
     #[serde(rename = "type")]
     _ty: String,
-    instrument_id: u64,
+    strike: f64,
+    /// YYYYMMDD, matches what trader received in TickEvent.expiry.
+    expiry: String,
+    /// "C" or "P", matches what trader received in TickEvent.right.
+    right: String,
     side: String,         // "BUY" or "SELL"
-    qty: u32,
+    qty: i32,             // trader serializes i32; positive at runtime
     price: f64,
+    /// Trader sends as `orderRef`; alias accepts either spelling.
+    #[serde(default, alias = "orderRef")]
+    client_order_ref: Option<String>,
     /// Order type: "limit" or "market". Default "limit".
     #[serde(default = "default_order_type")]
     order_type: String,
@@ -190,8 +255,15 @@ struct PlaceOrderCmd {
     /// goodTillDate seconds from now — used when tif=GTD.
     #[serde(default)]
     gtd_seconds: Option<u32>,
+    /// v2 wire-timing: trader's local clock when decide_quote returned
+    /// Place. Same value as PlaceOrder.ts_ns on the trader side.
     #[serde(default)]
-    client_order_ref: Option<String>,
+    ts_ns: Option<u64>,
+    /// v2 wire-timing: broker_recv_ns of the TickEvent the trader
+    /// acted on. Echoed back from TickEvent.broker_recv_ns. None when
+    /// the trader didn't have a triggering tick (e.g. boot orders).
+    #[serde(default)]
+    triggering_tick_broker_recv_ns: Option<u64>,
 }
 
 fn default_order_type() -> String {
@@ -283,6 +355,7 @@ async fn dispatch_commands(
 }
 
 async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
+    let broker_order_recv_ns = now_ns();
     let cmd: PlaceOrderCmd = match rmp_serde::from_slice(body) {
         Ok(c) => c,
         Err(e) => {
@@ -292,25 +365,41 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
     };
     if matches!(runtime.mode, crate::runtime::RuntimeMode::Shadow) {
         log::info!(
-            "ipc place_order (SHADOW; not placing): {:?} {} @ {} qty {}",
+            "ipc place_order (SHADOW; not placing): {} {}{}@{} {} @ {} qty {}",
             cmd.side,
-            cmd.instrument_id,
+            cmd.strike,
+            cmd.right,
+            cmd.expiry,
+            cmd.side,
             cmd.price,
             cmd.qty
         );
         return;
     }
-    // Resolve the contract from the broker's contract cache via
-    // market_data — for now we look up the cached option to get the
-    // strike/expiry/right, and reconstruct a Contract.
+    // Resolve the contract from the broker's contract cache by
+    // (strike, expiry, right). Trader carries those fields on the
+    // wire; instrument_id is broker-internal and never round-trips.
+    // Expiry comparison is YYYYMMDD strings since both sides format
+    // the same way.
+    let r_norm = cmd.right.chars().next()
+        .map(|c| c.to_ascii_uppercase())
+        .unwrap_or('C');
     let contract = {
         let md = runtime.market_data.lock().unwrap();
         let products = runtime.portfolio.lock().unwrap().registry().products();
         let mut found = None;
         for prod in products {
             for t in md.options_for_product(&prod) {
-                if t.instrument_id == Some(corsair_broker_api::InstrumentId(cmd.instrument_id)) {
-                    found = Some((prod, t.strike, t.expiry, t.right));
+                let t_right_char = match t.right {
+                    corsair_broker_api::Right::Call => 'C',
+                    corsair_broker_api::Right::Put => 'P',
+                };
+                let t_expiry_str = t.expiry.format("%Y%m%d").to_string();
+                if (t.strike - cmd.strike).abs() < 1e-9
+                    && t_expiry_str == cmd.expiry
+                    && t_right_char == r_norm
+                {
+                    found = Some((prod, t.strike, t.expiry, t.right, t.instrument_id));
                     break;
                 }
             }
@@ -319,8 +408,8 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
             }
         }
         match found {
-            Some((prod, strike, expiry, right)) => corsair_broker_api::Contract {
-                instrument_id: corsair_broker_api::InstrumentId(cmd.instrument_id),
+            Some((prod, strike, expiry, right, iid)) => corsair_broker_api::Contract {
+                instrument_id: iid.unwrap_or(corsair_broker_api::InstrumentId(0)),
                 kind: ContractKind::Option,
                 symbol: format!("HXE{}", chrono::Local::now().format("%y%m")),
                 local_symbol: format!("{}{}{}{:.3}", prod, expiry, right.as_char(), strike),
@@ -333,9 +422,28 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
             },
             None => {
                 log::warn!(
-                    "ipc place_order: no contract cached for instrument_id={}",
-                    cmd.instrument_id
+                    "ipc place_order: no contract cached for {}{:.4} {} {}",
+                    r_norm, cmd.strike, cmd.expiry, cmd.side
                 );
+                // Still emit a wire_timing row so the failure shows up
+                // in the histogram as outcome=rejected.
+                let row = serde_json::json!({
+                    "schema": "wire_timing/v1",
+                    "ts_ns": now_ns(),
+                    "outcome": "no_contract",
+                    "order_id": serde_json::Value::Null,
+                    "client_order_ref": cmd.client_order_ref.clone().unwrap_or_default(),
+                    "strike": cmd.strike,
+                    "expiry": cmd.expiry,
+                    "right": cmd.right,
+                    "side": cmd.side,
+                    "qty": cmd.qty,
+                    "price": cmd.price,
+                    "triggering_tick_broker_recv_ns": cmd.triggering_tick_broker_recv_ns,
+                    "trader_decide_ts_ns": cmd.ts_ns,
+                    "broker_order_recv_ns": broker_order_recv_ns,
+                });
+                runtime.wire_timing.write(row);
                 return;
             }
         }
@@ -362,7 +470,7 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
     let req = PlaceOrderReq {
         contract,
         side,
-        qty: cmd.qty,
+        qty: cmd.qty.max(0) as u32,
         order_type,
         price: Some(cmd.price),
         tif,
@@ -371,10 +479,64 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
         account: Some(runtime.config.broker.ibkr.as_ref()
             .map(|i| i.account.clone()).unwrap_or_default()),
     };
-    let result = {
+    let broker_order_send_marker_ns = now_ns();
+    let (result, precise_send_ns, precise_ack_ns) = {
         let b = runtime.broker.lock().await;
-        b.place_order(req).await
+        let r = b.place_order(req).await;
+        // Drain precise broker-internal timestamps (NativeBroker only;
+        // mock returns None). On success this is the just-before
+        // client.send_raw moment + first ack arrival in route().
+        let timing = match &r {
+            Ok(oid) => b.drain_wire_timing(oid.0),
+            Err(_) => None,
+        };
+        let (s, a) = timing.unzip();
+        (r, s, a)
     };
+    let broker_order_ack_marker_ns = now_ns();
+    // Prefer precise timestamps when available; fall back to call-
+    // boundary markers otherwise.
+    let broker_order_send_ns = precise_send_ns.unwrap_or(broker_order_send_marker_ns);
+    let broker_order_ack_ns = precise_ack_ns.unwrap_or(broker_order_ack_marker_ns);
+
+    // v2 wire-timing — emit one JSONL row per place outcome. Stages
+    // computed by post-processor:
+    //   tick_to_decide  = trader_decide_ts_ns − triggering_tick_broker_recv_ns
+    //   trader_to_broker = broker_order_recv_ns − trader_decide_ts_ns
+    //   broker_handle   = broker_order_send_marker_ns − broker_order_recv_ns
+    //   external_rtt    = broker_order_ack_marker_ns − broker_order_send_marker_ns
+    //   total           = broker_order_ack_marker_ns − triggering_tick_broker_recv_ns
+    let (outcome_str, order_id_val): (&str, Option<u64>) = match &result {
+        Ok(oid) => ("ack", Some(oid.0)),
+        Err(_) => ("rejected", None),
+    };
+    let row = serde_json::json!({
+        "schema": "wire_timing/v2",
+        "ts_ns": broker_order_ack_ns,
+        "outcome": outcome_str,
+        "order_id": order_id_val,
+        "client_order_ref": cmd.client_order_ref.clone().unwrap_or_default(),
+        "strike": cmd.strike,
+        "expiry": cmd.expiry,
+        "right": cmd.right,
+        "side": cmd.side,
+        "qty": cmd.qty,
+        "price": cmd.price,
+        "triggering_tick_broker_recv_ns": cmd.triggering_tick_broker_recv_ns,
+        "trader_decide_ts_ns": cmd.ts_ns,
+        "broker_order_recv_ns": broker_order_recv_ns,
+        "broker_order_send_ns": broker_order_send_ns,
+        "broker_order_ack_ns": broker_order_ack_ns,
+        // Markers retained for diagnostics: the gap between precise
+        // and marker reveals place_order setup overhead (~30 µs)
+        // and dispatcher wake-up latency (~10-50 µs).
+        "broker_order_send_marker_ns": broker_order_send_marker_ns,
+        "broker_order_ack_marker_ns": broker_order_ack_marker_ns,
+        "send_ns_precise": precise_send_ns.is_some(),
+        "ack_ns_precise": precise_ack_ns.is_some(),
+    });
+    runtime.wire_timing.write(row);
+
     match result {
         Ok(oid) => log::info!(
             "ipc place_order placed: oid={} for ref='{}'",
@@ -539,6 +701,17 @@ async fn forward_connection(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
 /// (`corsair_trader::messages::TickMsg`) requires `strike`, `expiry`,
 /// `right` (no defaults) and overwrites its OptionState entry on each
 /// tick — so we need consolidated bid/ask/sizes here, not single-side.
+/// Underlying-tick event emitted on bid/ask/last for the registered
+/// underlying. Trader's UnderlyingTickMsg consumes this and sets
+/// state.underlying_price, which is the gate forward for decide_on_tick.
+#[derive(Debug, Serialize)]
+struct UnderlyingTickEvent<'a> {
+    #[serde(rename = "type")]
+    ty: &'a str,
+    price: f64,
+    ts_ns: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct TickEvent<'a> {
     #[serde(rename = "type")]
@@ -553,7 +726,13 @@ struct TickEvent<'a> {
     ask: Option<f64>,
     bid_size: Option<i32>,
     ask_size: Option<i32>,
+    /// IBKR gateway tick timestamp (existing).
     ts_ns: u64,
+    /// Broker's local clock at TickEvent publish time (v2 wire timing).
+    /// Within ~5-30 µs of TCP-recv since broker dispatch is direct.
+    /// Trader echoes this back on PlaceOrder.triggering_tick_broker_recv_ns
+    /// so the wire_timing JSONL row can join tick → order.
+    broker_recv_ns: u64,
 }
 
 /// Per-instrument bid/ask/size cache. Native ticks arrive per-kind
@@ -581,6 +760,32 @@ async fn forward_ticks(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
     loop {
         match rx.recv().await {
             Ok(tick) => {
+                // Underlying-tick fork (mirrors the fast-path; this
+                // pump is the broadcast-channel fallback when the fast
+                // publisher returns false).
+                let underlying_product = {
+                    let md = runtime.market_data.lock().unwrap();
+                    md.product_for_underlying(tick.instrument_id)
+                };
+                if underlying_product.is_some() {
+                    if matches!(tick.kind, TickKind::Bid | TickKind::Ask | TickKind::Last) {
+                        if let Some(price) = tick.price {
+                            if price > 0.0 {
+                                let ev = UnderlyingTickEvent {
+                                    ty: "underlying_tick",
+                                    price,
+                                    ts_ns: tick.timestamp_ns,
+                                };
+                                if let Ok(body) = rmp_serde::to_vec_named(&ev) {
+                                    if !server.publish(&body) {
+                                        log::debug!("ipc events ring full — dropped underlying tick");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // Skip tick kinds the trader doesn't consume.
                 let is_consumable = matches!(
                     tick.kind,
@@ -589,9 +794,8 @@ async fn forward_ticks(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
                 if !is_consumable {
                     continue;
                 }
-                // Resolve instrument_id → option meta. Underlying ticks
-                // and unregistered ids return None — silently skipped
-                // (underlying flows over a different event type).
+                // Resolve instrument_id → option meta. Unregistered
+                // ids return None — silently skipped.
                 let meta = {
                     let md = runtime.market_data.lock().unwrap();
                     md.option_meta(tick.instrument_id)
@@ -627,7 +831,11 @@ async fn forward_ticks(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
                     ask: entry.ask,
                     bid_size: entry.bid_size,
                     ask_size: entry.ask_size,
+                    // v2 wire-timing — both fields = channel-recv time
+                    // (closer to TCP recv than the previous now_ns() at
+                    // publish point, which lumped in the broadcast hop).
                     ts_ns: tick.timestamp_ns,
+                    broker_recv_ns: tick.timestamp_ns,
                 };
                 if let Ok(body) = rmp_serde::to_vec_named(&ev) {
                     if !server.publish(&body) {
@@ -651,7 +859,12 @@ struct RiskStateEvent {
     margin_usd: f64,
     margin_pct: f64,
     options_delta: f64,
-    hedge_delta: i32,
+    /// i64 to match trader's RiskStateMsg.hedge_delta exactly. Was
+    /// i32 (silent msgpack widening on the trader side); unifying so
+    /// the wire schema is canonical and an integer-overflow scenario
+    /// (impossible at our position sizes, but cheap to bound) doesn't
+    /// truncate. Audit HI-001.
+    hedge_delta: i64,
     effective_delta: f64,
     theta: f64,
     vega: f64,
@@ -687,10 +900,10 @@ async fn periodic_risk_state(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
                 agg.total.gross_positions,
             )
         };
-        let hedge_delta: i32 = {
+        let hedge_delta: i64 = {
             let h = runtime.hedge.lock().unwrap();
-            // Sum hedge_qty across products.
-            h.managers().iter().map(|m| m.hedge_qty()).sum()
+            // Sum hedge_qty across products. i64 matches trader.
+            h.managers().iter().map(|m| m.hedge_qty() as i64).sum()
         };
         let effective_delta = options_delta + (hedge_delta as f64);
 

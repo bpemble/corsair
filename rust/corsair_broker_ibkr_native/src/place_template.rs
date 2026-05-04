@@ -119,6 +119,13 @@ fn trailing_bytes() -> &'static [u8] {
             encode_unset(),     // scaleInitLevelSize
             encode_unset(),     // scaleSubsLevelSize
             encode_unset(),     // scalePriceIncrement
+            // Always-sent scale-block trailing fields (we never
+            // populate scalePriceIncrement so the conditional
+            // scale_* extras are omitted, but these three are
+            // required regardless).
+            encode_unset(),     // scaleTable
+            encode_unset(),     // activeStartTime
+            encode_unset(),     // activeStopTime
             encode_unset(),     // hedgeType
             encode_unset(),     // optOutSmartRouting
             encode_unset(),     // clearingAccount
@@ -131,14 +138,11 @@ fn trailing_bytes() -> &'static [u8] {
             encode_unset(),     // solicited
             encode_bool(false), // randomizeSize
             encode_bool(false), // randomizePrice
-            encode_unset(),     // referenceContractId
-            encode_bool(false), // isPeggedChangeAmountDecrease
-            encode_unset(),     // peggedChangeAmount
-            encode_unset(),     // referenceChangeAmount
-            encode_unset(),     // referenceExchangeId
+            // PEG BENCH fields conditional on order_type — omitted
+            // for LMT/IOC.
             encode_int(0),      // conditionsCount
-            encode_unset(),     // conditionsIgnoreRth
-            encode_unset(),     // conditionsCancelOrder
+            // conditionsIgnoreRth + conditionsCancelOrder are
+            // conditional on conditionsCount > 0 per IBKR API. Skip.
             encode_unset(),     // adjustedOrderType
             encode_unset(),     // triggerPrice
             encode_unset(),     // lmtPriceOffset

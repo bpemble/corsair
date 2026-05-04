@@ -89,6 +89,11 @@ pub struct Runtime {
     /// on (CLAUDE.md §7) and by `IBKRMarginChecker.update_cached_margin`
     /// equivalent to compute the synthetic-vs-IBKR scale (§3).
     pub account: Mutex<corsair_broker_api::AccountSnapshot>,
+
+    /// v2 wire-to-wire latency JSONL stream
+    /// (logs-paper/wire_timing-YYYY-MM-DD.jsonl). One row per
+    /// place_order outcome with the five broker-edge timestamps.
+    pub wire_timing: crate::jsonl::JsonlWriter,
 }
 
 impl Runtime {
@@ -188,6 +193,13 @@ impl Runtime {
                 realized_pnl_today: 0.0,
                 timestamp_ns: 0,
             }),
+            wire_timing: crate::jsonl::JsonlWriter::start(
+                std::path::PathBuf::from(
+                    std::env::var("CORSAIR_LOGS_DIR")
+                        .unwrap_or_else(|_| "/app/logs-paper".into()),
+                ),
+                "wire_timing",
+            ),
         });
 
         // ── Connect ───────────────────────────────────────────────

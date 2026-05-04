@@ -1,0 +1,13 @@
+# Faster link step. mold is a parallel linker that's typically 5-10x
+# faster than the default `ld` for our binary sizes (~10-20 MB). clang
+# drives the linker via -fuse-ld; Dockerfile installs both packages.
+#
+# Rationale: every code edit triggers a relink, and link was the dominant
+# tail on a 4-core VPS (~10-15s of a 30s rebuild). On bare-metal
+# (12-core) the savings shrink in absolute terms but the linker still
+# dwarfs codegen for incremental rebuilds.
+#
+# To revert: delete this file. cargo falls back to system default (ld).
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
