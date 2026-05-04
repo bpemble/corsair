@@ -46,6 +46,18 @@ pub struct TickMsg {
     /// forward-compat with pre-v2 broker builds.
     #[serde(default)]
     pub broker_recv_ns: Option<u64>,
+    /// L2 depth: top-2 bid prices (level 0 = best, level 1 = next).
+    /// Set when broker has an active reqMktDepth subscription for
+    /// this leg (rotator covers ATM-nearest 5 strikes). None
+    /// otherwise — trader falls back to depth-1 self-fill approx.
+    #[serde(default)]
+    pub depth_bid_0: Option<f64>,
+    #[serde(default)]
+    pub depth_bid_1: Option<f64>,
+    #[serde(default)]
+    pub depth_ask_0: Option<f64>,
+    #[serde(default)]
+    pub depth_ask_1: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

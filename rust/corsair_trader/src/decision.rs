@@ -179,35 +179,44 @@ pub fn decide_on_tick(
     let bid_size = tick.bid_size.unwrap_or(0);
     let ask_size = tick.ask_size.unwrap_or(0);
 
-    // Self-fill filter: IBKR's L1 BBO includes our resting orders. If
-    // our_bid is at the displayed bid (and our qty matches the
-    // displayed size), we ARE the bid — comparing target against our
-    // own price for tick-jumping is a no-op at best, a runaway
-    // 1-tick-better loop at worst. Treat the BBO as "no external
-    // incumbent" on that side; the naive theo-derived target stands.
-    //
-    // This is a depth-1 approximation. Without a level-2 feed we can't
-    // see the next-best bid/ask. The conservative assumption is that
-    // when we appear to be the BBO, there's no useful external
-    // incumbent to improve over — fall through with raw_*-equivalent
-    // value of 0 so the tick-jump branch is skipped.
-    let bid = {
-        let buy_key = (TraderState::strike_key(strike), expiry.clone(), r_char, 'B');
-        let our_bid = state.our_orders.get(&buy_key).map(|o| o.price);
-        if let Some(p) = our_bid {
-            if (p - raw_bid).abs() < 1e-9 { 0.0 } else { raw_bid }
+    // Look up our resting orders (used by both the L2-aware path and
+    // the depth-1 self-fill fallback below).
+    let buy_key = (TraderState::strike_key(strike), expiry.clone(), r_char, 'B');
+    let sell_key = (TraderState::strike_key(strike), expiry.clone(), r_char, 'S');
+    let our_bid = state.our_orders.get(&buy_key).map(|o| o.price);
+    let our_ask = state.our_orders.get(&sell_key).map(|o| o.price);
+
+    // Compute "external" bid/ask — the next-best price after our own
+    // resting orders. With L2 (broker rotates ~5 active depth subs
+    // around ATM): if our_bid matches the top-of-book, fall to
+    // level 1; otherwise level 0 IS external. Without L2 (other
+    // strikes): use depth-1 self-fill approximation against raw_bid.
+    let bid = if let Some(d0) = tick.depth_bid_0 {
+        // L2 path.
+        if our_bid.map(|p| (p - d0).abs() < 1e-9).unwrap_or(false) {
+            // We're the top-of-book — external incumbent is level 1.
+            tick.depth_bid_1.unwrap_or(0.0)
+        } else {
+            d0
+        }
+    } else {
+        // L1 fallback.
+        if our_bid.map(|p| (p - raw_bid).abs() < 1e-9).unwrap_or(false) {
+            0.0
         } else {
             raw_bid
         }
     };
-    let ask = {
-        let sell_key = (TraderState::strike_key(strike), expiry.clone(), r_char, 'S');
-        let our_ask = state.our_orders.get(&sell_key).map(|o| o.price);
-        if let Some(p) = our_ask {
-            if (p - raw_ask).abs() < 1e-9 { 0.0 } else { raw_ask }
+    let ask = if let Some(d0) = tick.depth_ask_0 {
+        if our_ask.map(|p| (p - d0).abs() < 1e-9).unwrap_or(false) {
+            tick.depth_ask_1.unwrap_or(0.0)
         } else {
-            raw_ask
+            d0
         }
+    } else if our_ask.map(|p| (p - raw_ask).abs() < 1e-9).unwrap_or(false) {
+        0.0
+    } else {
+        raw_ask
     };
 
     // Two-sided market check (uses raw — even if WE are the BBO, we

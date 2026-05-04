@@ -181,6 +181,14 @@ impl MarketDataState {
         }
     }
 
+    /// Direct lookup by InstrumentId. Used by the broker daemon's
+    /// tick fast-path to attach depth state to outbound TickEvents
+    /// without re-resolving by (product, strike, expiry, right).
+    pub fn option_by_iid(&self, iid: InstrumentId) -> Option<&crate::option_state::OptionTick> {
+        let k = self.by_instrument.get(&iid)?;
+        self.options.get(k)
+    }
+
     /// Apply an IBKR depth operation to the option's L2 book.
     /// `is_bid` is true when IBKR sent side=1 (bid), false for side=0
     /// (ask). `op` is 0=insert, 1=update, 2=delete. No-op for non-

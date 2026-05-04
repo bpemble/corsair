@@ -186,6 +186,26 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
                 TickKind::AskSize => entry.ask_size = tick.size.map(|s| s as i32),
                 _ => return,
             }
+            // L2 depth: top-2 levels per side. The trader uses these
+            // to compute external best (subtracting its own resting
+            // size) so we don't tick-jump ourselves.
+            //
+            // None when the depth rotator hasn't subscribed this leg
+            // (only ATM-nearest ~5 strikes have active L2 at any
+            // given time) — trader falls back to the depth-1
+            // self-fill approximation.
+            let (depth_bid_0, depth_bid_1, depth_ask_0, depth_ask_1) = {
+                let md = runtime_for_closure.market_data.lock().unwrap();
+                if let Some(opt) = md.option_by_iid(tick.instrument_id) {
+                    let b0 = opt.depth.bids.first().map(|l| l.price);
+                    let b1 = opt.depth.bids.get(1).map(|l| l.price);
+                    let a0 = opt.depth.asks.first().map(|l| l.price);
+                    let a1 = opt.depth.asks.get(1).map(|l| l.price);
+                    (b0, b1, a0, a1)
+                } else {
+                    (None, None, None, None)
+                }
+            };
             let ev = TickEvent {
                 ty: "tick",
                 strike: entry.strike,
@@ -195,11 +215,12 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
                 ask: entry.ask,
                 bid_size: entry.bid_size,
                 ask_size: entry.ask_size,
-                // ts_ns is the broker dispatcher's channel-recv time
-                // (closest broker-internal proxy for TCP recv); same
-                // value reused for v2 wire-timing's broker_recv_ns.
                 ts_ns: tick.timestamp_ns,
                 broker_recv_ns: tick.timestamp_ns,
+                depth_bid_0,
+                depth_bid_1,
+                depth_ask_0,
+                depth_ask_1,
             };
             if let Ok(body) = rmp_serde::to_vec_named(&ev) {
                 if !server_for_closure.publish(&body) {
@@ -776,6 +797,19 @@ struct TickEvent<'a> {
     /// Trader echoes this back on PlaceOrder.triggering_tick_broker_recv_ns
     /// so the wire_timing JSONL row can join tick → order.
     broker_recv_ns: u64,
+    /// L2 depth: top-2 bid prices (level 0 = best, level 1 = next).
+    /// None when no depth subscription is active for this leg.
+    /// Trader uses these to find "external best" by subtracting its
+    /// own resting orders: if our_bid == depth_bid_0, treat depth_bid_1
+    /// as the external incumbent for tick-jumping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth_bid_0: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth_bid_1: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth_ask_0: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth_ask_1: Option<f64>,
 }
 
 /// Per-instrument bid/ask/size cache. Native ticks arrive per-kind
@@ -865,6 +899,19 @@ async fn forward_ticks(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
                     TickKind::AskSize => entry.ask_size = tick.size.map(|s| s as i32),
                     _ => unreachable!(),
                 }
+                // L2 depth top-2 levels (None when no active depth sub).
+                let (depth_bid_0, depth_bid_1, depth_ask_0, depth_ask_1) = {
+                    let md = runtime.market_data.lock().unwrap();
+                    if let Some(opt) = md.option_by_iid(tick.instrument_id) {
+                        let b0 = opt.depth.bids.first().map(|l| l.price);
+                        let b1 = opt.depth.bids.get(1).map(|l| l.price);
+                        let a0 = opt.depth.asks.first().map(|l| l.price);
+                        let a1 = opt.depth.asks.get(1).map(|l| l.price);
+                        (b0, b1, a0, a1)
+                    } else {
+                        (None, None, None, None)
+                    }
+                };
                 let ev = TickEvent {
                     ty: "tick",
                     strike: entry.strike,
@@ -879,6 +926,10 @@ async fn forward_ticks(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
                     // publish point, which lumped in the broadcast hop).
                     ts_ns: tick.timestamp_ns,
                     broker_recv_ns: tick.timestamp_ns,
+                    depth_bid_0,
+                    depth_bid_1,
+                    depth_ask_0,
+                    depth_ask_1,
                 };
                 if let Ok(body) = rmp_serde::to_vec_named(&ev) {
                     if !server.publish(&body) {
