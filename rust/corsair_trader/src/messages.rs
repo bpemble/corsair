@@ -89,7 +89,11 @@ pub struct HelloMsg {
     pub config: Option<HelloConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+// Serialize derive added 2026-05-05 so the msgpack_decode round-trip
+// tests can encode TickMsg via rmp_serde::to_vec_named — the broker
+// is the only producer of these on the wire, so the impl is unused
+// in production but harmless.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TickMsg {
     pub strike: f64,
     pub expiry: String,
