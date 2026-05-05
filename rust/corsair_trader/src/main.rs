@@ -131,7 +131,15 @@ fn main() -> std::io::Result<()> {
     // the hot loop is per-shard rather than against a single big
     // mutex.
     let allowed = corsair_ipc::cpu_affinity::allowed_cpus();
-    let bg_cpu = allowed.iter().find(|c| !pins.contains(c)).copied();
+    // Bg thread placement: reverse-iter so the first eligible cpu is the
+    // LAST allowed (e.g. cpu 11 with cpuset 8,9,10,11 + workers on 8,10).
+    // Cpu 11 is the SMT sibling of worker 1 (cpu 10), which perf data
+    // showed is mostly idle in busy-poll mode (worker 0 owns the hot
+    // loop). Sharing a physical core with the idle worker means the bg
+    // thread's 10Hz staleness sweep doesn't pollute worker 0's L1/L2.
+    // The previous forward-find landed bg on cpu 9 (sibling of worker
+    // 0) and the contention was visible in p99 telemetry.
+    let bg_cpu = allowed.iter().rev().find(|c| !pins.contains(c)).copied();
     let bg_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -354,7 +362,7 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
             let mut total_events: u64 = 0;
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                let (tel, n_events) = build_telemetry(&state, &counters, &mut total_events);
+                let (tel, n_events) = build_telemetry(&state, &counters, &commands_ring, &mut total_events);
                 let body = match rmp_serde::to_vec_named(&tel) {
                     Ok(b) => b,
                     Err(e) => {
@@ -368,7 +376,7 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                 drop(ring);
                 log::info!(
                     "telemetry: events={} ipc_p50={:?} ipc_p99={:?} ttt_p50={:?} ttt_p99={:?} \
-                     opts={} orders={} hedge={:?} decisions={}",
+                     opts={} orders={} hedge={:?} cmd_drops={} decisions={}",
                     n_events,
                     tel.ipc_p50_us,
                     tel.ipc_p99_us,
@@ -377,6 +385,7 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                     tel.n_options,
                     tel.n_active_orders,
                     tel.risk_hedge_delta,
+                    tel.commands_frames_dropped,
                     tel.decisions,
                 );
             }
@@ -877,9 +886,22 @@ fn on_tick(
     let mut wire_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut frame_ranges: Vec<std::ops::Range<usize>> =
         Vec::with_capacity(decisions.len() * 2);
-    let mut places_to_track: Vec<(OurOrderKey, OurOrder, Option<i64>)> =
+    // `_to_track` tuples carry the index of the "load-bearing" frame
+    // for that decision — the place_order frame for a Place, the
+    // modify_order frame for a Modify. After the ring-write loop,
+    // `frame_ok[idx] == true` iff that frame actually made it onto
+    // the SHM ring. If false, the broker never sees the command, so
+    // we MUST NOT advance our local our_orders state — otherwise the
+    // trader thinks an order is in-flight that doesn't exist, sits in
+    // skip_in_band on every subsequent tick, and the strike goes
+    // permanently idle (the bug we hunted for several hours on
+    // 2026-05-05). Cancel-before-place's cancel frame index is not
+    // tracked: a failed cancel just leaves the old order at IBKR
+    // until GTD-expiry; that's recoverable. A failed place is the
+    // poisoning case.
+    let mut places_to_track: Vec<(OurOrderKey, OurOrder, Option<i64>, usize)> =
         Vec::with_capacity(decisions.len());
-    let mut modifies_to_track: Vec<(OurOrderKey, f64, i64)> =
+    let mut modifies_to_track: Vec<(OurOrderKey, f64, i64, usize)> =
         Vec::with_capacity(decisions.len());
     let mut cancel_all_fired = false;
 
@@ -924,6 +946,7 @@ fn on_tick(
                     order_ref: "corsair_trader_rust".into(),
                     triggering_tick_broker_recv_ns: tick.broker_recv_ns,
                 };
+                let place_frame_idx = frame_ranges.len();
                 frame_ranges.push(encode_frame(&mut wire_buf, &p));
                 let okey: OurOrderKey = (
                     SharedState::strike_key(tick.strike),
@@ -940,6 +963,7 @@ fn on_tick(
                         order_id: None,
                     },
                     cancel_old_oid,
+                    place_frame_idx,
                 ));
             }
             Decision::Modify {
@@ -957,6 +981,7 @@ fn on_tick(
                     gtd_seconds: gtd_lifetime_s as u32,
                     triggering_tick_broker_recv_ns: tick.broker_recv_ns,
                 };
+                let modify_frame_idx = frame_ranges.len();
                 frame_ranges.push(encode_frame(&mut wire_buf, &m));
                 let okey: OurOrderKey = (
                     SharedState::strike_key(tick.strike),
@@ -964,7 +989,7 @@ fn on_tick(
                     r_char,
                     side.as_char(),
                 );
-                modifies_to_track.push((okey, price, order_id));
+                modifies_to_track.push((okey, price, order_id, modify_frame_idx));
             }
             Decision::CancelAll { order_ids } => {
                 let n = order_ids.len();
@@ -989,10 +1014,22 @@ fn on_tick(
     }
 
     // Single ring lock for ALL outbound frames in this tick.
+    // Each rejected frame increments place_dropped — surfaces as
+    // `place_dropped` in the 10s telemetry decisions dict and as the
+    // monotonic `cmd_drops=` field in the telemetry print line.
+    // `frame_ok[i]` records whether frame i made it onto the ring;
+    // the post-write tracking loops use this to decide whether to
+    // advance our_orders state (only on success — otherwise the
+    // trader poisons its own view by claiming an order is in-flight
+    // that the broker never received).
+    let mut frame_ok: Vec<bool> = vec![true; frame_ranges.len()];
     {
         let mut ring = commands_ring.lock().unwrap();
-        for r in &frame_ranges {
-            ring.write_frame(&wire_buf[r.clone()]);
+        for (i, r) in frame_ranges.iter().enumerate() {
+            if !ring.write_frame(&wire_buf[r.clone()]) {
+                counters.place_dropped.fetch_add(1, Ordering::Relaxed);
+                frame_ok[i] = false;
+            }
         }
     }
 
@@ -1028,13 +1065,30 @@ fn on_tick(
         state.our_orders.clear();
         state.orderid_to_key.clear();
     }
-    for (key, order, cancel_old_oid) in places_to_track {
+    for (key, order, cancel_old_oid, place_idx) in places_to_track {
+        // If the place frame was rejected by the SHM ring, the broker
+        // never sees this order — don't poison our_orders by claiming
+        // it's in-flight. A subsequent tick will re-evaluate from a
+        // clean state and try again. (The optional cancel for the old
+        // oid may or may not have made it; if it did, the old order
+        // is gone at the broker but we leave orderid_to_key alone so
+        // it can clear naturally on order_status. If not, GTD-expiry
+        // sweeps it within ~5s.)
+        if !frame_ok[place_idx] {
+            continue;
+        }
         if let Some(oid) = cancel_old_oid {
             state.orderid_to_key.remove(&oid);
         }
         state.our_orders.insert(key, order);
     }
-    for (key, new_price, order_id) in modifies_to_track {
+    for (key, new_price, order_id, modify_idx) in modifies_to_track {
+        // Same reasoning: a dropped modify means the broker still
+        // holds the prior price. Leaving our_orders unchanged keeps
+        // the trader's view consistent with what's actually resting.
+        if !frame_ok[modify_idx] {
+            continue;
+        }
         if let Some(mut o) = state.our_orders.get_mut(&key) {
             o.price = new_price;
             o.send_ns = send_ns_wall_after_write;
@@ -1164,7 +1218,9 @@ fn staleness_check(
         };
         if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
             let frame = ipc::protocol::pack_frame(&body);
-            commands_ring.lock().unwrap().write_frame(&frame);
+            if !commands_ring.lock().unwrap().write_frame(&frame) {
+                counters.place_dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
         state.our_orders.remove(&tc.key);
         state.orderid_to_key.remove(&tc.order_id);
@@ -1179,6 +1235,7 @@ fn staleness_check(
 fn build_telemetry(
     state: &Arc<SharedState>,
     counters: &Arc<DecisionCounters>,
+    commands_ring: &Arc<Mutex<Ring>>,
     total_events_running: &mut u64,
 ) -> (Telemetry, u64) {
     // Snapshot histograms under the histogram lock; drop before the
@@ -1206,6 +1263,7 @@ fn build_telemetry(
         let sc = state.scalars.lock();
         (sc.weekend_paused, sc.risk_hedge_delta)
     };
+    let commands_frames_dropped = commands_ring.lock().unwrap().frames_dropped;
     (
         Telemetry {
             msg_type: "telemetry",
@@ -1224,6 +1282,7 @@ fn build_telemetry(
             killed,
             weekend_paused,
             risk_hedge_delta,
+            commands_frames_dropped,
         },
         *total_events_running,
     )

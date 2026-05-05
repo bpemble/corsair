@@ -1,0 +1,13 @@
+# Cargo build config for the corsair workspace.
+#
+# target-cpu=native: tell rustc/LLVM to emit instructions specific to the
+# build host's CPU (i9-13900K Raptor Lake currently). Unlocks AVX2 and
+# microarch-specific tuning. ~5-10% speedup on hot compute paths.
+#
+# CAVEAT: native binaries are HOST-SPECIFIC. If we move to a different
+# CPU family (e.g. EPYC, AMD Zen), rebuild from that host. For Raptor
+# Lake → Raptor Lake Refresh (13900K → 14900K) it's safe; same ISA.
+# To produce a portable binary, change to target-cpu=alderlake (covers
+# 12th-13th-14th gen Intel) or x86-64-v3 (covers most modern x86_64).
+[build]
+rustflags = ["-C", "target-cpu=native"]
