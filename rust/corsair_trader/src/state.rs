@@ -387,6 +387,13 @@ pub struct DecisionCounters {
     pub risk_block_sell: AtomicU64,
     pub staleness_cancel: AtomicU64,
     pub staleness_cancel_dark: AtomicU64,
+    /// 2026-05-05 amend bias: drift-stale orders now refresh price via
+    /// `modify_order` instead of `cancel`+next-tick-place. Each modify
+    /// saves ~145 ms RTT vs cancel+place (per wire_timing analysis:
+    /// modify p50=41ms, place p50=186ms). Dark-book staleness still
+    /// uses cancel since we don't want to be in a dark market at any
+    /// price. Increment counts drift-only refreshes.
+    pub staleness_modify: AtomicU64,
     pub replace_cancel: AtomicU64,
     /// Quote update fired as a single modify_order (amend) instead of
     /// cancel + place. Replaces most replace_cancel events: a known
@@ -435,6 +442,7 @@ impl DecisionCounters {
             risk_block_sell: AtomicU64::new(0),
             staleness_cancel: AtomicU64::new(0),
             staleness_cancel_dark: AtomicU64::new(0),
+            staleness_modify: AtomicU64::new(0),
             replace_cancel: AtomicU64::new(0),
             modify: AtomicU64::new(0),
             place_dropped: AtomicU64::new(0),
@@ -470,6 +478,7 @@ impl DecisionCounters {
             ("risk_block_sell", &self.risk_block_sell),
             ("staleness_cancel", &self.staleness_cancel),
             ("staleness_cancel_dark", &self.staleness_cancel_dark),
+            ("staleness_modify", &self.staleness_modify),
             ("replace_cancel", &self.replace_cancel),
             ("modify", &self.modify),
             ("place_dropped", &self.place_dropped),

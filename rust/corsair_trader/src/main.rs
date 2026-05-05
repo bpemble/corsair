@@ -1102,10 +1102,23 @@ fn on_tick(
     }
 }
 
-/// Periodic staleness check — cancel any resting order whose
-/// current theo has drifted more than STALENESS_TICKS from the
-/// order's price. Mirrors Python's staleness_loop in
-/// src/trader/main.py. Runs at 10Hz from a tokio task.
+/// Periodic staleness check — refresh / cancel resting orders whose
+/// current theo has drifted, or whose market has gone dark. Runs at
+/// 10Hz from a bg-runtime tokio task.
+///
+/// Amend bias (2026-05-05): drift-stale orders are now refreshed via
+/// `modify_order` instead of cancel-then-next-tick-place. Modify RTT
+/// is ~4.5x faster than place (41ms vs 186ms p50 per wire_timing
+/// analysis), so the same quote update reaches IBKR faster. The new
+/// price targets `theo ± min_edge_ticks * tick_size` — the same
+/// edge the placement logic would target on the next tick. Drift
+/// always adjusts the order in the SAFE direction (BUY stays at or
+/// below ask, SELL stays at or above bid) because the staleness
+/// trigger condition (`drift > threshold`) implies the order's
+/// price is already on the resting side of theo.
+///
+/// Dark-book staleness still uses `cancel_order` — we don't want to
+/// be in a dark market at any refreshed price.
 fn staleness_check(
     state: &Arc<SharedState>,
     counters: &Arc<DecisionCounters>,
@@ -1113,18 +1126,25 @@ fn staleness_check(
 ) {
     use crate::decision::{compute_theo, time_to_expiry_years, STALENESS_TICKS};
 
-    // Snapshot the orders to check (avoid holding shard guards
-    // across the entire scan). Build the cancels list with a fresh
-    // iter — DashMap shard read guards drop as the iter advances.
-    struct ToCancel {
-        order_id: i64,
-        key: OurOrderKey,
-        reason_dark: bool,
+    enum Action {
+        Modify {
+            order_id: i64,
+            key: OurOrderKey,
+            new_price: f64,
+        },
+        Cancel {
+            order_id: i64,
+            key: OurOrderKey,
+            reason_dark: bool,
+        },
     }
-    let mut cancels: Vec<ToCancel> = Vec::new();
+    let mut actions: Vec<Action> = Vec::new();
 
-    let tick_size = state.scalar_snapshot().tick_size;
+    let snap = state.scalar_snapshot();
+    let tick_size = snap.tick_size;
     let threshold = STALENESS_TICKS as f64 * tick_size;
+    let min_edge = snap.min_edge_ticks as f64 * tick_size;
+    let gtd_lifetime_s = snap.gtd_lifetime_s;
 
     for entry in state.our_orders.iter() {
         let key = entry.key();
@@ -1173,22 +1193,38 @@ fn staleness_check(
         let theo = res.1;
 
         // Stale if our price is too unfavorable vs current theo.
+        // Drift > threshold → modify to fresh edge (amend bias).
         let drift = if s_char == 'B' {
             order.price - theo
         } else {
             theo - order.price
         };
         if drift > threshold {
-            cancels.push(ToCancel {
-                order_id,
-                key: key.clone(),
-                reason_dark: false,
-            });
+            // Target: same edge the placement logic uses on a fresh
+            // tick. BUY ↓ to (theo - min_edge), SELL ↑ to (theo +
+            // min_edge), snapped to the tick grid. Both directions
+            // stay on the safe side of the spread (drift > threshold
+            // implies order was already non-crossing).
+            let raw_new = if s_char == 'B' {
+                theo - min_edge
+            } else {
+                theo + min_edge
+            };
+            let new_price = (raw_new / tick_size).round() * tick_size;
+            // Skip degenerate "no movement" modify — shouldn't happen
+            // given drift > threshold but defensive.
+            if (new_price - order.price).abs() > tick_size * 0.01 {
+                actions.push(Action::Modify {
+                    order_id,
+                    key: key.clone(),
+                    new_price,
+                });
+            }
             continue;
         }
 
-        // Dark-book ON-REST guard (mirror Python). Cancel if
-        // latest tick state for this contract has gone dark.
+        // Dark-book ON-REST guard. Cancel (not modify) — we don't
+        // want to be in a dark market at any refreshed price.
         let opt_key = (key.0, Arc::clone(expiry), r_char);
         if let Some(latest_ref) = state.options.get(&opt_key) {
             let latest = latest_ref.value();
@@ -1198,7 +1234,7 @@ fn staleness_check(
             let asz = latest.ask_size.unwrap_or(0);
             let market_dark = !bid_alive || !ask_alive || bsz <= 0 || asz <= 0;
             if market_dark {
-                cancels.push(ToCancel {
+                actions.push(Action::Cancel {
                     order_id,
                     key: key.clone(),
                     reason_dark: true,
@@ -1207,31 +1243,70 @@ fn staleness_check(
         }
     }
 
-    if cancels.is_empty() {
+    if actions.is_empty() {
         return;
     }
 
-    // Send cancels and update local state. No bulk lock — DashMap
-    // remove takes a shard write guard per call; counters atomics
-    // are wait-free.
-    for tc in cancels {
-        let cancel = CancelOrder {
-            msg_type: "cancel_order",
-            ts_ns: now_ns_wall(),
-            order_id: tc.order_id,
-        };
-        if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
-            let frame = ipc::protocol::pack_frame(&body);
-            if !commands_ring.lock().unwrap().write_frame(&frame) {
-                counters.place_dropped.fetch_add(1, Ordering::Relaxed);
+    // Process actions. Each modify keeps the order live with a fresh
+    // price; each cancel removes it from our_orders. No bulk lock.
+    let now_w = now_ns_wall();
+    let now_m = now_ns_monotonic();
+    for action in actions {
+        match action {
+            Action::Modify {
+                order_id,
+                key,
+                new_price,
+            } => {
+                let modify = ModifyOrder {
+                    msg_type: "modify_order",
+                    ts_ns: now_w,
+                    order_id,
+                    price: new_price,
+                    gtd_seconds: gtd_lifetime_s as u32,
+                    triggering_tick_broker_recv_ns: None,
+                };
+                if let Ok(body) = rmp_serde::to_vec_named(&modify) {
+                    let frame = ipc::protocol::pack_frame(&body);
+                    if !commands_ring.lock().unwrap().write_frame(&frame) {
+                        counters.place_dropped.fetch_add(1, Ordering::Relaxed);
+                        // Frame dropped — leave our_orders entry as-is.
+                        // Next staleness pass will retry.
+                        continue;
+                    }
+                }
+                if let Some(mut o) = state.our_orders.get_mut(&key) {
+                    o.price = new_price;
+                    o.send_ns = now_w;
+                    o.place_monotonic_ns = now_m;
+                }
+                counters.staleness_modify.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
-        }
-        state.our_orders.remove(&tc.key);
-        state.orderid_to_key.remove(&tc.order_id);
-        if tc.reason_dark {
-            counters.staleness_cancel_dark.fetch_add(1, Ordering::Relaxed);
-        } else {
-            counters.staleness_cancel.fetch_add(1, Ordering::Relaxed);
+            Action::Cancel {
+                order_id,
+                key,
+                reason_dark,
+            } => {
+                let cancel = CancelOrder {
+                    msg_type: "cancel_order",
+                    ts_ns: now_w,
+                    order_id,
+                };
+                if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
+                    let frame = ipc::protocol::pack_frame(&body);
+                    if !commands_ring.lock().unwrap().write_frame(&frame) {
+                        counters.place_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                state.our_orders.remove(&key);
+                state.orderid_to_key.remove(&order_id);
+                if reason_dark {
+                    counters.staleness_cancel_dark.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    counters.staleness_cancel.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 }
