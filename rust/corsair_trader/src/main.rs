@@ -6,6 +6,10 @@
 //!
 //! Hot path is single-threaded; tokio is used for concurrent
 //! background tasks (telemetry, staleness loop, FIFO read polling).
+//! State sharding (Priority 1, 2026-05-04) puts the heavy maps
+//! behind DashMap and the histograms/scalars behind their own
+//! parking_lot::Mutex so the bg tasks don't block the hot loop on
+//! a single big mutex; see state.rs for the layout rationale.
 //!
 //! Env vars:
 //!   CORSAIR_TRADER_PLACES_ORDERS=1    actually send place_orders
@@ -30,14 +34,15 @@ mod tte_cache;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::decision::{decide_on_tick, Decision, GTD_LIFETIME_S};
+use crate::decision::{decide_on_tick, Decision};
 use crate::ipc::shm::{wait_for_rings, Ring, DEFAULT_RING_CAPACITY};
 use crate::jsonl::{DecisionInner, DecisionLog, LogPayload};
 use crate::messages::*;
-use crate::state::{DecisionCounters, OurOrder, TraderState};
+use crate::state::{DecisionCounters, OurOrder, OurOrderKey, SharedState};
 
 const VERSION: &str = "rust-v1";
 
@@ -62,7 +67,36 @@ fn places_orders() -> bool {
         .unwrap_or(false)
 }
 
+/// Lock all current and future memory pages so the hot path never
+/// page-faults. mimalloc allocations after this point are guaranteed
+/// resident (RLIMIT_MEMLOCK permitting). Logs and continues on failure
+/// — non-fatal so we still run on hosts where MEMLOCK is too small
+/// (the page-fault risk just remains as a tail-latency outlier).
+///
+/// Audit Phase 1 #6 (2026-05-05). Container needs `ulimits.memlock`
+/// raised in docker-compose.yml or this errors with EPERM/ENOMEM.
+fn lock_all_memory() {
+    unsafe {
+        let r = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
+        if r != 0 {
+            let e = std::io::Error::last_os_error();
+            eprintln!(
+                "mlockall failed (errno={:?}); continuing without page-fault \
+                 protection. Raise docker-compose ulimits.memlock to fix.",
+                e.raw_os_error()
+            );
+        } else {
+            eprintln!("mlockall MCL_CURRENT|MCL_FUTURE succeeded");
+        }
+    }
+}
+
 fn main() -> std::io::Result<()> {
+    // Lock memory before logger init / runtime build so future
+    // allocations from those subsystems are also resident. Pre-logger
+    // print uses raw eprintln since env_logger isn't up yet.
+    lock_all_memory();
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
@@ -70,13 +104,14 @@ fn main() -> std::io::Result<()> {
     // Multi-thread tokio runtime with pinned workers. Default 2
     // workers (per CLAUDE.md §17 — busy-poll hot loop + helpers).
     // CORSAIR_TRADER_WORKERS overrides. Pinning honors docker
-    // cpuset; on bare-metal trader gets cpuset 4,5,10,11 and pins
-    // workers to first two of those.
+    // cpuset; on bare-metal i9-13900K the trader gets cpuset
+    // 8,9,10,11 and SMT-aware pinning lands worker 0 on CPU 8 and
+    // worker 1 on CPU 10 (different physical cores).
     let desired = std::env::var("CORSAIR_TRADER_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(2);
-    let (workers, pinner) =
+    let (workers, pins, pinner) =
         corsair_ipc::cpu_affinity::build_pinner("corsair_trader", desired);
     let main_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
@@ -85,14 +120,18 @@ fn main() -> std::io::Result<()> {
         .build()?;
 
     // Background runtime — staleness sweep (10Hz) + telemetry (10s)
-    // live here, off the hot loop's cores. Removes scheduler
-    // preemption of the hot loop from these periodic tasks (the
-    // mutex contention itself remains until #7 lock-shards
-    // TraderState.options out of the single mutex). Single-thread
-    // current-thread runtime on a dedicated std thread, pinned to
-    // the next CPU after the main runtime's workers.
+    // live here, off the hot loop's cores. Single-thread current-
+    // thread runtime on a dedicated std thread, pinned to the first
+    // CPU in the cpuset that ISN'T already a worker pin. On hybrid
+    // Intel parts the worker pins are SMT-spread across distinct
+    // physical cores (see build_pinner), so the bg thread typically
+    // lands on the SMT sibling of one of the worker cores — shared
+    // L1/L2, low cross-core wakeup cost. With map locks now sharded
+    // (Priority 1, 2026-05-04) the bg task's brief contention with
+    // the hot loop is per-shard rather than against a single big
+    // mutex.
     let allowed = corsair_ipc::cpu_affinity::allowed_cpus();
-    let bg_cpu = allowed.get(workers).copied();
+    let bg_cpu = allowed.iter().find(|c| !pins.contains(c)).copied();
     let bg_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -177,17 +216,20 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
         log::error!("welcome write_frame failed (commands ring full?)");
     }
 
-    // Shared state behind a mutex; hot path is single-thread but
-    // background tasks (telemetry, staleness) need access.
-    let state = Arc::new(Mutex::new(TraderState::new()));
-    let counters = Arc::new(Mutex::new(DecisionCounters::default()));
+    // Lock-sharded shared state. SharedState fields use interior
+    // mutability (DashMap, parking_lot::Mutex) so callers can take
+    // shared `&SharedState` references; no top-level mutex needed.
+    // Counters use AtomicU64 fields — wait-free fetch_add per gate
+    // increment, no mutex acquire.
+    let state = Arc::new(SharedState::new());
+    let counters = Arc::new(DecisionCounters::default());
     let events_ring = Arc::new(Mutex::new(events_ring));
     let commands_ring = Arc::new(Mutex::new(commands_ring));
 
     // Graceful shutdown: SIGTERM / SIGINT → cancel every resting
     // order at IBKR, then exit. Without this, `docker compose stop
     // trader` killed the container while orders sat at IBKR for up
-    // to GTD_LIFETIME_S seconds — any market cross during that window
+    // to gtd_lifetime_s seconds — any market cross during that window
     // would fill orphans and rebuild the cascade pattern we just
     // spent the day fixing. Spawned on the bg runtime so the hot
     // path stays untouched.
@@ -214,14 +256,39 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                 _ = sigterm.recv() => log::warn!("graceful_shutdown: SIGTERM"),
                 _ = sigint.recv() => log::warn!("graceful_shutdown: SIGINT"),
             }
+            // Latency-harness hook: if `CORSAIR_TRADER_HIST_DUMP_PATH`
+            // is set, dump the in-memory ipc_us / ttt_us samples to a
+            // JSON file before doing any cancel work. The
+            // corsair_tick_replay orchestrator reads this file as the
+            // raw sample input for KS/bootstrap A/B comparison.
+            if let Ok(path) = std::env::var("CORSAIR_TRADER_HIST_DUMP_PATH") {
+                let h = state_sd.histograms.lock();
+                let dump = serde_json::json!({
+                    "ipc_us": h.ipc_us.iter().copied().collect::<Vec<_>>(),
+                    "ttt_us": h.ttt_us.iter().copied().collect::<Vec<_>>(),
+                });
+                drop(h);
+                match std::fs::write(&path, dump.to_string()) {
+                    Ok(()) => log::warn!(
+                        "graceful_shutdown: histogram dumped to {}",
+                        path
+                    ),
+                    Err(e) => log::error!(
+                        "graceful_shutdown: histogram dump to {} failed: {}",
+                        path,
+                        e
+                    ),
+                }
+            }
             // Snapshot all live order_ids and emit cancel frames.
-            // Holding state lock briefly only to read order_id list;
-            // we cap the cancel set at the moment of signal so an
-            // ongoing place_ack flood can't keep us alive.
-            let order_ids: Vec<i64> = {
-                let s = state_sd.lock().unwrap();
-                s.orderid_to_key.keys().copied().collect()
-            };
+            // DashMap iter holds shard read guards; we drop them by
+            // collecting eagerly so any concurrent place_ack flood
+            // can't keep us alive.
+            let order_ids: Vec<i64> = state_sd
+                .orderid_to_key
+                .iter()
+                .map(|e| *e.key())
+                .collect();
             log::warn!(
                 "graceful_shutdown: cancelling {} resting orders before exit",
                 order_ids.len()
@@ -301,7 +368,7 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                 drop(ring);
                 log::info!(
                     "telemetry: events={} ipc_p50={:?} ipc_p99={:?} ttt_p50={:?} ttt_p99={:?} \
-                     opts={} orders={} decisions={}",
+                     opts={} orders={} hedge={:?} decisions={}",
                     n_events,
                     tel.ipc_p50_us,
                     tel.ipc_p99_us,
@@ -309,6 +376,7 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                     tel.ttt_p99_us,
                     tel.n_options,
                     tel.n_active_orders,
+                    tel.risk_hedge_delta,
                     tel.decisions,
                 );
             }
@@ -400,8 +468,8 @@ impl std::os::fd::AsRawFd for EvtFd {
 }
 
 fn process_event(
-    state: &Arc<Mutex<TraderState>>,
-    counters: &Arc<Mutex<DecisionCounters>>,
+    state: &Arc<SharedState>,
+    counters: &Arc<DecisionCounters>,
     commands_ring: &Arc<Mutex<Ring>>,
     body: Vec<u8>,
     events_log: &Arc<jsonl::JsonlWriter>,
@@ -421,7 +489,7 @@ fn process_event(
         Ok(h) => h,
         Err(e) => {
             log::debug!("malformed msg, ignoring: {}", e);
-            counters.lock().unwrap().dropped_parse_errors += 1;
+            counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
     };
@@ -438,10 +506,11 @@ fn process_event(
     if let Some(emit_ns) = header.ts_ns {
         let lat = recv_wall_ns.saturating_sub(emit_ns) / 1000;
         if lat < 5_000_000 {
-            let mut s = state.lock().unwrap();
-            s.ipc_us.push_back(lat);
-            if s.ipc_us.len() > 2000 {
-                s.ipc_us.pop_front();
+            let mut h = state.histograms.lock();
+            let cap = h.ipc_cap;
+            h.ipc_us.push_back(lat);
+            if h.ipc_us.len() > cap {
+                h.ipc_us.pop_front();
             }
         }
     }
@@ -451,7 +520,7 @@ fn process_event(
             let mut tick: TickMsg = match rmp_serde::from_slice(&body) {
                 Ok(t) => t,
                 Err(_) => {
-                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
@@ -461,23 +530,30 @@ fn process_event(
             if tick.ts_ns.is_none() {
                 tick.ts_ns = header.ts_ns;
             }
-            on_tick(state, counters, commands_ring, &tick, decisions_log);
+            on_tick(
+                state,
+                counters,
+                commands_ring,
+                tick,
+                decisions_log,
+                recv_wall_ns,
+            );
         }
         "underlying_tick" => {
             let ut: UnderlyingTickMsg = match rmp_serde::from_slice(&body) {
                 Ok(t) => t,
                 Err(_) => {
-                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
-            state.lock().unwrap().underlying_price = ut.price;
+            state.scalars.lock().underlying_price = ut.price;
         }
         "vol_surface" => {
             let vs: VolSurfaceMsg = match rmp_serde::from_slice(&body) {
                 Ok(t) => t,
                 Err(_) => {
-                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
@@ -489,38 +565,42 @@ fn process_event(
                 forward: vs.forward,
                 params: vs.params,
                 fit_ts_ns: vs.ts_ns.unwrap_or(0),
+                calibrated_min_k: vs.calibrated_min_k,
+                calibrated_max_k: vs.calibrated_max_k,
             };
-            let mut s = state.lock().unwrap();
-            let expiry_arc = s.intern_expiry(&vs.expiry);
+            let expiry_arc = state.intern_expiry(&vs.expiry);
             let side_upper = vs.side.to_ascii_uppercase();
             if side_upper == "BOTH" {
-                s.vol_surfaces
+                state
+                    .vol_surfaces
                     .insert((Arc::clone(&expiry_arc), 'C'), entry.clone());
-                s.vol_surfaces.insert((expiry_arc, 'P'), entry);
+                state.vol_surfaces.insert((expiry_arc, 'P'), entry);
             } else {
                 let side_char = side_upper.chars().next().unwrap_or('C');
-                s.vol_surfaces.insert((expiry_arc, side_char), entry);
+                state.vol_surfaces.insert((expiry_arc, side_char), entry);
             }
         }
         "risk_state" => {
             let r: RiskStateMsg = match rmp_serde::from_slice(&body) {
                 Ok(t) => t,
                 Err(_) => {
-                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
-            let mut s = state.lock().unwrap();
-            s.risk_effective_delta = Some(r.effective_delta);
-            s.risk_margin_pct = Some(r.margin_pct);
-            s.risk_hedge_delta = Some(r.hedge_delta);
-            s.risk_state_age_monotonic_ns = now_ns_monotonic();
+            let mut sc = state.scalars.lock();
+            sc.risk_effective_delta = Some(r.effective_delta);
+            sc.risk_margin_pct = Some(r.margin_pct);
+            sc.risk_hedge_delta = Some(r.hedge_delta);
+            sc.risk_theta = Some(r.theta);
+            sc.risk_vega = Some(r.vega);
+            sc.risk_state_age_monotonic_ns = now_ns_monotonic();
         }
         "place_ack" => {
             let p: PlaceAckMsg = match rmp_serde::from_slice(&body) {
                 Ok(t) => t,
                 Err(_) => {
-                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
@@ -530,28 +610,26 @@ fn process_event(
                 "SELL" => 'S',
                 _ => return,
             };
-            let mut s = state.lock().unwrap();
-            let expiry_arc = s.intern_expiry(&p.expiry);
-            let key = (
-                TraderState::strike_key(p.strike),
+            let expiry_arc = state.intern_expiry(&p.expiry);
+            let key: OurOrderKey = (
+                SharedState::strike_key(p.strike),
                 expiry_arc,
                 r_char,
                 s_char,
             );
-            if let Some(o) = s.our_orders.get_mut(&key) {
-                o.order_id = Some(p.order_id);
-            } else {
-                s.our_orders.insert(
-                    key.clone(),
-                    OurOrder {
-                        price: p.price,
-                        send_ns: now_ns_wall(),
-                        place_monotonic_ns: now_ns_monotonic(),
-                        order_id: Some(p.order_id),
-                    },
-                );
-            }
-            s.orderid_to_key.insert(p.order_id, key);
+            // Update existing OR insert. DashMap's entry API gives us
+            // both branches in one op without a TOCTOU window.
+            state
+                .our_orders
+                .entry(key.clone())
+                .and_modify(|o| o.order_id = Some(p.order_id))
+                .or_insert_with(|| OurOrder {
+                    price: p.price,
+                    send_ns: now_ns_wall(),
+                    place_monotonic_ns: now_ns_monotonic(),
+                    order_id: Some(p.order_id),
+                });
+            state.orderid_to_key.insert(p.order_id, key);
         }
         // Broker emits "order_status" (the canonical name in Rust runtime);
         // legacy adapters may use "order_ack". Both routed to the same
@@ -560,7 +638,7 @@ fn process_event(
             let a: OrderAckMsg = match rmp_serde::from_slice(&body) {
                 Ok(t) => t,
                 Err(_) => {
-                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
@@ -579,9 +657,8 @@ fn process_event(
                 "Filled" | "Cancelled" | "ApiCancelled" | "Inactive" | "Rejected" | "ApiRejected"
             );
             if terminal {
-                let mut s = state.lock().unwrap();
-                if let Some(key) = s.orderid_to_key.remove(&oid) {
-                    s.our_orders.remove(&key);
+                if let Some((_, key)) = state.orderid_to_key.remove(&oid) {
+                    state.our_orders.remove(&key);
                 }
             }
         }
@@ -589,60 +666,86 @@ fn process_event(
             let k: KillMsg = match rmp_serde::from_slice(&body) {
                 Ok(t) => t,
                 Err(_) => {
-                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
             let src = k.source.unwrap_or_else(|| "?".to_string());
             let reason = k.reason.unwrap_or_else(|| "?".to_string());
-            state.lock().unwrap().kills.insert(src, reason);
+            // Increment kills_count only on a NEW source — duplicate
+            // kill messages for an already-active source must not
+            // double-count, or kills_count drifts above kills.len()
+            // and the hot path's gate fires forever.
+            if state.kills.insert(src, reason).is_none() {
+                state.kills_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
         "resume" => {
             let k: KillMsg = match rmp_serde::from_slice(&body) {
                 Ok(t) => t,
                 Err(_) => {
-                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
             let src = k.source.unwrap_or_else(|| "?".to_string());
-            state.lock().unwrap().kills.remove(&src);
+            if state.kills.remove(&src).is_some() {
+                state.kills_count.fetch_sub(1, Ordering::Relaxed);
+            }
         }
         "weekend_pause" => {
             let wp: WeekendPauseMsg = match rmp_serde::from_slice(&body) {
                 Ok(t) => t,
                 Err(_) => {
-                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
-            state.lock().unwrap().weekend_paused = wp.paused;
+            state.scalars.lock().weekend_paused = wp.paused;
         }
         "hello" => {
             let h: HelloMsg = match rmp_serde::from_slice(&body) {
                 Ok(t) => t,
                 Err(_) => {
-                    counters.lock().unwrap().dropped_parse_errors += 1;
+                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
             log::warn!("broker hello received");
             if let Some(cfg) = h.config {
-                let mut s = state.lock().unwrap();
+                let mut sc = state.scalars.lock();
                 if let Some(v) = cfg.min_edge_ticks {
-                    s.min_edge_ticks = v as i32;
+                    sc.min_edge_ticks = v as i32;
                 }
                 if let Some(v) = cfg.tick_size {
-                    s.tick_size = v;
+                    sc.tick_size = v;
                 }
                 if let Some(v) = cfg.delta_ceiling {
-                    s.delta_ceiling = v;
+                    sc.delta_ceiling = v;
                 }
                 if let Some(v) = cfg.delta_kill {
-                    s.delta_kill = v;
+                    sc.delta_kill = v;
                 }
                 if let Some(v) = cfg.margin_ceiling_pct {
-                    s.margin_ceiling_pct = v;
+                    sc.margin_ceiling_pct = v;
+                }
+                if let Some(v) = cfg.gtd_lifetime_s {
+                    sc.gtd_lifetime_s = v;
+                }
+                if let Some(v) = cfg.gtd_refresh_lead_s {
+                    sc.gtd_refresh_lead_s = v;
+                }
+                if let Some(v) = cfg.dead_band_ticks {
+                    sc.dead_band_ticks = v as i32;
+                }
+                if let Some(v) = cfg.skip_if_spread_over_edge_mul {
+                    sc.skip_if_spread_over_edge_mul = v;
+                }
+                if let Some(v) = cfg.theta_kill {
+                    sc.theta_kill = v;
+                }
+                if let Some(v) = cfg.vega_kill {
+                    sc.vega_kill = v;
                 }
             }
         }
@@ -653,61 +756,95 @@ fn process_event(
 }
 
 fn on_tick(
-    state: &Arc<Mutex<TraderState>>,
-    counters: &Arc<Mutex<DecisionCounters>>,
+    state: &Arc<SharedState>,
+    counters: &Arc<DecisionCounters>,
     commands_ring: &Arc<Mutex<Ring>>,
-    tick: &TickMsg,
+    mut tick: TickMsg,
     decisions_log: &Arc<jsonl::JsonlWriter>,
+    decide_ns_wall: u64,
 ) {
     let now_mono = now_ns_monotonic();
-    let decide_ns_wall = now_ns_wall();
+    // Item 8 (2026-05-05): `decide_ns_wall` is now passed in from
+    // `process_event` rather than re-sampled here. Eliminates one
+    // `SystemTime::now()` syscall per tick (~80-150ns each on x86_64
+    // vDSO + Rust wrapping). The few-µs gap between `recv_wall_ns`
+    // and the previous `decide_ns_wall` is absorbed into the place
+    // order's `ts_ns` field — broker-side wire timing inflates
+    // marginally but stays within the noise envelope.
 
-    // Hot-path layout (post p50-1..4 rewrite, 2026-05-04):
-    //   1. Lock state+counters; intern expiry; insert option; decide.
-    //      TTT push DEFERRED to step 4 — see p50-4 below.
+    // Hot-path layout (post p50-1..4 rewrite, lock-shard 2026-05-04):
+    //   1. Intern expiry; insert option (DashMap insert, no big lock);
+    //      decide. decide_on_tick takes one scalar lock for its
+    //      snapshot, and DashMap reads on theo_cache / vol_surfaces /
+    //      our_orders.
     //   2. Enqueue typed Decision payloads to JSONL (writer formats
     //      ISO + serializes off-thread; see p50-2).
-    //   3. Encode all outbound msgpack frames (UNLOCKED).
+    //   3. Encode all outbound msgpack frames.
     //   4. Take ring lock, write all frames, unlock. Capture
     //      `send_ns_wall` AFTER write — that's the honest TTT
     //      end-point now (p50-4 — was previously stamped at function
     //      entry, which under-reported TTT by the encode + write
     //      window).
-    //   5. Single state-lock for incumbency updates + TTT push.
-    let (decisions, forward, expiry_arc, r_char) = {
-        let mut s = state.lock().unwrap();
-        let mut c = counters.lock().unwrap();
-        let r_char = tick.right.chars().next().unwrap_or('C').to_ascii_uppercase();
-        // p50-3: intern the expiry string once per tick. All HashMap
-        // keys downstream share this Arc — clones are bumps (~5ns)
-        // not allocations. Production has ~4 unique expiries, so the
-        // intern hits cache after warmup.
-        let expiry_arc = s.intern_expiry(&tick.expiry);
-        // Slim option-state insert. NO TickMsg clone (saves 2 String
-        // allocs); key built with right-as-char (saves 1 alloc); value
-        // is OptionState (8 fields, all stack/Copy types).
-        let opt_state = crate::state::OptionState {
-            strike: tick.strike,
-            bid: tick.bid,
-            ask: tick.ask,
-            bid_size: tick.bid_size,
-            ask_size: tick.ask_size,
-            ts_ns: tick.ts_ns,
-            broker_recv_ns: tick.broker_recv_ns,
-        };
-        s.options.insert(
-            (TraderState::strike_key(tick.strike), Arc::clone(&expiry_arc), r_char),
-            opt_state,
-        );
-        let forward = s.underlying_price;
-        let decisions = decide_on_tick(&mut s, &mut c, tick, &expiry_arc, now_mono);
-        (decisions, forward, expiry_arc, r_char)
+    //   5. Apply incumbency updates (DashMap inserts/removes).
+    //      Histogram TTT push uses its own parking_lot lock.
+    let r_char = tick.right.chars().next().unwrap_or('C').to_ascii_uppercase();
+    let expiry_arc = state.intern_expiry(&tick.expiry);
+    // IBKR's L1 market data emits bid_changed and ask_changed as
+    // separate updates, so an incoming tick often has only one of
+    // (bid, ask) populated. Merge the new tick with the cached
+    // OptionState for this strike/right so the dark-book gate
+    // (raw_bid<=0 || raw_ask<=0) sees the latest known values for
+    // BOTH sides rather than dropping the tick because the missing
+    // side is None. Without this merge every one-sided tick fires
+    // skip_one_sided_or_dark — at off-hours paper, that's basically
+    // every tick.
+    let opt_key = (
+        SharedState::strike_key(tick.strike),
+        Arc::clone(&expiry_arc),
+        r_char,
+    );
+    let cached = state.options.get(&opt_key).map(|r| *r.value());
+    let merged_bid = tick.bid.or(cached.and_then(|c| c.bid));
+    let merged_ask = tick.ask.or(cached.and_then(|c| c.ask));
+    let merged_bid_size = tick.bid_size.or(cached.and_then(|c| c.bid_size));
+    let merged_ask_size = tick.ask_size.or(cached.and_then(|c| c.ask_size));
+    let opt_state = crate::state::OptionState {
+        strike: tick.strike,
+        bid: merged_bid,
+        ask: merged_ask,
+        bid_size: merged_bid_size,
+        ask_size: merged_ask_size,
+        ts_ns: tick.ts_ns,
+        broker_recv_ns: tick.broker_recv_ns,
     };
+    state.options.insert(opt_key, opt_state);
+    // Snapshot scalars once: forward feeds JSONL logging, gtd_lifetime_s
+    // feeds ModifyOrder.gtd_seconds. decide_on_tick takes its own snap
+    // internally for the gates that need the rest of the scalar block.
+    let (forward, gtd_lifetime_s) = {
+        let sc = state.scalars.lock();
+        (sc.underlying_price, sc.gtd_lifetime_s)
+    };
+    // Item 7 (2026-05-05): mutate the owned `tick` in place with the
+    // merged L1 view rather than building a fresh `TickMsg`. The
+    // previous approach allocated two Strings per tick (expiry, right
+    // clones) — small but frequent. Taking the tick by-value at the
+    // call site lets us reuse its allocations.
+    tick.bid = merged_bid;
+    tick.ask = merged_ask;
+    tick.bid_size = merged_bid_size;
+    tick.ask_size = merged_ask_size;
+    let decisions = decide_on_tick(state, counters, &tick, &expiry_arc, now_mono);
 
-    // p50-2: log decisions to JSONL via typed payload — UNLOCKED.
+    // p50-2: log decisions to JSONL via typed payload.
     // The writer task formats ISO + serializes the JSON line.
     for d in &decisions {
-        if let Decision::Place { side, price, cancel_old_oid } = d {
+        if let Decision::Place {
+            side,
+            price,
+            cancel_old_oid,
+        } = d
+        {
             decisions_log.write(LogPayload::Decision(DecisionLog {
                 recv_ns: decide_ns_wall,
                 trigger_ts_ns: tick.ts_ns,
@@ -729,28 +866,51 @@ fn on_tick(
         return;
     }
 
-    // Build all outbound frames first (msgpack encoding) — UNLOCKED.
-    // Frame ts_ns uses the decide-time wall clock; that's the
-    // semantic the broker expects on `place_order.ts_ns`. The TTT
-    // metric uses a SEPARATE timestamp captured after ring write.
-    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(decisions.len() * 2);
-    let mut places_to_track: Vec<((u64, Arc<str>, char, char), OurOrder, Option<i64>)> =
+    // Item 9 (2026-05-05): single preallocated wire buffer reused
+    // for every frame this tick. Previous design did 2 Vec
+    // allocations per frame (rmp_serde::to_vec_named + pack_frame);
+    // typical Place produced 4 fresh Vecs, Modify 2. Now we encode
+    // each frame's body directly into `wire_buf` after a 4-byte
+    // length placeholder, then backfill the placeholder with the
+    // actual body length. `frame_ranges` records each frame's slice
+    // so the ring-write loop below feeds them out one at a time.
+    let mut wire_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut frame_ranges: Vec<std::ops::Range<usize>> =
+        Vec::with_capacity(decisions.len() * 2);
+    let mut places_to_track: Vec<(OurOrderKey, OurOrder, Option<i64>)> =
         Vec::with_capacity(decisions.len());
-    let mut modifies_to_track: Vec<((u64, Arc<str>, char, char), f64, i64)> =
+    let mut modifies_to_track: Vec<(OurOrderKey, f64, i64)> =
         Vec::with_capacity(decisions.len());
     let mut cancel_all_fired = false;
+
+    fn encode_frame<T: serde::Serialize>(
+        buf: &mut Vec<u8>,
+        val: &T,
+    ) -> std::ops::Range<usize> {
+        let frame_start = buf.len();
+        buf.extend_from_slice(&[0u8; 4]); // length placeholder
+        let body_start = buf.len();
+        let _ = rmp_serde::encode::write_named(buf, val);
+        let body_len = (buf.len() - body_start) as u32;
+        buf[frame_start..frame_start + 4]
+            .copy_from_slice(&body_len.to_be_bytes());
+        frame_start..buf.len()
+    }
+
     for d in decisions {
         match d {
-            Decision::Place { side, price, cancel_old_oid } => {
+            Decision::Place {
+                side,
+                price,
+                cancel_old_oid,
+            } => {
                 if let Some(oid) = cancel_old_oid {
                     let cancel = CancelOrder {
                         msg_type: "cancel_order",
                         ts_ns: decide_ns_wall,
                         order_id: oid,
                     };
-                    if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
-                        frames.push(ipc::protocol::pack_frame(&body));
-                    }
+                    frame_ranges.push(encode_frame(&mut wire_buf, &cancel));
                 }
                 let p = PlaceOrder {
                     msg_type: "place_order",
@@ -764,12 +924,13 @@ fn on_tick(
                     order_ref: "corsair_trader_rust".into(),
                     triggering_tick_broker_recv_ns: tick.broker_recv_ns,
                 };
-                if let Ok(body) = rmp_serde::to_vec_named(&p) {
-                    frames.push(ipc::protocol::pack_frame(&body));
-                }
-                let okey = (TraderState::strike_key(tick.strike),
-                            Arc::clone(&expiry_arc), r_char,
-                            side.as_char());
+                frame_ranges.push(encode_frame(&mut wire_buf, &p));
+                let okey: OurOrderKey = (
+                    SharedState::strike_key(tick.strike),
+                    Arc::clone(&expiry_arc),
+                    r_char,
+                    side.as_char(),
+                );
                 places_to_track.push((
                     okey,
                     OurOrder {
@@ -781,7 +942,11 @@ fn on_tick(
                     cancel_old_oid,
                 ));
             }
-            Decision::Modify { side, order_id, price } => {
+            Decision::Modify {
+                side,
+                order_id,
+                price,
+            } => {
                 // Single-message amend. Refresh GTD on every modify so
                 // the order doesn't expire mid-update.
                 let m = ModifyOrder {
@@ -789,15 +954,16 @@ fn on_tick(
                     ts_ns: decide_ns_wall,
                     order_id,
                     price,
-                    gtd_seconds: GTD_LIFETIME_S as u32,
+                    gtd_seconds: gtd_lifetime_s as u32,
                     triggering_tick_broker_recv_ns: tick.broker_recv_ns,
                 };
-                if let Ok(body) = rmp_serde::to_vec_named(&m) {
-                    frames.push(ipc::protocol::pack_frame(&body));
-                }
-                let okey = (TraderState::strike_key(tick.strike),
-                            Arc::clone(&expiry_arc), r_char,
-                            side.as_char());
+                frame_ranges.push(encode_frame(&mut wire_buf, &m));
+                let okey: OurOrderKey = (
+                    SharedState::strike_key(tick.strike),
+                    Arc::clone(&expiry_arc),
+                    r_char,
+                    side.as_char(),
+                );
                 modifies_to_track.push((okey, price, order_id));
             }
             Decision::CancelAll { order_ids } => {
@@ -808,9 +974,7 @@ fn on_tick(
                         ts_ns: decide_ns_wall,
                         order_id: *oid,
                     };
-                    if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
-                        frames.push(ipc::protocol::pack_frame(&body));
-                    }
+                    frame_ranges.push(encode_frame(&mut wire_buf, &cancel));
                 }
                 log::warn!(
                     "trader: CancelAll fired ({} orders) — risk self-block",
@@ -827,8 +991,8 @@ fn on_tick(
     // Single ring lock for ALL outbound frames in this tick.
     {
         let mut ring = commands_ring.lock().unwrap();
-        for frame in &frames {
-            ring.write_frame(frame);
+        for r in &frame_ranges {
+            ring.write_frame(&wire_buf[r.clone()]);
         }
     }
 
@@ -840,43 +1004,42 @@ fn on_tick(
     // ring" wire-to-wire-internal latency.
     let send_ns_wall_after_write = now_ns_wall();
 
-    // Single state lock for all incumbency updates AND TTT push.
-    {
-        let mut s = state.lock().unwrap();
+    // TTT histogram push — separate parking_lot mutex so the bg
+    // telemetry sort doesn't block this tiny (~50ns) push.
+    if let Some(emit_ns) = tick.ts_ns {
+        let lat = send_ns_wall_after_write.saturating_sub(emit_ns) / 1000;
+        if lat < 5_000_000 {
+            let mut h = state.histograms.lock();
+            let cap = h.ttt_cap;
+            h.ttt_us.push_back(lat);
+            if h.ttt_us.len() > cap {
+                h.ttt_us.pop_front();
+            }
+        }
+    }
 
-        if let Some(emit_ns) = tick.ts_ns {
-            let lat = send_ns_wall_after_write.saturating_sub(emit_ns) / 1000;
-            if lat < 5_000_000 {
-                s.ttt_us.push_back(lat);
-                if s.ttt_us.len() > 500 {
-                    s.ttt_us.pop_front();
-                }
-            }
+    if cancel_all_fired {
+        // Wipe local incumbents — broker-side cancel will land
+        // shortly, but our_orders should already reflect "no
+        // longer want resting". Avoids re-firing CancelAll on
+        // subsequent ticks during the in-flight cancel window
+        // and prevents the next tick from trying to amend
+        // orders we just cancelled.
+        state.our_orders.clear();
+        state.orderid_to_key.clear();
+    }
+    for (key, order, cancel_old_oid) in places_to_track {
+        if let Some(oid) = cancel_old_oid {
+            state.orderid_to_key.remove(&oid);
         }
-
-        if cancel_all_fired {
-            // Wipe local incumbents — broker-side cancel will land
-            // shortly, but our_orders should already reflect "no
-            // longer want resting". Avoids re-firing CancelAll on
-            // subsequent ticks during the in-flight cancel window
-            // and prevents the next tick from trying to amend
-            // orders we just cancelled.
-            s.our_orders.clear();
-            s.orderid_to_key.clear();
-        }
-        for (key, order, cancel_old_oid) in places_to_track {
-            if let Some(oid) = cancel_old_oid {
-                s.orderid_to_key.remove(&oid);
-            }
-            s.our_orders.insert(key, order);
-        }
-        for (key, new_price, order_id) in modifies_to_track {
-            if let Some(o) = s.our_orders.get_mut(&key) {
-                o.price = new_price;
-                o.send_ns = send_ns_wall_after_write;
-                o.place_monotonic_ns = now_mono;
-                debug_assert_eq!(o.order_id, Some(order_id));
-            }
+        state.our_orders.insert(key, order);
+    }
+    for (key, new_price, order_id) in modifies_to_track {
+        if let Some(mut o) = state.our_orders.get_mut(&key) {
+            o.price = new_price;
+            o.send_ns = send_ns_wall_after_write;
+            o.place_monotonic_ns = now_mono;
+            debug_assert_eq!(o.order_id, Some(order_id));
         }
     }
 }
@@ -886,89 +1049,102 @@ fn on_tick(
 /// order's price. Mirrors Python's staleness_loop in
 /// src/trader/main.py. Runs at 10Hz from a tokio task.
 fn staleness_check(
-    state: &Arc<Mutex<TraderState>>,
-    counters: &Arc<Mutex<DecisionCounters>>,
+    state: &Arc<SharedState>,
+    counters: &Arc<DecisionCounters>,
     commands_ring: &Arc<Mutex<Ring>>,
 ) {
     use crate::decision::{compute_theo, time_to_expiry_years, STALENESS_TICKS};
 
-    // Snapshot the orders to check (avoid holding lock during sends).
-    // For each (key, OurOrder), compute current theo using fit-time
-    // forward + vol_surface. Cancel if order is too far off.
+    // Snapshot the orders to check (avoid holding shard guards
+    // across the entire scan). Build the cancels list with a fresh
+    // iter — DashMap shard read guards drop as the iter advances.
     struct ToCancel {
         order_id: i64,
-        key: (u64, Arc<str>, char, char),
+        key: OurOrderKey,
         reason_dark: bool,
     }
     let mut cancels: Vec<ToCancel> = Vec::new();
 
-    {
-        let s = state.lock().unwrap();
-        let tick_size = s.tick_size;
-        let threshold = STALENESS_TICKS as f64 * tick_size;
-        for (key, order) in s.our_orders.iter() {
-            let order_id = match order.order_id {
-                Some(o) => o,
-                None => continue, // unack'd; can't cancel yet
-            };
-            let strike = f64::from_bits(key.0);
-            let expiry = &key.1;
-            let r_char = key.2;
-            let s_char = key.3;
+    let tick_size = state.scalar_snapshot().tick_size;
+    let threshold = STALENESS_TICKS as f64 * tick_size;
 
-            // Look up vol surface for this option. Arc::clone bumps,
-            // not allocates.
-            let vp = s
-                .vol_surfaces
-                .get(&(Arc::clone(expiry), r_char))
-                .or_else(|| s.vol_surfaces.get(&(Arc::clone(expiry), 'C')))
-                .or_else(|| s.vol_surfaces.get(&(Arc::clone(expiry), 'P')));
-            let vp = match vp {
-                Some(v) => v,
-                None => continue,
-            };
-            let tte = match time_to_expiry_years(expiry) {
-                Some(t) if t > 0.0 => t,
-                _ => continue,
-            };
-            // Use fit-time forward (anchored point for SVI).
-            let res = match compute_theo(vp.forward, strike, tte, r_char, &vp.params) {
-                Some(v) => v,
-                None => continue,
-            };
-            let theo = res.1;
+    for entry in state.our_orders.iter() {
+        let key = entry.key();
+        let order = entry.value();
+        let order_id = match order.order_id {
+            Some(o) => o,
+            None => continue, // unack'd; can't cancel yet
+        };
+        let strike = f64::from_bits(key.0);
+        let expiry = &key.1;
+        let r_char = key.2;
+        let s_char = key.3;
 
-            // Stale if our price is too unfavorable vs current theo.
-            let drift = if s_char == 'B' {
-                order.price - theo
-            } else {
-                theo - order.price
-            };
-            if drift > threshold {
+        // Look up vol surface for this option. Arc::clone bumps,
+        // not allocates. DashMap get returns a Ref guard; clone
+        // out the value to a stack local so the guard drops.
+        let vp = state
+            .vol_surfaces
+            .get(&(Arc::clone(expiry), r_char))
+            .map(|r| r.value().clone())
+            .or_else(|| {
+                state
+                    .vol_surfaces
+                    .get(&(Arc::clone(expiry), 'C'))
+                    .map(|r| r.value().clone())
+            })
+            .or_else(|| {
+                state
+                    .vol_surfaces
+                    .get(&(Arc::clone(expiry), 'P'))
+                    .map(|r| r.value().clone())
+            });
+        let vp = match vp {
+            Some(v) => v,
+            None => continue,
+        };
+        let tte = match time_to_expiry_years(expiry) {
+            Some(t) if t > 0.0 => t,
+            _ => continue,
+        };
+        // Use fit-time forward (anchored point for SVI).
+        let res = match compute_theo(vp.forward, strike, tte, r_char, &vp.params) {
+            Some(v) => v,
+            None => continue,
+        };
+        let theo = res.1;
+
+        // Stale if our price is too unfavorable vs current theo.
+        let drift = if s_char == 'B' {
+            order.price - theo
+        } else {
+            theo - order.price
+        };
+        if drift > threshold {
+            cancels.push(ToCancel {
+                order_id,
+                key: key.clone(),
+                reason_dark: false,
+            });
+            continue;
+        }
+
+        // Dark-book ON-REST guard (mirror Python). Cancel if
+        // latest tick state for this contract has gone dark.
+        let opt_key = (key.0, Arc::clone(expiry), r_char);
+        if let Some(latest_ref) = state.options.get(&opt_key) {
+            let latest = latest_ref.value();
+            let bid_alive = matches!(latest.bid, Some(b) if b > 0.0);
+            let ask_alive = matches!(latest.ask, Some(a) if a > 0.0);
+            let bsz = latest.bid_size.unwrap_or(0);
+            let asz = latest.ask_size.unwrap_or(0);
+            let market_dark = !bid_alive || !ask_alive || bsz <= 0 || asz <= 0;
+            if market_dark {
                 cancels.push(ToCancel {
                     order_id,
                     key: key.clone(),
-                    reason_dark: false,
+                    reason_dark: true,
                 });
-                continue;
-            }
-
-            // Dark-book ON-REST guard (mirror Python). Cancel if
-            // latest tick state for this contract has gone dark.
-            let opt_key = (key.0, Arc::clone(expiry), r_char);
-            if let Some(latest) = s.options.get(&opt_key) {
-                let bid_alive = matches!(latest.bid, Some(b) if b > 0.0);
-                let ask_alive = matches!(latest.ask, Some(a) if a > 0.0);
-                let bsz = latest.bid_size.unwrap_or(0);
-                let asz = latest.ask_size.unwrap_or(0);
-                let market_dark = !bid_alive || !ask_alive || bsz <= 0 || asz <= 0;
-                if market_dark {
-                    cancels.push(ToCancel {
-                        order_id,
-                        key: key.clone(),
-                        reason_dark: true,
-                    });
-                }
             }
         }
     }
@@ -977,41 +1153,43 @@ fn staleness_check(
         return;
     }
 
-    // Send cancels and update local state.
-    {
-        let mut s = state.lock().unwrap();
-        let mut c = counters.lock().unwrap();
-        for tc in cancels {
-            let cancel = CancelOrder {
-                msg_type: "cancel_order",
-                ts_ns: now_ns_wall(),
-                order_id: tc.order_id,
-            };
-            if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
-                let frame = ipc::protocol::pack_frame(&body);
-                commands_ring.lock().unwrap().write_frame(&frame);
-            }
-            s.our_orders.remove(&tc.key);
-            s.orderid_to_key.remove(&tc.order_id);
-            if tc.reason_dark {
-                c.staleness_cancel_dark += 1;
-            } else {
-                c.staleness_cancel += 1;
-            }
+    // Send cancels and update local state. No bulk lock — DashMap
+    // remove takes a shard write guard per call; counters atomics
+    // are wait-free.
+    for tc in cancels {
+        let cancel = CancelOrder {
+            msg_type: "cancel_order",
+            ts_ns: now_ns_wall(),
+            order_id: tc.order_id,
+        };
+        if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
+            let frame = ipc::protocol::pack_frame(&body);
+            commands_ring.lock().unwrap().write_frame(&frame);
+        }
+        state.our_orders.remove(&tc.key);
+        state.orderid_to_key.remove(&tc.order_id);
+        if tc.reason_dark {
+            counters.staleness_cancel_dark.fetch_add(1, Ordering::Relaxed);
+        } else {
+            counters.staleness_cancel.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
 fn build_telemetry(
-    state: &Arc<Mutex<TraderState>>,
-    counters: &Arc<Mutex<DecisionCounters>>,
+    state: &Arc<SharedState>,
+    counters: &Arc<DecisionCounters>,
     total_events_running: &mut u64,
 ) -> (Telemetry, u64) {
-    let s = state.lock().unwrap();
-    let c = counters.lock().unwrap();
-    let mut ipc_sorted: Vec<u64> = s.ipc_us.iter().copied().collect();
+    // Snapshot histograms under the histogram lock; drop before the
+    // sort so the hot path can keep pushing while we sort the copy.
+    let (mut ipc_sorted, mut ttt_sorted) = {
+        let h = state.histograms.lock();
+        let ipc: Vec<u64> = h.ipc_us.iter().copied().collect();
+        let ttt: Vec<u64> = h.ttt_us.iter().copied().collect();
+        (ipc, ttt)
+    };
     ipc_sorted.sort_unstable();
-    let mut ttt_sorted: Vec<u64> = s.ttt_us.iter().copied().collect();
     ttt_sorted.sort_unstable();
     let pct = |v: &[u64], q: f64| -> Option<u64> {
         if v.is_empty() {
@@ -1021,25 +1199,31 @@ fn build_telemetry(
             Some(v[idx.min(v.len() - 1)])
         }
     };
-    let n_events = s.options.len() as u64; // approx; real count in process loop
+    let n_events = state.options.len() as u64; // approx; real count in process loop
     *total_events_running += n_events;
+    let killed: Vec<String> = state.kills.iter().map(|e| e.key().clone()).collect();
+    let (weekend_paused, risk_hedge_delta) = {
+        let sc = state.scalars.lock();
+        (sc.weekend_paused, sc.risk_hedge_delta)
+    };
     (
         Telemetry {
             msg_type: "telemetry",
             ts_ns: now_ns_wall(),
             events: serde_json::json!({}),
-            decisions: c.to_json(),
+            decisions: counters.to_json(),
             ipc_p50_us: pct(&ipc_sorted, 0.50),
             ipc_p99_us: pct(&ipc_sorted, 0.99),
             ipc_n: ipc_sorted.len(),
             ttt_p50_us: pct(&ttt_sorted, 0.50),
             ttt_p99_us: pct(&ttt_sorted, 0.99),
             ttt_n: ttt_sorted.len(),
-            n_options: s.options.len(),
-            n_active_orders: s.our_orders.len(),
-            n_vol_expiries: s.vol_surfaces.len(),
-            killed: s.kills.keys().cloned().collect(),
-            weekend_paused: s.weekend_paused,
+            n_options: state.options.len(),
+            n_active_orders: state.our_orders.len(),
+            n_vol_expiries: state.vol_surfaces.len(),
+            killed,
+            weekend_paused,
+            risk_hedge_delta,
         },
         *total_events_running,
     )
