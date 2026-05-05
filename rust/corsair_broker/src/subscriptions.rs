@@ -84,6 +84,64 @@ async fn subscribe_product(
         .await?;
     }
 
+    // 2b. Subscribe the resolved hedge contract's tick stream so its
+    //     mark is independent of the options-engine underlying. Without
+    //     this, hedge MTM uses the wrong futures contract — calendar
+    //     spread between (e.g.) HGM6 and HGK6 sign-flips a real gain
+    //     into a reported loss of `multiplier × spread` per contract.
+    //     CLAUDE.md §10 had this for the Python broker; Phase 6.7
+    //     cutover lost it. Best-effort — failure logs and continues.
+    let hedge_contract: Option<Contract> = {
+        let h = runtime.hedge.lock().unwrap();
+        h.for_product(symbol)
+            .and_then(|m| m.hedge_contract().cloned())
+    };
+    if let Some(hc) = hedge_contract {
+        let same_as_underlying = hc.instrument_id == underlying.instrument_id;
+        if same_as_underlying {
+            // Hedge instrument == options underlying. Register the
+            // hedge map so hedge_underlying_price() returns a value,
+            // but skip the duplicate subscribe (would alloc a second
+            // IBKR market-data line for no benefit).
+            let mut md = runtime.market_data.lock().unwrap();
+            md.register_hedge_underlying(symbol, hc.instrument_id);
+            log::warn!(
+                "subscribe[{symbol}]: hedge {} shares iid with options underlying — \
+                 reusing existing tick subscription",
+                hc.local_symbol
+            );
+        } else {
+            {
+                let mut md = runtime.market_data.lock().unwrap();
+                md.register_hedge_underlying(symbol, hc.instrument_id);
+            }
+            let b = runtime.broker.clone();
+            match b
+                .subscribe_ticks(TickSubscription {
+                    instrument_id: hc.instrument_id,
+                    tick_by_tick: false,
+                    consumer_tag: Some("hedge".into()),
+                    contract: Some(hc.clone()),
+                })
+                .await
+            {
+                Ok(_) => log::warn!(
+                    "subscribe[{symbol}]: hedge {} (expiry={}, conId={}) tick stream subscribed",
+                    hc.local_symbol, hc.expiry, hc.instrument_id.0
+                ),
+                Err(e) => log::error!(
+                    "subscribe[{symbol}]: hedge {} subscribe_ticks failed: {} — \
+                     hedge MTM will fall back to options underlying with WARN",
+                    hc.local_symbol, e
+                ),
+            }
+        }
+    } else {
+        log::warn!(
+            "subscribe[{symbol}]: no hedge contract resolved — hedge MTM will be unavailable"
+        );
+    }
+
     // 3. Wait briefly for first underlying tick. If we don't get one
     //    in 10s, fall back to picking ATM from product config (e.g.
     //    we know HG trades around $6/lb).
@@ -153,6 +211,104 @@ async fn subscribe_product(
     Ok(())
 }
 
+/// Periodic re-centering of the option-data subscription window on
+/// the parity-implied forward (HGM6 for HG options). Boot-time
+/// `subscribe_product` anchors on underlying spot (HGK6) because no
+/// option mids are available yet to compute parity F. Once the first
+/// SABR fit lands and parity F is known, the right anchor is
+/// `parity_F ± strike_range × increment` — symmetric around the
+/// option's actual underlying, not the front-month future we tick.
+///
+/// Without this, the wing closer to spot has 7+ strikes covered but
+/// the wing farther from spot loses coverage by the K6→M6 carry
+/// (~1 nickel in HG). Cadence is 30s; only ADDS missing strikes,
+/// never unsubscribes.
+pub async fn run_window_recenter(runtime: Arc<Runtime>) {
+    use std::time::Duration;
+
+    const CADENCE_SEC: u64 = 30;
+    let mut t = tokio::time::interval(Duration::from_secs(CADENCE_SEC));
+    // Burn immediate tick + give vol_surface fitter a head start.
+    t.tick().await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    log::info!("window_recenter: cadence {CADENCE_SEC}s");
+    loop {
+        t.tick().await;
+        let products: Vec<ProductConfig> = runtime
+            .config
+            .products
+            .iter()
+            .filter(|p| p.enabled)
+            .cloned()
+            .collect();
+        for product in &products {
+            let symbol = &product.name;
+            // Read parity F from most recent fit for this product.
+            // Fits are keyed (product, expiry, side); first match wins.
+            let parity_f: Option<f64> = {
+                let cache = runtime.vol_surface_cache.lock().unwrap();
+                cache
+                    .iter()
+                    .find(|((p, _, _), _)| p == symbol)
+                    .map(|(_, e)| e.forward)
+            };
+            let Some(f) = parity_f else { continue };
+            if f <= 0.0 {
+                continue;
+            }
+            // Desired strike window centered on parity F.
+            let atm = round_to_increment(f, product.strike_increment);
+            let desired = generate_strikes(atm, product);
+            // Front-month expiry — pull from any already-subscribed
+            // option (boot path established it).
+            let (front_expiry, already_subbed): (
+                Option<NaiveDate>,
+                std::collections::HashSet<(u64, NaiveDate, Right)>,
+            ) = {
+                let md = runtime.market_data.lock().unwrap();
+                let mut earliest: Option<NaiveDate> = None;
+                let mut set = std::collections::HashSet::new();
+                for opt in md.options_for_product(symbol) {
+                    set.insert((opt.strike.to_bits(), opt.expiry, opt.right));
+                    earliest = match earliest {
+                        Some(e) if e <= opt.expiry => Some(e),
+                        _ => Some(opt.expiry),
+                    };
+                }
+                (earliest, set)
+            };
+            let Some(expiry) = front_expiry else { continue };
+            // Subscribe missing (strike, right) tuples.
+            let mut added = 0usize;
+            for strike in &desired {
+                for right in [Right::Call, Right::Put] {
+                    let key = (strike.to_bits(), expiry, right);
+                    if already_subbed.contains(&key) {
+                        continue;
+                    }
+                    if let Err(e) =
+                        qualify_and_subscribe(&runtime, product, *strike, expiry, right).await
+                    {
+                        log::warn!(
+                            "window_recenter[{symbol}] {} {:?}: {}",
+                            strike, right, e
+                        );
+                    } else {
+                        added += 1;
+                    }
+                }
+            }
+            if added > 0 {
+                log::warn!(
+                    "window_recenter[{symbol}]: parity F={:.4}, ATM={:.4} → \
+                     +{added} new (strike, right) subs",
+                    f, atm
+                );
+            }
+        }
+    }
+}
+
 /// Periodic depth-subscription rotator. Mirrors the Python broker's
 /// `rotate_depth_subscriptions` (CLAUDE.md note from market_data.py).
 /// Every CADENCE_SEC, picks the K options closest to ATM that have
@@ -172,21 +328,42 @@ pub async fn run_depth_rotator(runtime: Arc<Runtime>) {
 
     const CADENCE_SEC: u64 = 30;
     const MAX_ACTIVE: usize = 5; // IBKR concurrent reqMktDepth limit
+    // Of the MAX_ACTIVE slots, the FIXED_NEAREST closest-to-spot
+    // strikes are kept permanently subscribed (they have the highest
+    // fill rate, so we want continuous external-best visibility on
+    // them). The remaining MAX_ACTIVE - FIXED_NEAREST = ROTATE_SLOTS
+    // slots cycle through the rest of the in-scope set so wing
+    // strikes get periodic L2 coverage too. Pre-fix, the rotator
+    // always took `take(MAX_ACTIVE)` of the closest, locking the
+    // wings out indefinitely; tick-jumping on the wings degraded to
+    // the L1 self-fill heuristic that can't distinguish "alone at
+    // price" from "tied with peer," leaving us queue-disadvantaged
+    // on most of our quoted scope (CLAUDE.md §12 / 2026-05-05 audit).
+    const FIXED_NEAREST: usize = 2;
+    const ROTATE_SLOTS: usize = MAX_ACTIVE - FIXED_NEAREST;
     const NUM_ROWS: i32 = 5;     // depth levels per side
 
     // Map (instrument_id) → handle, so we can unsubscribe later.
     let mut active: std::collections::HashMap<corsair_broker_api::InstrumentId, TickStreamHandle> =
         std::collections::HashMap::new();
+    // Cursor into the rotation slice; advances by ROTATE_SLOTS each
+    // cadence so the full wing set is covered over time. With ~20
+    // wing candidates and 3 rotating slots at 30s cadence, each
+    // strike gets re-covered every ~3.5 minutes.
+    let mut rotate_cursor: usize = 0;
     let mut t = tokio::time::interval(Duration::from_secs(CADENCE_SEC));
     // First tick fires immediately — let market_data accumulate first.
     t.tick().await;
     tokio::time::sleep(Duration::from_secs(10)).await;
-    log::info!("depth_rotator: cadence {CADENCE_SEC}s, max_active={MAX_ACTIVE}");
+    log::info!(
+        "depth_rotator: cadence {CADENCE_SEC}s, max_active={MAX_ACTIVE} \
+         (fixed_nearest={FIXED_NEAREST}, rotating={ROTATE_SLOTS})"
+    );
     loop {
         t.tick().await;
-        // Pick target instruments: strikes nearest ATM with valid L1
-        // mid, capped at MAX_ACTIVE (call+put treated separately so
-        // we cover both sides of ATM).
+        // Pick target instruments: nearest FIXED_NEAREST always-on,
+        // remaining ROTATE_SLOTS cycle through the rest of the
+        // in-scope set so wings get periodic L2 coverage too.
         //
         // Audit T1-3: lock order MUST be portfolio → market_data,
         // matching tasks.rs:periodic_*. Hoist the products list out
@@ -217,11 +394,33 @@ pub async fn run_depth_rotator(runtime: Arc<Runtime>) {
                 }
             }
             candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            candidates
-                .into_iter()
-                .take(MAX_ACTIVE)
-                .map(|(_, iid, c)| (iid, c))
-                .collect()
+
+            // Split: nearest FIXED_NEAREST as always-on, the rest as
+            // the rotation pool.
+            let fixed_n = FIXED_NEAREST.min(candidates.len());
+            let rotation_pool: Vec<_> = candidates.split_off(fixed_n);
+            let fixed = candidates;
+
+            let mut chosen: Vec<(corsair_broker_api::InstrumentId, corsair_broker_api::Contract)> =
+                Vec::with_capacity(MAX_ACTIVE);
+            for (_, iid, c) in fixed.into_iter() {
+                chosen.push((iid, c));
+            }
+            let pool_len = rotation_pool.len();
+            if pool_len > 0 {
+                let take = ROTATE_SLOTS.min(pool_len);
+                let start = rotate_cursor % pool_len;
+                for i in 0..take {
+                    let (_, iid, c) = rotation_pool[(start + i) % pool_len].clone();
+                    chosen.push((iid, c));
+                }
+                // Advance cursor by the number we took so the next
+                // cadence starts where we left off. mod by pool_len
+                // keeps the index bounded; on ATM drift the pool
+                // shrinks/grows but the cursor still wraps cleanly.
+                rotate_cursor = (rotate_cursor + take) % pool_len;
+            }
+            chosen
         };
 
         let want: HashSet<corsair_broker_api::InstrumentId> =
@@ -269,7 +468,28 @@ pub async fn run_depth_rotator(runtime: Arc<Runtime>) {
             }
         }
         if !active.is_empty() {
-            log::info!("depth_rotator: {} active L2 subs", active.len());
+            // Emit the strike list so an operator can verify rotation
+            // is actually happening (the count alone wouldn't catch
+            // the regression we just fixed: 5 active, same 5 forever).
+            // Resolves iids back to local_symbol via qualified_contracts.
+            let strikes: Vec<String> = {
+                let qc = runtime.qualified_contracts.lock().unwrap();
+                let mut s: Vec<String> = active
+                    .keys()
+                    .map(|iid| {
+                        qc.get(iid)
+                            .map(|c| c.local_symbol.clone())
+                            .unwrap_or_else(|| format!("{:?}", iid))
+                    })
+                    .collect();
+                s.sort();
+                s
+            };
+            log::info!(
+                "depth_rotator: {} active L2 subs: {}",
+                active.len(),
+                strikes.join(", ")
+            );
         }
     }
 }
@@ -406,6 +626,19 @@ async fn qualify_and_subscribe(
         // trading_class, not a synthesized placeholder).
         let mut qc = runtime.qualified_contracts.lock().unwrap();
         qc.insert(qualified.instrument_id, qualified.clone());
+    }
+    {
+        // Fast-path key for handle_place / handle_modify so they can
+        // resolve a Contract in O(1) instead of scanning every option
+        // and format-allocating expiry strings per call. See
+        // Runtime::contract_by_key doc for rationale.
+        let r_char = match right {
+            corsair_broker_api::Right::Call => 'C',
+            corsair_broker_api::Right::Put => 'P',
+        };
+        let expiry_str = expiry.format("%Y%m%d").to_string();
+        let mut cbk = runtime.contract_by_key.lock().unwrap();
+        cbk.insert((strike.to_bits(), expiry_str, r_char), qualified.clone());
     }
     {
         let b = runtime.broker.clone();

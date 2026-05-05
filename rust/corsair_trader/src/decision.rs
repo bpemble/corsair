@@ -3,14 +3,31 @@
 //! friendliness.
 //!
 //! Returns a `Decision` enum the caller acts on.
+//!
+//! Lock-shard refactor (Priority 1, 2026-05-04): the function now
+//! takes `&SharedState` (no exclusive reference). Scalars are
+//! snapshotted once at the top of the function so the decision
+//! flow doesn't repeatedly acquire `state.scalars`. Counter
+//! increments use atomic `fetch_add` — wait-free, no lock.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::messages::{TickMsg, VolParams};
 use crate::pricing::{black76_price, sabr_implied_vol, svi_implied_vol};
-use crate::state::{DecisionCounters, TraderState};
+use crate::state::{DecisionCounters, ScalarSnapshot, SharedState};
 
 // Constants matching Python's src/trader/main.py.
+// 0.25 = ATM + 5 OTM strikes per side (spec §3.3, asym ATM+OTM).
+// 0.30 admitted a 7th strike (offset 0.30) past the spec window.
+/// Strike-window gate: skip if `|K - pricing_forward| > this`.
+/// 0.30 (5 strikes × 0.05 + ½-strike of slack) so the in-scope set
+/// stays stable as F drifts within an ATM bin. Tightening to 0.25
+/// (2026-05-05 morning) caused 6.20 C to flip out of scope when
+/// F=5.9295 even though ATM was 6.00 — wing strikes don't appear in
+/// `our_orders` for whole rotations of the SABR fit, then snap back
+/// when F crosses the bin boundary. CLAUDE.md §12 documents 0.30 as
+/// the historical / intended value.
 pub const MAX_STRIKE_OFFSET_USD: f64 = 0.30;
 // STALENESS_INTERVAL_SECS used to gate the staleness loop cadence;
 // the loop now uses tokio::sleep(100ms) directly so the constant is
@@ -29,14 +46,25 @@ pub const COOLDOWN_NS: u64 = 250_000_000; // 250ms
 /// (one new order every 250ms × 4 strikes × 2 sides = ~32/sec) and
 /// every market cross filled the entire stack.
 pub const UNACK_INFLIGHT_NS: u64 = 2_000_000_000; // 2s
-pub const DEAD_BAND_TICKS: i32 = 1;
-pub const GTD_LIFETIME_S: f64 = 5.0;
-pub const GTD_REFRESH_LEAD_S: f64 = 1.5;
+// DEAD_BAND_TICKS / GTD_LIFETIME_S / GTD_REFRESH_LEAD_S now live on
+// the broker (config/runtime_v3.yaml `quoting:` block), shipped to the
+// trader on the `hello` IPC event. Hot-path values come from
+// ScalarSnapshot. Defaults match the YAML's documented values; if the
+// hello event hasn't arrived, those defaults run instead.
 pub const RISK_STATE_STALE_S: f64 = 5.0;
 pub const MIN_BBO_SIZE: i32 = 1;
+/// Skip quoting when |spot - fit_forward| exceeds this. Reverted to
+/// 200 on 2026-05-05 evening after empirical observation showed the
+/// HG K6→M6 calendar carry is structurally ~$0.04–0.05 (80–100 ticks),
+/// so a 100-tick guard fired on ~24% of decisions during normal US
+/// session. The morning's adverse-selection event was misdiagnosed
+/// as drift; root causes were the missing kill IPC + tick cache
+/// initialization bug + symmetric quoting absorbing one-sided flow.
+/// All three are fixed; the drift guard's job is to catch genuinely
+/// stale fits between 60s SABR cycles, which 200 ticks ($0.10) covers
+/// while leaving the structural carry untouched.
 pub const MAX_FORWARD_DRIFT_TICKS: i32 = 200;
 pub const ATM_TOL_USD: f64 = 0.025; // half-strike tolerance for OTM-only
-pub const CANCEL_THRESHOLD_S: f64 = 1.0; // skip cancel-before-replace if GTD imminent
 
 #[derive(Debug)]
 pub enum Decision {
@@ -107,51 +135,101 @@ impl Side {
 /// caller owns interning so all downstream HashMap keys share one Arc
 /// and clones are bumps, not allocations.
 pub fn decide_on_tick(
-    state: &mut TraderState,
-    counters: &mut DecisionCounters,
+    state: &SharedState,
+    counters: &DecisionCounters,
     tick: &TickMsg,
     expiry_arc: &Arc<str>,
     now_monotonic_ns: u64,
 ) -> Vec<Decision> {
     let mut out = Vec::with_capacity(2);
-    let forward = state.underlying_price;
-    if forward <= 0.0 {
+
+    // One scalar lock for the whole decision flow. Subsequent reads
+    // hit the stack-local `snap`.
+    let snap = state.scalar_snapshot();
+
+    // Spot is the front-month underlying price (HGK6 tick stream).
+    // Distinct from the option's pricing forward (HGM6 parity-F or
+    // similar carry-anchored value), which arrives via vol_surface.
+    let spot = snap.underlying_price;
+    if spot <= 0.0 {
         return out;
     }
     let strike = tick.strike;
-    let right = &tick.right;
+    // Single canonical right-as-char for the rest of the function.
+    // 'C' / 'P' uppercased; defaults to 'C' on a malformed tick to
+    // match the historical Python fallback. Used as the OTM gate
+    // discriminator AND as the HashMap key for vol_surfaces /
+    // theo_cache / our_orders.
+    let r_char = tick
+        .right
+        .chars()
+        .next()
+        .unwrap_or('C')
+        .to_ascii_uppercase();
 
-    // Don't quote into a halt
-    if !state.kills.is_empty() {
+    // Don't quote into a halt. Atomic mirror of `kills.len()` —
+    // DashMap::is_empty() would touch every shard, measurable cost
+    // per tick; this is one Relaxed load.
+    if state.kills_count.load(Ordering::Relaxed) > 0 {
         return out;
     }
-    if state.weekend_paused {
+    if snap.weekend_paused {
         return out;
     }
+
+    // Vol surface lookup hoisted ABOVE the strike-window gates so
+    // gating anchors on the option's pricing forward (vp_msg.forward,
+    // typically parity-F of the option's underlying contract) rather
+    // than spot. With HG carry the two differ ~$0.05 (≈100 ticks);
+    // gating on spot rejected strikes that ARE inside the option's
+    // pricing window. Per quant advisor 2026-05-05 spec Rec 3.
+    let vp_msg = state
+        .vol_surfaces
+        .get(&(Arc::clone(expiry_arc), r_char))
+        .map(|r| r.value().clone())
+        .or_else(|| {
+            state
+                .vol_surfaces
+                .get(&(Arc::clone(expiry_arc), 'C'))
+                .map(|r| r.value().clone())
+        })
+        .or_else(|| {
+            state
+                .vol_surfaces
+                .get(&(Arc::clone(expiry_arc), 'P'))
+                .map(|r| r.value().clone())
+        });
+    let vp_msg = match vp_msg {
+        Some(v) => v,
+        None => {
+            counters.skip_no_vol_surface.fetch_add(1, Ordering::Relaxed);
+            return out;
+        }
+    };
+    let pricing_forward = vp_msg.forward;
 
     // Compute risk-gate values once per tick.
-    let (risk_buy, risk_sell, risk_all) = compute_risk_gates(state, now_monotonic_ns);
+    let (risk_buy, risk_sell, risk_all) = compute_risk_gates(&snap, now_monotonic_ns);
 
-    // ATM-window restriction.
-    if (strike - forward).abs() > MAX_STRIKE_OFFSET_USD {
-        counters.skip_off_atm += 1;
+    // ATM-window restriction — anchored on PRICING forward (Rec 3).
+    if (strike - pricing_forward).abs() > MAX_STRIKE_OFFSET_USD {
+        counters.skip_off_atm.fetch_add(1, Ordering::Relaxed);
         return out;
     }
 
-    // OTM-only restriction (CLAUDE.md §12).
-    let r_upper = right.chars().next().unwrap_or('C').to_ascii_uppercase();
-    if r_upper == 'C' && strike < forward - ATM_TOL_USD {
-        counters.skip_itm += 1;
+    // OTM-only restriction (CLAUDE.md §12) — anchored on PRICING forward.
+    if r_char == 'C' && strike < pricing_forward - ATM_TOL_USD {
+        counters.skip_itm.fetch_add(1, Ordering::Relaxed);
         return out;
     }
-    if r_upper == 'P' && strike > forward + ATM_TOL_USD {
-        counters.skip_itm += 1;
+    if r_char == 'P' && strike > pricing_forward + ATM_TOL_USD {
+        counters.skip_itm.fetch_add(1, Ordering::Relaxed);
         return out;
     }
 
     // All-blocking risk gate hoisted before per-side loop.
     if risk_all {
-        counters.risk_block += 2;
+        counters.risk_block.fetch_add(2, Ordering::Relaxed);
         // Proactive cancel: when self-blocked on risk AND we still
         // have live quotes resting, fire cancel_all immediately. The
         // alternative (passively waiting for the per-fill kill) lets
@@ -161,8 +239,8 @@ pub fn decide_on_tick(
         // see empty our_orders and skip.
         let order_ids: Vec<i64> = state
             .our_orders
-            .values()
-            .filter_map(|o| o.order_id)
+            .iter()
+            .filter_map(|e| e.value().order_id)
             .collect();
         if !order_ids.is_empty() {
             out.push(Decision::CancelAll { order_ids });
@@ -170,23 +248,6 @@ pub fn decide_on_tick(
         return out;
     }
 
-    // Vol surface lookup: try (expiry, right_char) then either side.
-    // Lookups clone the expiry Arc (bump, not alloc).
-    let r_char = right.chars().next().unwrap_or('C').to_ascii_uppercase();
-    let vp_msg = state
-        .vol_surfaces
-        .get(&(Arc::clone(expiry_arc), r_char))
-        .or_else(|| state.vol_surfaces.get(&(Arc::clone(expiry_arc), 'C')))
-        .or_else(|| state.vol_surfaces.get(&(Arc::clone(expiry_arc), 'P')));
-    let vp_msg = match vp_msg {
-        Some(v) => v.clone(),
-        None => {
-            counters.skip_no_vol_surface += 1;
-            return out;
-        }
-    };
-
-    let fit_forward = vp_msg.forward;
     let tte = match time_to_expiry_years(expiry_arc) {
         Some(t) if t > 0.0 => t,
         _ => return out,
@@ -202,16 +263,40 @@ pub fn decide_on_tick(
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         if now_ns.saturating_sub(vp_msg.fit_ts_ns) > 120_000_000_000 {
-            counters.skip_vol_surface_stale += 1;
+            counters
+                .skip_vol_surface_stale
+                .fetch_add(1, Ordering::Relaxed);
             return out;
         }
     }
 
-    // Forward-drift guard.
-    let drift = (forward - fit_forward).abs();
-    let max_drift = MAX_FORWARD_DRIFT_TICKS as f64 * state.tick_size;
+    // is_strike_calibrated (spec §3.3, audit item 6). Refuse to quote
+    // strikes outside the SABR fit's calibrated envelope — SABR
+    // extrapolation past the strike range used for the fit is
+    // unreliable. Half a tick of slack on each side covers float
+    // round-trip drift from broker → wire → trader. When either
+    // bound is None (older broker) the gate is skipped.
+    if let (Some(min_k), Some(max_k)) = (vp_msg.calibrated_min_k, vp_msg.calibrated_max_k) {
+        let slack = snap.tick_size * 0.5;
+        if strike < min_k - slack || strike > max_k + slack {
+            counters
+                .skip_uncalibrated_strike
+                .fetch_add(1, Ordering::Relaxed);
+            return out;
+        }
+    }
+
+    // Forward-drift guard. Compares spot (front-month underlying)
+    // against pricing_forward (option's parity-implied F). Detects
+    // when the parity estimator has stopped tracking spot — the
+    // broker's vol_surface fitter falls back to spot at fit-time
+    // when this drift exceeds 50 ticks, so seeing it here means
+    // either spot has moved between fits or the broker accepted a
+    // borderline fit.
+    let drift = (spot - pricing_forward).abs();
+    let max_drift = MAX_FORWARD_DRIFT_TICKS as f64 * snap.tick_size;
     if drift > max_drift {
-        counters.skip_forward_drift += 1;
+        counters.skip_forward_drift.fetch_add(1, Ordering::Relaxed);
         return out;
     }
 
@@ -222,28 +307,31 @@ pub fn decide_on_tick(
     // and invalidate only when a new fit lands. Saves ~80µs per
     // tick on the SVI implied_vol + Black76 chain in the amend loop.
     let theo_key = (
-        TraderState::strike_key(strike),
+        SharedState::strike_key(strike),
         Arc::clone(expiry_arc),
         r_char,
         vp_msg.fit_ts_ns,
     );
-    let theo = match state.theo_cache.get(&theo_key).copied() {
+    let theo = match state.theo_cache.get(&theo_key).map(|r| *r.value()) {
         Some(t) => t,
         None => {
-            let (_iv, t) = match compute_theo(fit_forward, strike, tte, r_char, &vp_msg.params) {
-                Some(v) => v,
-                None => {
-                    counters.skip_other += 1;
-                    return out;
-                }
-            };
+            let (_iv, t) =
+                match compute_theo(pricing_forward, strike, tte, r_char, &vp_msg.params) {
+                    Some(v) => v,
+                    None => {
+                        counters.skip_other.fetch_add(1, Ordering::Relaxed);
+                        return out;
+                    }
+                };
             // Bound cache size: prune all entries on fit change. The
             // hashmap key includes fit_ts_ns so old entries are dead;
             // sweep them when the fit advances by retaining only
             // current-fit keys. Cheap O(N≤44) per fit cycle.
             if state.theo_cache.len() > 200 {
                 let current_fit = vp_msg.fit_ts_ns;
-                state.theo_cache.retain(|(_, _, _, ts), _| *ts == current_fit);
+                state
+                    .theo_cache
+                    .retain(|(_, _, _, ts), _| *ts == current_fit);
             }
             state.theo_cache.insert(theo_key, t);
             t
@@ -258,10 +346,20 @@ pub fn decide_on_tick(
 
     // Look up our resting orders (used by both the L2-aware path and
     // the depth-1 self-fill fallback below).
-    let buy_key = (TraderState::strike_key(strike), Arc::clone(expiry_arc), r_char, 'B');
-    let sell_key = (TraderState::strike_key(strike), Arc::clone(expiry_arc), r_char, 'S');
-    let our_bid = state.our_orders.get(&buy_key).map(|o| o.price);
-    let our_ask = state.our_orders.get(&sell_key).map(|o| o.price);
+    let buy_key = (
+        SharedState::strike_key(strike),
+        Arc::clone(expiry_arc),
+        r_char,
+        'B',
+    );
+    let sell_key = (
+        SharedState::strike_key(strike),
+        Arc::clone(expiry_arc),
+        r_char,
+        'S',
+    );
+    let our_bid = state.our_orders.get(&buy_key).map(|r| r.value().price);
+    let our_ask = state.our_orders.get(&sell_key).map(|r| r.value().price);
 
     // Compute "external" bid/ask — the next-best price after our own
     // resting orders. With L2 (broker rotates ~5 active depth subs
@@ -299,16 +397,30 @@ pub fn decide_on_tick(
     // Two-sided market check (uses raw — even if WE are the BBO, we
     // still need real two-sided market on each side to enter).
     if raw_bid <= 0.0 || raw_ask <= 0.0 {
-        counters.skip_one_sided_or_dark += 2;
+        counters
+            .skip_one_sided_or_dark
+            .fetch_add(2, Ordering::Relaxed);
         return out;
     }
     // Min BBO size check.
     if bid_size < MIN_BBO_SIZE || ask_size < MIN_BBO_SIZE {
-        counters.skip_thin_book += 2;
+        counters.skip_thin_book.fetch_add(2, Ordering::Relaxed);
         return out;
     }
 
-    let edge = state.min_edge_ticks as f64 * state.tick_size;
+    let edge = snap.min_edge_ticks as f64 * snap.tick_size;
+
+    // Spec §3.4: wide-market skip. If the half-spread is more than
+    // `skip_if_spread_over_edge_mul × min_edge`, both sides are too
+    // wide to quote into safely (theo±edge would land far inside the
+    // BBO and we'd be picked off by the next tightening). 0 disables.
+    if snap.skip_if_spread_over_edge_mul > 0.0 {
+        let half_spread = (raw_ask - raw_bid) * 0.5;
+        if half_spread > snap.skip_if_spread_over_edge_mul * edge {
+            counters.skip_wide_spread.fetch_add(2, Ordering::Relaxed);
+            return out;
+        }
+    }
 
     for side in [Side::Buy, Side::Sell] {
         let mut target = match side {
@@ -316,7 +428,9 @@ pub fn decide_on_tick(
             Side::Sell => theo + edge,
         };
         if target <= 0.0 {
-            counters.skip_target_nonpositive += 1;
+            counters
+                .skip_target_nonpositive
+                .fetch_add(1, Ordering::Relaxed);
             continue;
         }
         // Tick-jump (improve on incumbent BBO). When our naive
@@ -338,7 +452,7 @@ pub fn decide_on_tick(
                 // because we're the BBO ourselves — no need to jump
                 // 1-tick "ahead" of our own resting order.
                 if bid > 0.0 {
-                    let jumped = bid + state.tick_size;
+                    let jumped = bid + snap.tick_size;
                     if target < jumped && (theo - jumped) >= edge {
                         target = jumped;
                     }
@@ -346,7 +460,7 @@ pub fn decide_on_tick(
             }
             Side::Sell => {
                 if ask > 0.0 {
-                    let jumped = ask - state.tick_size;
+                    let jumped = ask - snap.tick_size;
                     if target > jumped && (jumped - theo) >= edge {
                         target = jumped;
                     }
@@ -360,30 +474,54 @@ pub fn decide_on_tick(
         match side {
             Side::Buy => {
                 if ask > 0.0 && target >= ask {
-                    counters.skip_would_cross_ask += 1;
+                    counters
+                        .skip_would_cross_ask
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             }
             Side::Sell => {
                 if bid > 0.0 && target <= bid {
-                    counters.skip_would_cross_bid += 1;
+                    counters
+                        .skip_would_cross_bid
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             }
         }
+        // Cap relative to market consensus mid (2026-05-05 evening).
+        // The stale-theo failure mode: when SABR is fit on slightly
+        // biased input (one-sided strikes) AND spot drifts between
+        // refits, theo can sit several ticks above market mid for
+        // tens of seconds. Without this cap, bid = theo - edge ends
+        // up AT or ABOVE market ask, and sellers happily hit our bid
+        // 11 times in 5 seconds (5.90 P @ 0.0975 incident, 14:22:55–
+        // 14:23:00 UTC). The cap forces every quote to sit at least
+        // `edge` away from market mid, regardless of how biased theo
+        // is. Trusts the market consensus when our model disagrees.
+        let mkt_mid = (raw_bid + raw_ask) * 0.5;
+        target = match side {
+            Side::Buy => target.min(mkt_mid - edge),
+            Side::Sell => target.max(mkt_mid + edge),
+        };
+        if target <= 0.0 {
+            counters
+                .skip_target_nonpositive
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         // Quantize to tick.
-        let target_q =
-            (target / state.tick_size).round() * state.tick_size;
+        let target_q = (target / snap.tick_size).round() * snap.tick_size;
         let target_q = (target_q * 10000.0).round() / 10000.0; // 4dp clean
 
         // Per-side risk gate.
         match side {
             Side::Buy if risk_buy => {
-                counters.risk_block_buy += 1;
+                counters.risk_block_buy.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             Side::Sell if risk_sell => {
-                counters.risk_block_sell += 1;
+                counters.risk_block_sell.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             _ => {}
@@ -392,14 +530,14 @@ pub fn decide_on_tick(
         // Compact key: strike-bits + expiry-arc + right-char +
         // side-char. Arc bump per clone, no String alloc.
         let key = (
-            TraderState::strike_key(strike),
+            SharedState::strike_key(strike),
             Arc::clone(expiry_arc),
             r_char,
             side.as_char(),
         );
 
         // Dead-band + GTD-refresh check.
-        let existing = state.our_orders.get(&key).cloned();
+        let existing = state.our_orders.get(&key).map(|r| r.value().clone());
         if let Some(ref ex) = existing {
             // HI-003: no place while previous order is still unack'd
             // (order_id is None until place_ack arrives). Without this
@@ -420,20 +558,21 @@ pub fn decide_on_tick(
             if ex.order_id.is_none()
                 && (now_monotonic_ns - ex.place_monotonic_ns) < UNACK_INFLIGHT_NS
             {
-                counters.skip_unack_inflight += 1;
+                counters.skip_unack_inflight.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let age_s = (now_monotonic_ns - ex.place_monotonic_ns) as f64 / 1e9;
-            let in_band = (target_q - ex.price).abs()
-                < DEAD_BAND_TICKS as f64 * state.tick_size;
-            let needs_gtd_refresh = age_s > (GTD_LIFETIME_S - GTD_REFRESH_LEAD_S);
+            let in_band =
+                (target_q - ex.price).abs() < snap.dead_band_ticks as f64 * snap.tick_size;
+            let needs_gtd_refresh =
+                age_s > (snap.gtd_lifetime_s - snap.gtd_refresh_lead_s);
             if in_band && !needs_gtd_refresh {
-                counters.skip_in_band += 1;
+                counters.skip_in_band.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             // Cooldown floor.
             if (now_monotonic_ns - ex.place_monotonic_ns) < COOLDOWN_NS {
-                counters.skip_cooldown += 1;
+                counters.skip_cooldown.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         }
@@ -455,11 +594,9 @@ pub fn decide_on_tick(
         //     fresh Place with no cancel.
         //   - If existing order is near-GTD-expiry, prefer modify too —
         //     a modify refreshes GTD via gtd_until_utc on the same id.
-        //     The replace_skip_cancel_near_gtd counter survives for
-        //     diagnostic continuity but no longer gates anything.
         if let Some(ref ex) = existing {
             if let Some(oid) = ex.order_id {
-                counters.modify += 1;
+                counters.modify.fetch_add(1, Ordering::Relaxed);
                 out.push(Decision::Modify {
                     side,
                     order_id: oid,
@@ -473,17 +610,19 @@ pub fn decide_on_tick(
             price: target_q,
             cancel_old_oid: None,
         });
-        counters.place += 1;
+        counters.place.fetch_add(1, Ordering::Relaxed);
     }
     out
 }
 
 /// Risk gates — return (buy_blocked, sell_blocked, all_blocked).
-/// Mirrors the Python check in _decide_on_tick.
-pub fn compute_risk_gates(state: &TraderState, now_monotonic_ns: u64) -> (bool, bool, bool) {
-    let eff = state.risk_effective_delta;
-    let age_s = if state.risk_state_age_monotonic_ns > 0 {
-        (now_monotonic_ns - state.risk_state_age_monotonic_ns) as f64 / 1e9
+/// Mirrors the Python check in _decide_on_tick. Reads the
+/// stack-local `ScalarSnapshot` so the caller pays for one mutex
+/// acquire (snapshot) per tick instead of one per gate read.
+pub fn compute_risk_gates(snap: &ScalarSnapshot, now_monotonic_ns: u64) -> (bool, bool, bool) {
+    let eff = snap.risk_effective_delta;
+    let age_s = if snap.risk_state_age_monotonic_ns > 0 {
+        (now_monotonic_ns - snap.risk_state_age_monotonic_ns) as f64 / 1e9
     } else {
         f64::INFINITY
     };
@@ -494,10 +633,10 @@ pub fn compute_risk_gates(state: &TraderState, now_monotonic_ns: u64) -> (bool, 
     let mut buy = false;
     let mut sell = false;
     let mut all = false;
-    if eff + 1.0 >= state.delta_ceiling {
+    if eff + 1.0 >= snap.delta_ceiling {
         buy = true;
     }
-    if eff - 1.0 <= -state.delta_ceiling {
+    if eff - 1.0 <= -snap.delta_ceiling {
         sell = true;
     }
     // The `-1.0` is an intentional grace buffer (MED-004): a fill can
@@ -508,12 +647,35 @@ pub fn compute_risk_gates(state: &TraderState, now_monotonic_ns: u64) -> (bool, 
     // 1 contract-delta of the kill, giving risk_state propagation a
     // round trip to catch up. delta_kill ceiling is documented
     // unbuffered (e.g. 5.0); the trader self-blocks at 4.0.
-    if eff.abs() >= state.delta_kill - 1.0 {
+    if eff.abs() >= snap.delta_kill - 1.0 {
         all = true;
     }
-    if let Some(margin_pct) = state.risk_margin_pct {
-        if margin_pct >= state.margin_ceiling_pct {
+    if let Some(margin_pct) = snap.risk_margin_pct {
+        if margin_pct >= snap.margin_ceiling_pct {
             all = true;
+        }
+    }
+    // Theta self-gate (2026-05-05 incident fix): the broker also fires
+    // a theta kill at the same threshold and now publishes a kill IPC
+    // event, but this local check is defense-in-depth against IPC
+    // drops or kill-event ring-full. theta_kill is negative (e.g.
+    // -500) and risk_theta accumulates negative for short-vol books;
+    // breach is `theta < theta_kill`. Zero disables.
+    if snap.theta_kill < 0.0 {
+        if let Some(theta) = snap.risk_theta {
+            if theta < snap.theta_kill {
+                all = true;
+            }
+        }
+    }
+    // Vega self-gate. vega_kill is positive and the magnitude of the
+    // worst-case vega exposure trips it. CLAUDE.md §13: 0 disables
+    // (current operational state per Alabaster characterization).
+    if snap.vega_kill > 0.0 {
+        if let Some(vega) = snap.risk_vega {
+            if vega.abs() >= snap.vega_kill {
+                all = true;
+            }
         }
     }
     (buy, sell, all)
@@ -581,20 +743,32 @@ mod tests {
 
     use super::*;
     use crate::messages::{TickMsg, VolParams};
-    use crate::state::{DecisionCounters, TraderState, VolSurfaceEntry};
+    use crate::state::{DecisionCounters, SharedState, VolSurfaceEntry};
+    use std::sync::atomic::Ordering;
 
-    fn fresh_state(forward: f64) -> TraderState {
-        let mut s = TraderState::new();
-        s.underlying_price = forward;
-        // Pretend risk_state has arrived (otherwise gate fail-closes).
-        s.risk_effective_delta = Some(0.0);
-        s.risk_margin_pct = Some(0.0);
-        s.risk_state_age_monotonic_ns = 1;
+    fn fresh_state(forward: f64) -> SharedState {
+        let s = SharedState::new();
+        {
+            let mut sc = s.scalars.lock();
+            sc.underlying_price = forward;
+            // Pretend risk_state has arrived (otherwise gate fail-closes).
+            sc.risk_effective_delta = Some(0.0);
+            sc.risk_margin_pct = Some(0.0);
+            sc.risk_state_age_monotonic_ns = 1;
+        }
         s
     }
 
-    fn install_svi_surface(state: &mut TraderState, expiry: &str, side: char) {
+    fn install_svi_surface(state: &SharedState, expiry: &str, side: char) {
         let expiry_arc = state.intern_expiry(expiry);
+        // fit_ts_ns must be within 120s of "now" or the HI-002
+        // staleness gate fires and the dark-book / thin-book tests
+        // never reach their target check. Use SystemTime::now() so
+        // the fixture stays fresh whenever the test runs.
+        let fit_ts_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         state.vol_surfaces.insert(
             (expiry_arc, side),
             VolSurfaceEntry {
@@ -610,13 +784,17 @@ mod tests {
                     beta: None,
                     nu: None,
                 },
-                fit_ts_ns: 1_000_000_000,
+                fit_ts_ns,
+                // None disables the calibrated-range gate so existing
+                // tests (which already assert on other gates) don't
+                // hit the new gate first.
+                calibrated_min_k: None,
+                calibrated_max_k: None,
             },
         );
     }
 
-    fn make_tick(strike: f64, expiry: &str, right: &str,
-                 bid: f64, ask: f64) -> TickMsg {
+    fn make_tick(strike: f64, expiry: &str, right: &str, bid: f64, ask: f64) -> TickMsg {
         TickMsg {
             strike,
             expiry: expiry.to_string(),
@@ -636,126 +814,248 @@ mod tests {
 
     #[test]
     fn no_vol_surface_skips() {
-        let mut state = fresh_state(6.0);
-        let mut counters = DecisionCounters::default();
+        let state = fresh_state(6.0);
+        let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
-        assert!(counters.skip_no_vol_surface > 0);
+        assert!(counters.skip_no_vol_surface.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
     fn off_atm_skips() {
-        let mut state = fresh_state(6.0);
-        install_svi_surface(&mut state, "20260526", 'C');
-        let mut counters = DecisionCounters::default();
+        let state = fresh_state(6.0);
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
         let tick = make_tick(7.0, "20260526", "C", 0.01, 0.02);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
-        assert_eq!(counters.skip_off_atm, 1);
+        assert_eq!(counters.skip_off_atm.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn itm_call_skips() {
-        let mut state = fresh_state(6.0);
-        install_svi_surface(&mut state, "20260526", 'C');
-        let mut counters = DecisionCounters::default();
+        let state = fresh_state(6.0);
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
         let tick = make_tick(5.85, "20260526", "C", 0.20, 0.22);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
-        assert_eq!(counters.skip_itm, 1);
+        assert_eq!(counters.skip_itm.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn itm_put_skips() {
-        let mut state = fresh_state(6.0);
-        install_svi_surface(&mut state, "20260526", 'P');
-        let mut counters = DecisionCounters::default();
+        let state = fresh_state(6.0);
+        install_svi_surface(&state, "20260526", 'P');
+        let counters = DecisionCounters::default();
         let tick = make_tick(6.15, "20260526", "P", 0.20, 0.22);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
-        assert_eq!(counters.skip_itm, 1);
+        assert_eq!(counters.skip_itm.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn dark_book_skips_both_sides() {
-        let mut state = fresh_state(6.0);
-        install_svi_surface(&mut state, "20260526", 'C');
-        let mut counters = DecisionCounters::default();
+        let state = fresh_state(6.0);
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
         let mut tick = make_tick(6.0, "20260526", "C", 0.0, 0.10);
         tick.bid = Some(0.0);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
-        assert_eq!(counters.skip_one_sided_or_dark, 2);
+        assert_eq!(counters.skip_one_sided_or_dark.load(Ordering::Relaxed), 2);
     }
 
     #[test]
     fn thin_book_skips() {
-        let mut state = fresh_state(6.0);
-        install_svi_surface(&mut state, "20260526", 'C');
-        let mut counters = DecisionCounters::default();
+        let state = fresh_state(6.0);
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
         let mut tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         tick.bid_size = Some(0);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
-        assert_eq!(counters.skip_thin_book, 2);
+        assert_eq!(counters.skip_thin_book.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn uncalibrated_strike_skips() {
+        // Calibrated range [5.95, 6.05]; quote at 6.10 → outside range,
+        // gate fires.
+        let state = fresh_state(6.0);
+        install_svi_surface(&state, "20260526", 'C');
+        // Mutate the surface entry to set calibrated bounds.
+        let expiry_arc = state.intern_expiry("20260526");
+        if let Some(mut entry) = state.vol_surfaces.get_mut(&(expiry_arc, 'C')) {
+            entry.calibrated_min_k = Some(5.95);
+            entry.calibrated_max_k = Some(6.05);
+        }
+        let counters = DecisionCounters::default();
+        // 6.10 is past calibrated_max_k=6.05 (more than half a tick),
+        // but still inside ATM-window (6.10 - 6.0 = 0.10 < 0.30).
+        let tick = make_tick(6.10, "20260526", "C", 0.10, 0.105);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert_eq!(counters.skip_uncalibrated_strike.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn wide_spread_skips_both_sides() {
+        // half_spread = 0.05; edge = min_edge_ticks(2) × tick_size(0.0005) = 0.001.
+        // Default mul=4 → threshold 0.004 < 0.05 → fires.
+        let state = fresh_state(6.0);
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
+        let tick = make_tick(6.0, "20260526", "C", 0.10, 0.20);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert_eq!(counters.skip_wide_spread.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn wide_spread_disabled_when_mul_zero() {
+        // Setting skip_if_spread_over_edge_mul = 0 disables the gate;
+        // the same tick that fires above should pass through.
+        let state = fresh_state(6.0);
+        state.scalars.lock().skip_if_spread_over_edge_mul = 0.0;
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
+        let tick = make_tick(6.0, "20260526", "C", 0.10, 0.20);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        assert_eq!(counters.skip_wide_spread.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn risk_state_unknown_blocks_all() {
-        let mut state = TraderState::new();
-        state.underlying_price = 6.0;
-        // risk_effective_delta is None → fail-closed.
-        install_svi_surface(&mut state, "20260526", 'C');
-        let mut counters = DecisionCounters::default();
+        let state = SharedState::new();
+        {
+            let mut sc = state.scalars.lock();
+            sc.underlying_price = 6.0;
+            // risk_effective_delta is None → fail-closed.
+        }
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
-        assert_eq!(counters.risk_block, 2);
+        assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
     }
 
     #[test]
     fn delta_kill_blocks_all() {
-        let mut state = fresh_state(6.0);
-        state.delta_kill = 5.0;
-        state.risk_effective_delta = Some(5.0);
-        install_svi_surface(&mut state, "20260526", 'C');
-        let mut counters = DecisionCounters::default();
+        let state = fresh_state(6.0);
+        {
+            let mut sc = state.scalars.lock();
+            sc.delta_kill = 5.0;
+            sc.risk_effective_delta = Some(5.0);
+        }
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
-        assert_eq!(counters.risk_block, 2);
+        assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn theta_kill_blocks_all() {
+        // 2026-05-05 incident regression test: theta of -850 with
+        // theta_kill at -500 must block placements, not fall through.
+        let state = fresh_state(6.0);
+        {
+            let mut sc = state.scalars.lock();
+            sc.theta_kill = -500.0;
+            sc.risk_theta = Some(-850.0);
+        }
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
+        let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn theta_kill_disabled_when_zero() {
+        // CLAUDE.md §13 pattern: 0 disables. A theta of -1000 must NOT
+        // block when theta_kill is 0.
+        let state = fresh_state(6.0);
+        {
+            let mut sc = state.scalars.lock();
+            sc.theta_kill = 0.0; // disabled
+            sc.risk_theta = Some(-1000.0);
+        }
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
+        let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        // Should NOT block on theta. (May skip for other reasons, e.g.
+        // wide spread, but risk_block from theta should be 0.)
+        let _ = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        // The risk_block counter increments by 2 only when ALL is set.
+        // With only theta_kill=0 and no other gate trips, ALL won't fire
+        // from the theta path.
+        assert_eq!(counters.risk_block.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn vega_kill_blocks_all() {
+        let state = fresh_state(6.0);
+        {
+            let mut sc = state.scalars.lock();
+            sc.vega_kill = 500.0;
+            sc.risk_vega = Some(-700.0); // |vega| > kill
+        }
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
+        let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        assert!(decisions.is_empty());
+        assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
     }
 
     #[test]
     fn weekend_pause_blocks() {
-        let mut state = fresh_state(6.0);
-        state.weekend_paused = true;
-        install_svi_surface(&mut state, "20260526", 'C');
-        let mut counters = DecisionCounters::default();
+        let state = fresh_state(6.0);
+        state.scalars.lock().weekend_paused = true;
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
     }
 
     #[test]
     fn kill_state_blocks() {
-        let mut state = fresh_state(6.0);
-        state.kills.insert("daily_halt".to_string(), "test".to_string());
-        install_svi_surface(&mut state, "20260526", 'C');
-        let mut counters = DecisionCounters::default();
+        let state = fresh_state(6.0);
+        state
+            .kills
+            .insert("daily_halt".to_string(), "test".to_string());
+        // Mirror the kills_count bookkeeping that process_event does
+        // on a real `kill` message — the hot path reads kills_count
+        // (atomic) rather than kills.is_empty() (which would touch
+        // every DashMap shard) so tests must keep them in sync.
+        state.kills_count.fetch_add(1, Ordering::Relaxed);
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&mut state, &mut counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
         assert!(decisions.is_empty());
     }
 }

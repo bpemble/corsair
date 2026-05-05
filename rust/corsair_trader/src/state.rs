@@ -393,6 +393,14 @@ pub struct DecisionCounters {
     /// live order_id at the key + price-update path goes through
     /// modify in one round trip.
     pub modify: AtomicU64,
+    /// Hot-path / staleness commands_ring write_frame returned false
+    /// (ring full → frame silently dropped before this counter shipped).
+    /// Each increment is one outbound place/modify/cancel frame that
+    /// never reached the broker. JSONL `decisions` log and our_orders
+    /// state are still populated unconditionally (Step 2), so the gap
+    /// between this counter and broker-side wire records is the
+    /// invisible-drop magnitude we're trying to surface.
+    pub place_dropped: AtomicU64,
 }
 
 impl Default for DecisionCounters {
@@ -429,6 +437,7 @@ impl DecisionCounters {
             staleness_cancel_dark: AtomicU64::new(0),
             replace_cancel: AtomicU64::new(0),
             modify: AtomicU64::new(0),
+            place_dropped: AtomicU64::new(0),
         }
     }
 
@@ -463,6 +472,7 @@ impl DecisionCounters {
             ("staleness_cancel_dark", &self.staleness_cancel_dark),
             ("replace_cancel", &self.replace_cancel),
             ("modify", &self.modify),
+            ("place_dropped", &self.place_dropped),
         ];
         for (k, v) in pairs {
             let n = v.load(Ordering::Relaxed);

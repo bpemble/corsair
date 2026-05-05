@@ -57,6 +57,30 @@ pub struct HelloConfig {
     pub delta_kill: Option<f64>,
     #[serde(default)]
     pub margin_ceiling_pct: Option<f64>,
+    /// Quote lifetime in seconds (broker GTD). Trader uses
+    /// `gtd_lifetime_s - gtd_refresh_lead_s` as the refresh threshold.
+    #[serde(default)]
+    pub gtd_lifetime_s: Option<f64>,
+    /// Lead seconds before GTD expiry to refresh.
+    #[serde(default)]
+    pub gtd_refresh_lead_s: Option<f64>,
+    /// Dead-band: skip if |new_price - rest_price| < N × tick_size.
+    #[serde(default)]
+    pub dead_band_ticks: Option<i64>,
+    /// Spec §3.4 wide-market skip: skip if half_spread > N × min_edge.
+    /// 0 disables.
+    #[serde(default)]
+    pub skip_if_spread_over_edge_mul: Option<f64>,
+    /// Theta-breach threshold (negative; 0 disables). Trader self-gates
+    /// at this value as defense-in-depth alongside the kill IPC event
+    /// from the broker. 2026-05-05 incident: kill IPC was missing AND
+    /// trader had no theta gate — adverse fills compounded for 6h.
+    #[serde(default)]
+    pub theta_kill: Option<f64>,
+    /// Vega-breach threshold (positive; 0 disables; currently 0 per
+    /// CLAUDE.md §13 Alabaster characterization).
+    #[serde(default)]
+    pub vega_kill: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +135,16 @@ pub struct VolSurfaceMsg {
     /// skip quoting (SVI extrapolation isn't safe with stale anchor).
     #[serde(default)]
     pub ts_ns: Option<u64>,
+    /// Calibrated-strike range used by the SABR fit. Trader's
+    /// is_strike_calibrated gate refuses to quote strikes outside
+    /// [calibrated_min_k, calibrated_max_k] — SABR extrapolation
+    /// past the fit's strike envelope is unreliable. Optional for
+    /// back-compat with older broker builds; when None the gate
+    /// is skipped.
+    #[serde(default)]
+    pub calibrated_min_k: Option<f64>,
+    #[serde(default)]
+    pub calibrated_max_k: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,4 +308,17 @@ pub struct Telemetry {
     pub n_vol_expiries: usize,
     pub killed: Vec<String>,
     pub weekend_paused: bool,
+    /// Latest hedge delta from the broker's 1Hz risk_state publish.
+    /// LOW-004: surfaced on telemetry alongside the IPC/TTT histograms
+    /// for operational observability (cascade post-mortems use this
+    /// to reconstruct hedge state at the 10s tick that bracketed an
+    /// incident). None until the first risk_state event arrives.
+    pub risk_hedge_delta: Option<i64>,
+    /// Cumulative `frames_dropped` counter on the trader's commands
+    /// SHM ring (writer side). Each unit is one outbound frame
+    /// (place_order / modify_order / cancel_order / telemetry) that
+    /// `write_frame` rejected because the ring was full. Read directly
+    /// from `commands_ring.frames_dropped` at telemetry build time —
+    /// monotonic across the trader process lifetime.
+    pub commands_frames_dropped: u64,
 }
