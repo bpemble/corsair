@@ -11,10 +11,14 @@ services:
     restart: unless-stopped
     network_mode: host
     env_file: .env
-    # Bare-metal Phase 4 (2026-05-02, i7-10710U 6c/12t): SMT-aware pin to
-    # physical cores 0-1 (logical 0,1,6,7). Gateway is JVM, low-priority,
-    # shares cores with the OS. isolcpus reserves cores 2-5 for broker/
-    # trader so this constraint keeps the JVM out of their way.
+    # Bare-metal (2026-05-04, i9-13900K hybrid 8P+16E = 24c/32t):
+    # P-cores 0 and 3 (logical 0,1,6,7). Gateway is JVM, low-priority,
+    # shares with OS housekeeping on P-core 0; P-core 3 is buffer
+    # between gateway and the broker/trader cpusets below. Hot
+    # services (corsair-broker-rs, trader) get the higher-frequency
+    # P-cores. SMT siblings on 13900K are interleaved (CPU 0,1 are
+    # the same physical core) so each cpuset value defines distinct
+    # physical cores explicitly.
     cpuset: "0,1,6,7"
     command: ["/bin/bash", "/mnt/scripts/gateway_run.sh"]
     environment:
@@ -37,83 +41,6 @@ services:
       retries: 6
       start_period: 120s
 
-  # ── Corsair v2 Market Maker (LEGACY — Python broker) ────────────────
-  # Retired 2026-05-02 by Phase 6.7 cutover. The Rust broker
-  # (`corsair-broker-rs`) is now the live runtime. This service is
-  # preserved as `--profile legacy-python-broker` for emergency
-  # rollback ONLY: `docker compose --profile legacy-python-broker up
-  # -d corsair`. Brings up ib_insync on clientId=0 — make sure to stop
-  # `corsair-broker-rs` first to avoid clientId conflict.
-  corsair:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    profiles: ["legacy-python-broker"]
-    restart: unless-stopped
-    depends_on:
-      ib-gateway:
-        condition: service_healthy
-    network_mode: host
-    env_file: .env
-    cap_add:
-      - SYS_PTRACE
-    environment:
-      CORSAIR_GATEWAY_HOST: "127.0.0.1"
-      CORSAIR_GATEWAY_PORT: "${TWS_PORT:-4002}"
-      CORSAIR_ACCOUNT_ID: "${IBKR_ACCOUNT}"
-      DISCORD_WEBHOOK_URL: "${DISCORD_WEBHOOK_URL:-}"
-      # v1.4 Stage 1 paper config. Flip to corsair_v2_config.yaml to
-      # roll back to the v1.3 config (asymmetric scope, $200K cap).
-      CORSAIR_CONFIG: "${CORSAIR_CONFIG:-config/hg_v1_4_paper.yaml}"
-      # Loop-block detector knobs (src/loop_block_detector.py). Override
-      # from the host shell to tune without a rebuild — e.g. set
-      # CORSAIR_LOOP_BLOCK_THRESHOLD_MS=20 for finer-grained capture, or
-      # CORSAIR_LOOP_BLOCK_DISABLED=1 to silence during a deep py-spy run.
-      CORSAIR_LOOP_BLOCK_THRESHOLD_MS: "${CORSAIR_LOOP_BLOCK_THRESHOLD_MS:-50}"
-      CORSAIR_LOOP_BLOCK_PING_MS: "${CORSAIR_LOOP_BLOCK_PING_MS:-10}"
-      CORSAIR_LOOP_BLOCK_DISABLED: "${CORSAIR_LOOP_BLOCK_DISABLED:-}"
-      # Broker IPC mode (mm_service_split.md). When "1", corsair runs as
-      # the broker: starts the IPC server, forwards gateway events to
-      # the trader process. Default empty → no IPC server, no trader
-      # interaction, identical to pre-split behavior.
-      CORSAIR_BROKER_MODE: "${CORSAIR_BROKER_MODE:-}"
-      # Phase 5+: IPC transport choice. "socket" (default) uses an
-      # asyncio Unix domain socket (~330μs p50); "shm" uses
-      # memory-mapped ring buffers with polling (~50-100μs p50).
-      # Both broker and trader must agree.
-      CORSAIR_IPC_TRANSPORT: "${CORSAIR_IPC_TRANSPORT:-socket}"
-      # Phase 3 cut-over: when "1", broker's quote engine stops
-      # placing orders; trader's place_order/cancel_order commands
-      # over IPC drive all option order flow. Default unset →
-      # broker quotes as today, trader logs only.
-      CORSAIR_TRADER_PLACES_ORDERS: "${CORSAIR_TRADER_PLACES_ORDERS:-}"
-    volumes:
-      - ./logs:/app/logs
-      - ./logs-paper:/app/logs-paper      # v1.4 §9.5 paper JSONL streams
-      - ./data:/app/data
-      - ./span_data:/app/span_data
-      - ./config:/app/config:ro
-      # Docker socket — lets the watchdog escalate to a gateway container
-      # restart when the in-engine recovery loop can't fix a JVM-level
-      # hang inside ib-gateway. See watchdog.escalate_gateway_restart().
-      - /var/run/docker.sock:/var/run/docker.sock:rw
-    healthcheck:
-      # Snapshot file is written by the main loop every ~1s in steady state.
-      # If it's >60s old the loop is hung even if the process is still alive
-      # — that's the failure mode log-mtime healthchecks miss because the
-      # ib_insync stderr keeps the log file fresh during silent hangs.
-      # Triggers `restart: unless-stopped` after 3 consecutive failures.
-      #
-      # Threshold is 60s (not 30s) to decouple it from the 30s discovery
-      # timeout in src/watchdog.py — at 30s a discovery that legitimately
-      # takes 31s would get the container nuked mid-recovery, even though
-      # the watchdog would have succeeded a second later.
-      test: ["CMD-SHELL", "test -f /app/data/hg_chain_snapshot.json && test $$(( $$(date +%s) - $$(stat -c %Y /app/data/hg_chain_snapshot.json) )) -lt 60"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 90s
-
   # ── Dashboard ───────────────────────────────────────────────────────
   dashboard:
     build:
@@ -127,22 +54,11 @@ services:
       - ./data:/app/data:ro
       - ./config:/app/config:ro
 
-  # ── Trader (mm_service_split Phase 1+2) ─────────────────────────────
-  # Connects to the broker (corsair) over a Unix socket in the shared
-  # data volume. Phase 2 reads forwarded events (ticks, fills, order
-  # acks) and writes to logs-paper/trader_events-YYYY-MM-DD.jsonl;
-  # phase 3 will own order placement.
-  #
-  # Reuses the corsair image — same Python env (pricing.py, sabr.py,
-  # corsair_pricing Rust extension all available). Different command.
-  #
-  # Started ALONGSIDE corsair when CORSAIR_BROKER_MODE=1; otherwise
-  # this service starts but its IPCClient retries connect-loop
-  # forever (harmless). To disable entirely, run
-  # `docker compose up -d corsair dashboard ib-gateway` and skip trader.
   # ── Trader (Rust binary) ────────────────────────────────────────────
-  # Reads from the Rust broker's IPC and places orders against IBKR via
-  # the broker. Default-on since Phase 6.7 cutover.
+  # Reads from the Rust broker's IPC over SHM and places orders against
+  # IBKR via the broker. Default-on since the Phase 6.7 cutover
+  # (2026-05-02). Reuses the corsair-corsair image (built from the same
+  # Dockerfile) but runs the corsair_trader_rust binary.
   trader:
     image: corsair-corsair
     depends_on:
@@ -150,12 +66,26 @@ services:
         condition: service_started
     network_mode: host
     env_file: .env
-    # Phase 4 SMT-aware pin: physical cores 4-5 (logical 4,5,10,11).
-    # Hot-loop (decision + place_order) lives on these isolated cores.
-    cpuset: "4,5,10,11"
+    # Bare-metal (2026-05-04, i9-13900K): P-cores 4 and 5 (logical
+    # 8,9,10,11). These two cores are the chip's "preferred" cores
+    # at 5.8 GHz boost — the rest of the P-cores run 5.5 GHz. Both
+    # tokio workers land on distinct physical cores via SMT-aware
+    # pinning in build_pinner: worker 0 → CPU 8 (P-core 4), worker
+    # 1 → CPU 10 (P-core 5). Bg runtime takes the SMT sibling of
+    # worker 0 (CPU 9) — shared L1/L2, low cross-core wakeup cost.
+    # Hot-loop (decision + place_order) runs at 5.8 GHz throughout.
+    cpuset: "8,9,10,11"
     mem_reservation: 1g
     cap_add:
       - SYS_NICE
+      # IPC_LOCK lets the container call mlockall(MCL_CURRENT|MCL_FUTURE)
+      # without hitting the Docker default RLIMIT_MEMLOCK ceiling
+      # (~64 KiB). Audit Phase 1 #6 (2026-05-05) — locks all current
+      # and future memory pages so the hot path never page-faults.
+      - IPC_LOCK
+    ulimits:
+      # -1 = unlimited; required for mlockall on a multi-MB process.
+      memlock: -1
     environment:
       LOG_LEVEL: "${TRADER_LOG_LEVEL:-INFO}"
       # Rust trader requires the SHM transport — no socket fallback
@@ -187,6 +117,13 @@ services:
   # CORSAIR_BROKER_SHADOW=0 to flip to live (only after Phase 5B IPC
   # work lands; otherwise the trader can't talk to it).
   corsair-broker-rs:
+    # Owns the build for the shared `corsair-corsair` image (used by
+    # both broker and trader). After the legacy `corsair` service was
+    # retired, this service is the canonical build site — rebuild via
+    # `docker compose up -d --build corsair-broker-rs`.
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: corsair-corsair
     depends_on:
       ib-gateway:
@@ -195,9 +132,22 @@ services:
     # API socket to localhost only, so bridged containers can't reach it.
     network_mode: host
     env_file: .env
-    # Phase 4 SMT-aware pin: physical cores 2-3 (logical 2,3,8,9).
-    # Owns gateway TCP, IPC server, snapshot writer, vol surface, hedge.
-    cpuset: "2,3,8,9"
+    # Bare-metal (2026-05-04, i9-13900K): P-cores 6 and 7 (logical
+    # 12,13,14,15) at 5.5 GHz. Cleanly separates the broker from
+    # the trader's preferred cores (P-cores 4,5 = CPU 8-11) so the
+    # two services don't share cache lines or SMT execution units.
+    # 4 tokio workers spread across both physical cores via SMT-
+    # aware pinning: workers 0,1 → CPU 12,14 (different P-cores),
+    # workers 2,3 → CPU 13,15 (SMT siblings). Owns gateway TCP,
+    # IPC server, snapshot writer, vol surface, hedge.
+    cpuset: "12,13,14,15"
+    # Item 3 (broker cmd_pump perf, 2026-05-05): seccomp adds ~5%
+    # overhead per syscall via __seccomp_filter (see perf record on
+    # the cmd_pump thread). Broker is in our trusted container running
+    # our own code; the seccomp default profile adds little real
+    # security here. Trade: looser sandbox for ~5% broker CPU back.
+    security_opt:
+      - seccomp:unconfined
     mem_reservation: 2g
     cap_add:
       - SYS_NICE
@@ -206,6 +156,14 @@ services:
       CORSAIR_BROKER_CONFIG: "/app/config/runtime_v3.yaml"
       CORSAIR_BROKER_SHADOW: "${CORSAIR_BROKER_SHADOW:-0}"
       CORSAIR_BROKER_IPC_ENABLED: "${CORSAIR_BROKER_IPC_ENABLED:-1}"
+      # Item 5 (broker cmd_pump perf, 2026-05-05): drop tokio worker
+      # count from 4→3 so build_pinner assigns workers to [12, 14, 13]
+      # (one per physical P-core + 1 SMT sibling) and CPU 15 stays
+      # free. cmd_pump's `allowed.last()` then pins to 15 alone, no
+      # co-tenancy with productive worker threads. Eliminates the
+      # SMT-sibling cache contention between cmd_pump's idle spin
+      # and worker N's productive work.
+      CORSAIR_BROKER_WORKERS: "${CORSAIR_BROKER_WORKERS:-3}"
       # Busy-poll the trader→broker commands ring. Drops command IPC
       # latency p50 from ~1ms to ~50µs at the cost of 1 CPU core hot.
       # Worth it for a market-maker; bare-metal has cores to spare.
