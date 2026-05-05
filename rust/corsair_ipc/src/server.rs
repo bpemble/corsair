@@ -236,17 +236,32 @@ fn command_pump_blocking(
         crate::cpu_affinity::pin_thread_to_cpu(cpu);
         log::info!("command_pump: pinned to CPU {}", cpu);
     }
+    // Items 1+2 (broker cmd_pump perf, 2026-05-05):
+    //
+    // 1. drain_notify() removed from the busy-poll path. The notify
+    //    FIFO is only useful when we're *waiting* for a wake — busy-
+    //    poll spins the ring offsets directly. The FIFO drain costs
+    //    a libc::read syscall every iteration (vfs_read + fdget_pos
+    //    + fput in kernel; ~10% of cmd_pump CPU per perf record).
+    //    Skipping it leaves the FIFO with pending bytes, but no one
+    //    reads them in this mode — harmless.
+    //
+    // 2. std::thread::yield_now() replaced with std::hint::spin_loop().
+    //    yield_now → libc::sched_yield → kernel scheduler decision +
+    //    context switch even on a dedicated CPU; ~30% of cmd_pump CPU
+    //    per perf record (entry_SYSRETQ + __sched_yield + __schedule
+    //    + update_curr + pick_task_fair etc.). spin_loop is a single
+    //    PAUSE instruction (Intel) telling the CPU to ease up while
+    //    we busy-wait — no kernel transition, sub-nanosecond cost.
+    //    Safe because the cmd_pump is pinned to a dedicated CPU and
+    //    has no co-tenant tasks to yield to.
     loop {
         let bytes = {
             let mut r = cmd_ring.lock().unwrap();
-            r.drain_notify();
             r.read_available()
         };
         if bytes.is_empty() {
-            // Empty read — yield without sleeping. yield_now lets
-            // other threads on the same CPU run if needed; on a
-            // dedicated CPU it's effectively a spin.
-            std::thread::yield_now();
+            std::hint::spin_loop();
             continue;
         }
         let mut buf = bytes;
