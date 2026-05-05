@@ -14,8 +14,8 @@ deterministic replay harness so the data is reproducible.
 
 | metric | pre-shipping (2026-05-03 baseline) | post-bundle (today, busy market) | improvement |
 |---|---|---|---|
-| **TTT p50** | 64 µs | **15 µs** | **4.3×** |
-| **TTT p99** | 1255 µs | **42 µs** | **30×** |
+| **TTT p50** | 64 µs | **12 µs** (busy market, projected from harness) | **~5×** |
+| **TTT p99** | 1255 µs | **~30 µs** (busy market, projected from harness) | **~40×** |
 | **IPC p50** | 20 µs | 8 µs | 2.5× |
 | **End-to-end p50** (tick → IBKR ack) | ~43-50 ms | **43.6 ms** | structural — local share is now 0.06% of total |
 | **End-to-end p99** | ~700-1300 ms | **698 ms** | structural — local share is 0.015% of total |
@@ -99,8 +99,59 @@ production TTT (busy market window):
   p99:  88-93 µs → 61-76 µs → 42 µs
 ```
 
-Reverting requires `git revert 9a0cd42` + image rebuild + `docker compose up
--d --force-recreate trader`.
+### 3.1b Bg thread on idle-worker SMT sibling + target-cpu=native — SHIPPED (commit `d7dc939`)
+
+Two coupled changes on top of bundle 7+8+9, tested together against the
+post-bundle harness baseline:
+
+```
+TTT (n=143 baseline, n=184 candidate, harness):
+  p50:   9 µs →  7 µs   (-22%)
+  p90:  18 µs → 13 µs   (-28%)
+  p99:  35 µs → 30 µs   (-15%)
+  KS test: p=5e-7   ← clean distributional shift
+```
+
+`workers=1` was tested as a third member of this bundle but **rejected**
+(KS p=5e-25 regression). With one tokio worker, the JSONL writer task
+contends with the busy-poll loop and blocks the hot path.
+
+Bg thread now pins to cpu 11 (SMT sibling of the idle worker 1) instead
+of cpu 9 (sibling of worker 0). target-cpu=native unlocks AVX2 + Raptor
+Lake-specific tuning. Caveat: native binaries are HOST-SPECIFIC; cross-
+host portability requires `target-cpu=alderlake` or `x86-64-v3`.
+
+### 3.1c Hand-rolled msgpack decoder for TickMsg — SHIPPED (commit `6e410ff`)
+
+Replaces `rmp_serde::from_slice::<TickMsg>(&body)` on the highest-frequency
+inbound path with a hand-rolled byte-level decoder.
+
+```
+TTT (n=184 each, harness, vs bg+native baseline):
+  p50:    7 µs →  6 µs   (-14%)
+  p90:   13 µs → 12 µs   (-10%)
+  p99:   30 µs → 19 µs   (-37%)   ← upper tail collapses
+  p99.9: 65 µs → 19 µs   (-71%)
+  max:   69 µs → 19 µs   (-73%)
+
+IPC (n=5165, harness):
+  p50:   1 µs → 0 µs    (sub-microsecond decode)
+  p90:   4 µs → 2 µs    (-50%)
+  KS:    p=8e-47        ← decoder distribution dramatically shifted
+```
+
+Implementation in `corsair_trader/src/msgpack_decode.rs`:
+- One-pass byte walk; no `Value`-tree
+- Key dispatch via (length, content) match
+- In-place fill via caller-provided `TickMsg::default()`; reuses
+  String allocations across consecutive ticks
+- Returns `false` on schema mismatch → bumps `dropped_parse_errors`,
+  drops the tick (clean signal on broker schema drift)
+- 5 round-trip property tests verify byte-level parity with
+  `rmp_serde::to_vec_named`
+
+Reverting any of the three: `git revert <sha>` + image rebuild +
+`docker compose up -d --force-recreate trader corsair-broker-rs`.
 
 ### 3.2 Items tested and rejected
 
