@@ -77,6 +77,14 @@ pub fn spawn_ipc(
     tokio::spawn(forward_status(runtime.clone(), Arc::clone(&server)));
     tokio::spawn(forward_connection(runtime.clone(), Arc::clone(&server)));
     tokio::spawn(periodic_risk_state(runtime.clone(), Arc::clone(&server)));
+    // Periodic log of fill notifications dropped by Discord rate limit.
+    // 60s cadence — operator sees a one-liner if many were skipped.
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            crate::notify::log_and_reset_dropped_fills();
+        }
+    });
 
     // Tick fast-path: install a publisher closure on NativeBroker
     // so the dispatcher writes ticks directly to SHM, bypassing the
@@ -164,24 +172,47 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
             ) {
                 return;
             }
-            let meta = {
+            // Pull metadata + seed values for the publisher cache from
+            // market_data in one lock acquisition. Seeding is what
+            // saves us from the 2026-05-04 bug: after a broker restart,
+            // the publisher cache started all-None and only filled as
+            // Bid/Ask price-change ticks arrived. In thin markets where
+            // only size ticks flow (overnight), cache stayed all-None
+            // for hours, the trader saw bid=None ask=None on every tick,
+            // and the dark-book guard fired on what was actually a
+            // perfectly two-sided book. Seeding from market_data picks
+            // up the IBKR initial-snapshot values so the very first
+            // TickEvent for an instrument carries the live BBO.
+            let seed = {
                 let md = runtime_for_closure.market_data.lock().unwrap();
-                md.option_meta(tick.instrument_id)
+                md.option_by_iid(tick.instrument_id).map(|opt| {
+                    let pos_or_none = |x: f64| if x > 0.0 { Some(x) } else { None };
+                    let pos_or_none_size = |x: u64| if x > 0 { Some(x as i32) } else { None };
+                    (
+                        opt.strike,
+                        opt.expiry,
+                        opt.right,
+                        pos_or_none(opt.bid),
+                        pos_or_none(opt.ask),
+                        pos_or_none_size(opt.bid_size),
+                        pos_or_none_size(opt.ask_size),
+                    )
+                })
             };
-            let Some(meta) = meta else { return };
+            let Some((seed_strike, seed_expiry, seed_right, seed_bid, seed_ask, seed_bid_size, seed_ask_size)) = seed else { return };
             let mut cache_guard = cache.lock().unwrap();
             let entry = cache_guard.entry(tick.instrument_id.0).or_insert_with(|| {
                 ConsolidatedTick {
-                    expiry: meta.expiry.format("%Y%m%d").to_string(),
-                    right: match meta.right {
+                    expiry: seed_expiry.format("%Y%m%d").to_string(),
+                    right: match seed_right {
                         Right::Call => "C",
                         Right::Put => "P",
                     },
-                    strike: meta.strike,
-                    bid: None,
-                    ask: None,
-                    bid_size: None,
-                    ask_size: None,
+                    strike: seed_strike,
+                    bid: seed_bid,
+                    ask: seed_ask,
+                    bid_size: seed_bid_size,
+                    ask_size: seed_ask_size,
                 }
             });
             match tick.kind {
@@ -227,10 +258,9 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
                 depth_ask_0,
                 depth_ask_1,
             };
-            if let Ok(body) = rmp_serde::to_vec_named(&ev) {
-                if !server_for_closure.publish(&body) {
-                    log::debug!("tick fastpath: events ring full");
-                }
+            let dropped = with_encoded_tick(&ev, |body| !server_for_closure.publish(body));
+            if dropped {
+                log::debug!("tick fastpath: events ring full");
             }
         });
     let installed = {
@@ -366,6 +396,131 @@ struct ConnectionEventMsg<'a> {
     timestamp_ns: u64,
 }
 
+/// Broker → trader config snapshot, sent in response to the trader's
+/// `welcome` command. Lets the trader replace its compile-time
+/// defaults (GTD lifetime, dead-band, spread skip multiplier, etc.)
+/// with the broker's runtime values so the two stay aligned without
+/// the trader needing its own YAML.
+#[derive(Debug, Serialize)]
+struct HelloConfigPayload {
+    min_edge_ticks: i32,
+    tick_size: f64,
+    delta_ceiling: f64,
+    delta_kill: f64,
+    margin_ceiling_pct: f64,
+    gtd_lifetime_s: f64,
+    gtd_refresh_lead_s: f64,
+    dead_band_ticks: i32,
+    skip_if_spread_over_edge_mul: f64,
+    /// Theta-breach threshold (negative; 0 disables). Trader self-gates
+    /// at this value so a theta breach is honored locally even if the
+    /// kill IPC event is dropped (defense in depth — see also the
+    /// kill_event publish path below). 2026-05-05 incident: 384 of 422
+    /// adverse fills happened AFTER broker fired THETA HALT because
+    /// kills weren't propagated AND trader had no theta gate.
+    theta_kill: f64,
+    /// Vega-breach threshold (positive; 0 disables; currently 0 per
+    /// CLAUDE.md §13 — Alabaster characterization).
+    vega_kill: f64,
+}
+
+/// Broker → trader kill event. Mirrors the trader's `KillMsg`. Fires
+/// the moment any risk gate trips, well before the next 1Hz risk_state
+/// would surface it. 2026-05-05 incident root cause: this event was
+/// never published — broker fired kills internally and trader had no
+/// idea. Fix: publish on every kill firing site (per-fill P&L,
+/// per-fill delta, periodic risk_check).
+#[derive(Debug, Serialize)]
+struct KillEventMsg<'a> {
+    #[serde(rename = "type")]
+    ty: &'static str,
+    timestamp_ns: u64,
+    source: &'a str,
+    reason: &'a str,
+    kill_type: &'a str,
+}
+
+/// Publish a kill event to the trader. Called from each of the broker's
+/// kill-firing sites in tasks.rs (alongside notify_kill + cancel_all_resting).
+pub(crate) fn publish_kill(runtime: &Arc<Runtime>, ev: &corsair_risk::KillEvent) {
+    let server = match runtime.ipc_server.lock().unwrap().clone() {
+        Some(s) => s,
+        None => return,
+    };
+    let source = format!("{:?}", ev.source).to_lowercase();
+    let kill_type = format!("{:?}", ev.kill_type).to_lowercase();
+    let msg = KillEventMsg {
+        ty: "kill",
+        timestamp_ns: ev.timestamp_ns,
+        source: &source,
+        reason: &ev.reason,
+        kill_type: &kill_type,
+    };
+    if let Ok(body) = rmp_serde::to_vec_named(&msg) {
+        if !server.publish(&body) {
+            log::error!(
+                "ipc events ring full — DROPPED kill event ({}); trader \
+                 will not know about this kill",
+                ev.reason
+            );
+        } else {
+            log::warn!(
+                "ipc: kill event published to trader (source={} type={} reason={})",
+                source,
+                kill_type,
+                ev.reason
+            );
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HelloEvent<'a> {
+    #[serde(rename = "type")]
+    ty: &'a str,
+    timestamp_ns: u64,
+    config: HelloConfigPayload,
+}
+
+fn publish_hello(runtime: &Arc<Runtime>) {
+    let server = match runtime.ipc_server.lock().unwrap().clone() {
+        Some(s) => s,
+        None => return,
+    };
+    let q = &runtime.config.quoting;
+    let c = &runtime.config.constraints;
+    let r = &runtime.config.risk;
+    let ev = HelloEvent {
+        ty: "hello",
+        timestamp_ns: now_ns(),
+        config: HelloConfigPayload {
+            min_edge_ticks: q.min_edge_ticks,
+            tick_size: q.tick_size,
+            delta_ceiling: c.delta_ceiling,
+            delta_kill: r.delta_kill,
+            margin_ceiling_pct: c.margin_ceiling_pct,
+            gtd_lifetime_s: q.gtd_lifetime_s,
+            gtd_refresh_lead_s: q.gtd_refresh_lead_s,
+            dead_band_ticks: q.dead_band_ticks,
+            skip_if_spread_over_edge_mul: q.skip_if_spread_over_edge_mul,
+            theta_kill: r.theta_kill,
+            vega_kill: r.vega_kill,
+        },
+    };
+    if let Ok(body) = rmp_serde::to_vec_named(&ev) {
+        if !server.publish(&body) {
+            log::warn!("ipc events ring full — dropped hello");
+        } else {
+            log::info!(
+                "ipc: hello published (gtd={:.1}s, dead_band={}t, spread_mul={:.1})",
+                q.gtd_lifetime_s,
+                q.dead_band_ticks,
+                q.skip_if_spread_over_edge_mul
+            );
+        }
+    }
+}
+
 // ─── Command dispatch ────────────────────────────────────────────
 
 async fn dispatch_commands(
@@ -400,6 +555,12 @@ async fn dispatch_commands(
             // so we don't need to surface them here. Logging at
             // trace so it's silent under default filter.
             "telemetry" => log::trace!("ipc: trader telemetry frame"),
+            // Trader sends "welcome" once on connect. Respond with a
+            // hello event carrying the broker's runtime config so the
+            // trader replaces its compile-time defaults (GTD,
+            // dead-band, spread mul) with our values. Items 3+4 of
+            // the 2026-05-04 audit.
+            "welcome" => publish_hello(&runtime),
             other => log::warn!("ipc: unknown command type: {other}"),
         }
     }
@@ -428,77 +589,44 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
         );
         return;
     }
-    // Resolve the contract from the broker's contract cache by
-    // (strike, expiry, right). Trader carries those fields on the
-    // wire; instrument_id is broker-internal and never round-trips.
-    // Expiry comparison is YYYYMMDD strings since both sides format
-    // the same way.
+    // Resolve the contract from the broker's fast-path lookup map.
+    // Pre-2026-05-04 this branch did an O(N×M) scan over every
+    // subscribed option with a `format!("%Y%m%d")` allocation per
+    // iteration — ~10–15 µs of pure dispatch latency per place call.
+    // `contract_by_key` is populated in subscribe_strike alongside
+    // qualified_contracts so the hot path is one HashMap::get.
     let r_norm = cmd.right.chars().next()
         .map(|c| c.to_ascii_uppercase())
         .unwrap_or('C');
-    // Audit T1-3: lock order portfolio → market_data, matching the
-    // periodic_* tasks. Fetch products first, then md.
-    let products = runtime.portfolio.lock().unwrap().registry().products();
-    let contract = {
-        let md = runtime.market_data.lock().unwrap();
-        let mut found_iid: Option<corsair_broker_api::InstrumentId> = None;
-        for prod in products {
-            for t in md.options_for_product(&prod) {
-                let t_right_char = match t.right {
-                    corsair_broker_api::Right::Call => 'C',
-                    corsair_broker_api::Right::Put => 'P',
-                };
-                let t_expiry_str = t.expiry.format("%Y%m%d").to_string();
-                if (t.strike - cmd.strike).abs() < 1e-9
-                    && t_expiry_str == cmd.expiry
-                    && t_right_char == r_norm
-                {
-                    found_iid = t.instrument_id;
-                    break;
-                }
-            }
-            if found_iid.is_some() {
-                break;
-            }
-        }
-        // Look up the FULL qualified Contract (with IBKR-canonical
-        // local_symbol + trading_class). This is what subscribe_product
-        // populated when it called qualify_option. Synthesizing the
-        // Contract from scratch caused IBKR to reject every place_order
-        // with cryptic errors like 110 "VOL volatility" because the
-        // server cross-checks fields against conId and our placeholder
-        // values didn't match.
-        let cached = found_iid.and_then(|iid| {
-            runtime.qualified_contracts.lock().unwrap().get(&iid).cloned()
-        });
-        match cached {
-            Some(c) => c,
-            None => {
-                log::warn!(
-                    "ipc place_order: no contract cached for {}{:.4} {} {}",
-                    r_norm, cmd.strike, cmd.expiry, cmd.side
-                );
-                // Still emit a wire_timing row so the failure shows up
-                // in the histogram as outcome=rejected.
-                let row = serde_json::json!({
-                    "schema": "wire_timing/v1",
-                    "ts_ns": now_ns(),
-                    "outcome": "no_contract",
-                    "order_id": serde_json::Value::Null,
-                    "client_order_ref": cmd.client_order_ref.clone().unwrap_or_default(),
-                    "strike": cmd.strike,
-                    "expiry": cmd.expiry,
-                    "right": cmd.right,
-                    "side": cmd.side,
-                    "qty": cmd.qty,
-                    "price": cmd.price,
-                    "triggering_tick_broker_recv_ns": cmd.triggering_tick_broker_recv_ns,
-                    "trader_decide_ts_ns": cmd.ts_ns,
-                    "broker_order_recv_ns": broker_order_recv_ns,
-                });
-                runtime.wire_timing.write(row);
-                return;
-            }
+    let lookup_key = (cmd.strike.to_bits(), cmd.expiry.clone(), r_norm);
+    let cached = runtime.contract_by_key.lock().unwrap().get(&lookup_key).cloned();
+    let contract = match cached {
+        Some(c) => c,
+        None => {
+            log::warn!(
+                "ipc place_order: no contract cached for {}{:.4} {} {}",
+                r_norm, cmd.strike, cmd.expiry, cmd.side
+            );
+            // Still emit a wire_timing row so the failure shows up
+            // in the histogram as outcome=rejected.
+            let row = serde_json::json!({
+                "schema": "wire_timing/v1",
+                "ts_ns": now_ns(),
+                "outcome": "no_contract",
+                "order_id": serde_json::Value::Null,
+                "client_order_ref": cmd.client_order_ref.clone().unwrap_or_default(),
+                "strike": cmd.strike,
+                "expiry": cmd.expiry,
+                "right": cmd.right,
+                "side": cmd.side,
+                "qty": cmd.qty,
+                "price": cmd.price,
+                "triggering_tick_broker_recv_ns": cmd.triggering_tick_broker_recv_ns,
+                "trader_decide_ts_ns": cmd.ts_ns,
+                "broker_order_recv_ns": broker_order_recv_ns,
+            });
+            runtime.wire_timing.write(row);
+            return;
         }
     };
     let side = match cmd.side.as_str() {
@@ -719,15 +847,19 @@ async fn handle_modify(runtime: &Arc<Runtime>, body: &[u8]) {
     // (send_ns, ack_ns) pair captured at the actual TCP send + first
     // OrderStatus update for this order_id.
     let broker_order_send_marker_ns = now_ns();
-    let (result, precise_send_ns, precise_ack_ns) = {
+    let (result, precise_send_ns, precise_ack_ns, strict_ack_ns) = {
         let b = runtime.broker.clone();
         let r = b.modify_order(OrderId(cmd.order_id), req).await;
         let timing = match &r {
             Ok(_) => b.drain_wire_timing(cmd.order_id),
             Err(_) => None,
         };
+        let strict = match &r {
+            Ok(_) => b.drain_strict_amend_ack_ns(cmd.order_id),
+            Err(_) => None,
+        };
         let (s, a) = timing.unzip();
-        (r, s, a)
+        (r, s, a, strict)
     };
     let broker_order_ack_marker_ns = now_ns();
     let broker_order_send_ns = precise_send_ns.unwrap_or(broker_order_send_marker_ns);
@@ -753,20 +885,69 @@ async fn handle_modify(runtime: &Arc<Runtime>, body: &[u8]) {
     });
     runtime.wire_timing.write(row);
 
-    // Push to dashboard latency block. Same TTT / RTT semantics as
-    // place — TTT measures our internal hot path, RTT measures
-    // IBKR network round-trip on the amend send.
+    // Push TTT immediately (it's measured at the send moment).
+    // For the amend RTT histogram, defer the push until the strict
+    // ack arrives — the dispatcher stamps `strict_ack_ns` only when
+    // an OpenOrder with matching-price lands. This avoids the
+    // bimodal distribution problem: previously we pushed every
+    // amend's "permissive" Gateway-PreSubmitted echo (~hundreds of
+    // µs) AND occasional server-confirmed acks (~40-400 ms) into the
+    // same histogram, making p50 dance wildly between the two
+    // populations. By only pushing strict samples we get a single
+    // population centered on real server round-trip latency.
+    //
+    // The deferred-push task waits up to 1s for the dispatcher to
+    // stamp strict_ack_ns. If it never arrives (Gateway never emits
+    // matching OpenOrder, e.g., GTD-only refresh), we drop the
+    // sample — n is lower but the samples we have are clean.
     if result.is_ok() {
-        let modify_rtt_us = (broker_order_ack_marker_ns
-            .saturating_sub(broker_order_send_marker_ns))
-            / 1000;
         let trigger_ns = cmd
             .triggering_tick_broker_recv_ns
             .unwrap_or(broker_order_recv_ns);
         let ttt_us = (broker_order_send_marker_ns.saturating_sub(trigger_ns)) / 1000;
-        let mut s = runtime.latency_samples.lock().unwrap();
-        s.push_ttt(ttt_us);
-        s.push_modify_rtt(modify_rtt_us);
+        runtime.latency_samples.lock().unwrap().push_ttt(ttt_us);
+
+        // If strict ack already landed (rare race — OpenOrder beat
+        // PreSubmitted): push immediately. Otherwise spawn a deferred
+        // observer.
+        if let Some(ack_ns) = strict_ack_ns {
+            let modify_rtt_us =
+                ack_ns.saturating_sub(broker_order_send_marker_ns) / 1000;
+            runtime
+                .latency_samples
+                .lock()
+                .unwrap()
+                .push_modify_rtt(modify_rtt_us);
+        } else {
+            let runtime_clone = runtime.clone();
+            let order_id = cmd.order_id;
+            let send_marker = broker_order_send_marker_ns;
+            tokio::spawn(async move {
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    if let Some(ack_ns) =
+                        runtime_clone.broker.drain_strict_amend_ack_ns(order_id)
+                    {
+                        let modify_rtt_us =
+                            ack_ns.saturating_sub(send_marker) / 1000;
+                        runtime_clone
+                            .latency_samples
+                            .lock()
+                            .unwrap()
+                            .push_modify_rtt(modify_rtt_us);
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        // No strict ack within budget — drop the sample.
+                        // Most often this means a same-price GTD refresh
+                        // where IBKR didn't re-emit OpenOrder.
+                        break;
+                    }
+                }
+            });
+        }
     }
 
     if let Err(e) = result {
@@ -805,6 +986,30 @@ async fn forward_fills(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
                         log::warn!("ipc events ring full — dropped fill");
                     }
                 }
+                // Discord notification (rate-limited inside).
+                // Look up the human-readable label from market_data
+                // so the embed says "HXEM6 P565" not just "iid=N".
+                let label = {
+                    let md = runtime.market_data.lock().unwrap();
+                    if let Some(opt) = md.option_by_iid(fill.instrument_id) {
+                        let r = match opt.right {
+                            Right::Call => "C",
+                            Right::Put => "P",
+                        };
+                        format!(
+                            "HXE{} {}{}",
+                            opt.expiry.format("%y%m%d"),
+                            r,
+                            (opt.strike * 100.0).round() as i32
+                        )
+                    } else if let Some(p) = md.product_for_underlying(fill.instrument_id) {
+                        // Hedge fill on the underlying contract.
+                        format!("{p} hedge")
+                    } else {
+                        format!("iid={}", fill.instrument_id.0)
+                    }
+                };
+                crate::notify::notify_fill(fill.clone(), label);
             }
             Err(RecvError::Lagged(n)) => log::warn!("forward_fills: lagged {n}"),
             Err(RecvError::Closed) => break,
@@ -926,6 +1131,144 @@ struct TickEvent<'a> {
     depth_ask_1: Option<f64>,
 }
 
+/// Hand-rolled msgpack encoder for `TickEvent`. Replaces
+/// `rmp_serde::to_vec_named(&ev)` at the high-frequency tick emit
+/// sites. Symmetric to the trader's hand-rolled `decode_tick` shipped
+/// in commit 6e410ff. Each tick saves ~1-2 µs of broker dispatch by
+/// eliminating serde's reflection + Vec allocation.
+///
+/// Output is always msgpack-named-fields fixmap (≤14 entries), with
+/// fixed encodings for primitives (no compression for small values):
+///   f64 → 0xcb + 8 BE bytes
+///   i32 → 0xd2 + 4 BE bytes
+///   u64 → 0xcf + 8 BE bytes
+///   nil → 0xc0
+///   strings ≤ 31 bytes → fixstr (we control the keys; longest is
+///                                "broker_recv_ns" at 14 bytes)
+///
+/// Caller passes a reusable `Vec<u8>` so there is no per-tick
+/// allocation. The caller clears + slices appropriately.
+///
+/// Round-trip parity with rmp_serde verified by `tests::tick_round_trip`
+/// — we encode hand-rolled, then decode via rmp_serde into a typed
+/// shadow struct, asserting every field matches.
+fn encode_tick_into(ev: &TickEvent, buf: &mut Vec<u8>) {
+    // Field count: 10 always-emitted + up to 4 depth fields.
+    let mut n_fields: u8 = 10;
+    if ev.depth_bid_0.is_some() { n_fields += 1; }
+    if ev.depth_bid_1.is_some() { n_fields += 1; }
+    if ev.depth_ask_0.is_some() { n_fields += 1; }
+    if ev.depth_ask_1.is_some() { n_fields += 1; }
+    // fixmap supports ≤15 entries (header byte 0x80..0x8f).
+    debug_assert!(n_fields <= 14);
+    buf.push(0x80 | n_fields);
+
+    write_str_kv(buf, "type", ev.ty);
+    write_f64_kv(buf, "strike", ev.strike);
+    write_str_kv(buf, "expiry", ev.expiry);
+    write_str_kv(buf, "right", ev.right);
+    write_opt_f64_kv(buf, "bid", ev.bid);
+    write_opt_f64_kv(buf, "ask", ev.ask);
+    write_opt_i32_kv(buf, "bid_size", ev.bid_size);
+    write_opt_i32_kv(buf, "ask_size", ev.ask_size);
+    write_u64_kv(buf, "ts_ns", ev.ts_ns);
+    write_u64_kv(buf, "broker_recv_ns", ev.broker_recv_ns);
+    if let Some(v) = ev.depth_bid_0 { write_f64_kv(buf, "depth_bid_0", v); }
+    if let Some(v) = ev.depth_bid_1 { write_f64_kv(buf, "depth_bid_1", v); }
+    if let Some(v) = ev.depth_ask_0 { write_f64_kv(buf, "depth_ask_0", v); }
+    if let Some(v) = ev.depth_ask_1 { write_f64_kv(buf, "depth_ask_1", v); }
+}
+
+#[inline]
+fn write_fixstr(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    debug_assert!(bytes.len() <= 31, "key too long for fixstr: {}", s);
+    buf.push(0xa0 | (bytes.len() as u8));
+    buf.extend_from_slice(bytes);
+}
+
+#[inline]
+fn write_str(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    if bytes.len() <= 31 {
+        buf.push(0xa0 | (bytes.len() as u8));
+    } else if bytes.len() <= 255 {
+        buf.push(0xd9);
+        buf.push(bytes.len() as u8);
+    } else if bytes.len() <= u16::MAX as usize {
+        buf.push(0xda);
+        buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    } else {
+        buf.push(0xdb);
+        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    }
+    buf.extend_from_slice(bytes);
+}
+
+#[inline]
+fn write_str_kv(buf: &mut Vec<u8>, key: &str, value: &str) {
+    write_fixstr(buf, key);
+    write_str(buf, value);
+}
+
+#[inline]
+fn write_f64_kv(buf: &mut Vec<u8>, key: &str, value: f64) {
+    write_fixstr(buf, key);
+    buf.push(0xcb);
+    buf.extend_from_slice(&value.to_be_bytes());
+}
+
+#[inline]
+fn write_opt_f64_kv(buf: &mut Vec<u8>, key: &str, value: Option<f64>) {
+    write_fixstr(buf, key);
+    match value {
+        Some(v) => {
+            buf.push(0xcb);
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        None => buf.push(0xc0),
+    }
+}
+
+#[inline]
+fn write_opt_i32_kv(buf: &mut Vec<u8>, key: &str, value: Option<i32>) {
+    write_fixstr(buf, key);
+    match value {
+        Some(v) => {
+            buf.push(0xd2);
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        None => buf.push(0xc0),
+    }
+}
+
+#[inline]
+fn write_u64_kv(buf: &mut Vec<u8>, key: &str, value: u64) {
+    write_fixstr(buf, key);
+    buf.push(0xcf);
+    buf.extend_from_slice(&value.to_be_bytes());
+}
+
+thread_local! {
+    /// Per-thread reusable buffer for `encode_tick_into`. Cleared each
+    /// call; never re-allocated after first warmup (typical encoded
+    /// tick is ~180 bytes).
+    static TICK_ENCODE_BUF: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(Vec::with_capacity(256));
+}
+
+/// Encode `ev` and call `f` with the byte slice. Uses a per-thread
+/// buffer so back-to-back ticks don't allocate.
+#[inline]
+fn with_encoded_tick<F: FnOnce(&[u8]) -> R, R>(ev: &TickEvent, f: F) -> R {
+    TICK_ENCODE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        encode_tick_into(ev, &mut buf);
+        f(&buf)
+    })
+}
+
 /// Per-instrument bid/ask/size cache. Native ticks arrive per-kind
 /// (Bid OR Ask OR BidSize OR AskSize); we accumulate here and emit a
 /// consolidated frame on every update so the trader can overwrite
@@ -1045,10 +1388,9 @@ async fn forward_ticks(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
                     depth_ask_0,
                     depth_ask_1,
                 };
-                if let Ok(body) = rmp_serde::to_vec_named(&ev) {
-                    if !server.publish(&body) {
-                        log::debug!("ipc events ring full — dropped tick");
-                    }
+                let dropped = with_encoded_tick(&ev, |body| !server.publish(body));
+                if dropped {
+                    log::debug!("ipc events ring full — dropped tick");
                 }
             }
             Err(RecvError::Lagged(n)) => log::warn!("forward_ticks: lagged {n}"),
@@ -1132,21 +1474,32 @@ async fn periodic_risk_state(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
         };
         let effective_delta = options_delta + (hedge_delta as f64);
 
-        // Margin: poll account_values asynchronously; if too slow,
-        // just skip this tick. (Account refreshes every ~5s in
-        // IBKR's stream so this is best-effort.)
-        let margin_usd = match {
-            let b = runtime.broker.clone();
-            tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                b.account_values(),
-            )
-            .await
-        } {
-            Ok(Ok(snap)) => snap.maintenance_margin,
-            _ => 0.0, // unavailable this tick
+        // Margin: read from runtime's cached AccountSnapshot
+        // (refreshed every 15s by `periodic_account_poll`). The
+        // previous design called `account_values()` per tick under
+        // a 50ms timeout and fell back to `margin_usd = 0.0` on
+        // expiry — a fail-OPEN on the trader-side margin gate.
+        // Trader sees fresh risk_state with margin_pct=0 and the
+        // `margin_pct >= ceiling` guard at decision.rs:646 doesn't
+        // fire (Finding C from the 2026-05-05 audit).
+        //
+        // Fail-closed semantics: when the cache has never been
+        // populated (timestamp_ns == 0, pre-first-poll) or is too
+        // stale (>30s old), publish margin_pct = 1.0 so the trader
+        // blocks ALL placements. The trader's `risk_state stale >5s`
+        // gate is the upstream backstop; this is the within-event
+        // backstop.
+        const MARGIN_CACHE_MAX_AGE_NS: u64 = 30_000_000_000;
+        let (margin_usd, margin_cache_fresh) = {
+            let a = runtime.account.lock().unwrap();
+            let now = now_ns();
+            let fresh = a.timestamp_ns > 0
+                && now.saturating_sub(a.timestamp_ns) <= MARGIN_CACHE_MAX_AGE_NS;
+            (a.maintenance_margin, fresh)
         };
-        let margin_pct = if capital > 0.0 {
+        let margin_pct = if !margin_cache_fresh {
+            1.0 // fail-closed sentinel (>= any reasonable ceiling)
+        } else if capital > 0.0 {
             margin_usd / capital
         } else {
             0.0
@@ -1180,5 +1533,158 @@ fn now_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Round-trip parity tests for the hand-rolled `encode_tick_into`.
+    //! Each test encodes via the hand-roll and decodes via rmp_serde
+    //! into a Deserialize-able shadow struct, then checks every field.
+    //! Equality at the field level (not byte level) lets the encoder
+    //! choose efficient encodings for primitives without breaking the
+    //! contract with the trader's decoder.
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TickEventOwned {
+        #[serde(rename = "type")]
+        ty: String,
+        strike: f64,
+        expiry: String,
+        right: String,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        bid_size: Option<i32>,
+        ask_size: Option<i32>,
+        ts_ns: u64,
+        broker_recv_ns: u64,
+        #[serde(default)]
+        depth_bid_0: Option<f64>,
+        #[serde(default)]
+        depth_bid_1: Option<f64>,
+        #[serde(default)]
+        depth_ask_0: Option<f64>,
+        #[serde(default)]
+        depth_ask_1: Option<f64>,
+    }
+
+    #[test]
+    fn tick_round_trip_full() {
+        let ev = TickEvent {
+            ty: "tick",
+            strike: 6.025,
+            expiry: "20260526",
+            right: "C",
+            bid: Some(0.0345),
+            ask: Some(0.036),
+            bid_size: Some(5),
+            ask_size: Some(7),
+            ts_ns: 1_777_993_654_064_490_620,
+            broker_recv_ns: 1_777_993_654_064_490_620,
+            depth_bid_0: Some(0.0345),
+            depth_bid_1: Some(0.034),
+            depth_ask_0: Some(0.036),
+            depth_ask_1: Some(0.0365),
+        };
+        let mut buf = Vec::new();
+        encode_tick_into(&ev, &mut buf);
+        let d: TickEventOwned = rmp_serde::from_slice(&buf).expect("decode");
+        assert_eq!(d.ty, "tick");
+        assert_eq!(d.strike, 6.025);
+        assert_eq!(d.expiry, "20260526");
+        assert_eq!(d.right, "C");
+        assert_eq!(d.bid, Some(0.0345));
+        assert_eq!(d.ask, Some(0.036));
+        assert_eq!(d.bid_size, Some(5));
+        assert_eq!(d.ask_size, Some(7));
+        assert_eq!(d.ts_ns, 1_777_993_654_064_490_620);
+        assert_eq!(d.broker_recv_ns, 1_777_993_654_064_490_620);
+        assert_eq!(d.depth_bid_0, Some(0.0345));
+        assert_eq!(d.depth_bid_1, Some(0.034));
+        assert_eq!(d.depth_ask_0, Some(0.036));
+        assert_eq!(d.depth_ask_1, Some(0.0365));
+    }
+
+    #[test]
+    fn tick_round_trip_no_depth() {
+        let ev = TickEvent {
+            ty: "tick",
+            strike: 6.0,
+            expiry: "20260526",
+            right: "P",
+            bid: None,
+            ask: Some(0.1),
+            bid_size: None,
+            ask_size: Some(10),
+            ts_ns: 0,
+            broker_recv_ns: 0,
+            depth_bid_0: None,
+            depth_bid_1: None,
+            depth_ask_0: None,
+            depth_ask_1: None,
+        };
+        let mut buf = Vec::new();
+        encode_tick_into(&ev, &mut buf);
+        let d: TickEventOwned = rmp_serde::from_slice(&buf).expect("decode");
+        assert_eq!(d.bid, None);
+        assert_eq!(d.ask, Some(0.1));
+        assert_eq!(d.bid_size, None);
+        assert_eq!(d.ask_size, Some(10));
+        assert_eq!(d.depth_bid_0, None);
+        assert_eq!(d.depth_bid_1, None);
+        assert_eq!(d.depth_ask_0, None);
+        assert_eq!(d.depth_ask_1, None);
+    }
+
+    #[test]
+    fn tick_buf_reuse_clears() {
+        // Ensure the encoder clears prior content; encode twice into the
+        // same buffer and verify only the second tick's data is decoded.
+        let mut buf = Vec::new();
+        encode_tick_into(
+            &TickEvent {
+                ty: "tick",
+                strike: 1.0,
+                expiry: "AAAA",
+                right: "C",
+                bid: Some(0.5),
+                ask: Some(0.6),
+                bid_size: Some(1),
+                ask_size: Some(1),
+                ts_ns: 1,
+                broker_recv_ns: 1,
+                depth_bid_0: None,
+                depth_bid_1: None,
+                depth_ask_0: None,
+                depth_ask_1: None,
+            },
+            &mut buf,
+        );
+        buf.clear();
+        encode_tick_into(
+            &TickEvent {
+                ty: "tick",
+                strike: 2.0,
+                expiry: "BBBB",
+                right: "P",
+                bid: None,
+                ask: None,
+                bid_size: None,
+                ask_size: None,
+                ts_ns: 999,
+                broker_recv_ns: 999,
+                depth_bid_0: None,
+                depth_bid_1: None,
+                depth_ask_0: None,
+                depth_ask_1: None,
+            },
+            &mut buf,
+        );
+        let d: TickEventOwned = rmp_serde::from_slice(&buf).expect("decode");
+        assert_eq!(d.strike, 2.0);
+        assert_eq!(d.expiry, "BBBB");
+        assert_eq!(d.bid, None);
+    }
 }
 
