@@ -1,0 +1,60 @@
+# CI pipeline.
+#
+# Two jobs run in parallel on push to main and on pull_request:
+#
+#   1. `lint-pricing-args` — zero-dependency grep lint codifying the
+#      §16/§19 audit's "no current underlying_price as pricing-fn
+#      positional arg" rule.
+#
+#   2. `cargo-test` — runs unit + bin tests for the crates that hold
+#      §16/§19-relevant test coverage (corsair_trader, corsair_pricing,
+#      corsair_ipc). corsair_pricing pulls PyO3 transitively, so the
+#      job installs python3-dev for libpython linking.
+#
+# Out of CI scope (tracked separately): corsair_broker tests
+# (heavier IBKR-related test setup) and full workspace `cargo test`.
+# Both are independent of §16/§19 regression coverage.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-pricing-args:
+    name: lint § pricing-function arguments (audit §16/§19 backstop)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run pricing-arg lint
+        run: bash scripts/lint_pricing_args.sh
+
+  cargo-test:
+    name: cargo test (corsair_trader, corsair_pricing, corsair_ipc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        # clang + mold: required by .cargo/config.toml (workspace-wide
+        # linker config). python3-dev: libpython3.X.so for PyO3 linkage
+        # in corsair_pricing (default features, not extension-module).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang mold python3-dev
+      - name: Install Rust toolchain (stable)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-test-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-test-${{ runner.os }}-
+      - name: cargo test (selected crates)
+        working-directory: rust
+        run: cargo test -p corsair_trader -p corsair_pricing -p corsair_ipc --bins --lib --no-fail-fast
