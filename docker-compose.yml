@@ -97,6 +97,15 @@ services:
       # Busy-poll the SHM events ring instead of FIFO-wake. Trades 1
       # isolated core hot for ~13 µs IPC latency reduction (CLAUDE.md §17).
       CORSAIR_TRADER_BUSY_POLL: "${CORSAIR_TRADER_BUSY_POLL:-1}"
+      # Huge pages experiment (2026-05-05): mimalloc's
+      # MIMALLOC_LARGE_OS_PAGES=1 madvise's allocator arena segments
+      # as transparent huge pages (2 MiB). Default OFF after harness
+      # A/B regressed — TTT p50 +17%, p90 +28%, KS p=0.025. The
+      # trader's hot working set is small enough (~MB) and L1 cache
+      # behavior already near-perfect (0.0013% miss rate) that 2 MiB
+      # arenas mostly add memory pressure with no TLB benefit. Kept
+      # as opt-in env to revisit if working-set ever grows past L2.
+      MIMALLOC_LARGE_OS_PAGES: "${MIMALLOC_LARGE_OS_PAGES:-}"
     volumes:
       - ./logs-paper:/app/logs-paper      # event JSONL output
       - ./data:/app/data                  # IPC ring files live here
