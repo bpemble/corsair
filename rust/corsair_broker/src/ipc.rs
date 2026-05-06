@@ -1066,18 +1066,58 @@ fn build_fill_notify_context(
             ctx.ask = ask;
             ctx.underlying = underlying;
             Some((product, opt.strike, opt.expiry, opt.right))
-        } else if let Some(p) = md.product_for_underlying(fill.instrument_id) {
-            ctx.instrument_label = format!("{p} hedge");
-            ctx.underlying = md.underlying_price(&p);
-            None
+        } else if let Some(p) = md
+            .product_for_hedge_underlying(fill.instrument_id)
+            .or_else(|| md.product_for_underlying(fill.instrument_id))
+        {
+            // Hedge fill on the futures leg — prefer the hedge
+            // contract's own tick (HGM6) over the options-engine
+            // underlying (HGK6); they're different futures with a
+            // non-trivial calendar spread (CLAUDE.md §10).
+            ctx.underlying = md
+                .hedge_underlying_price(&p)
+                .or_else(|| md.underlying_price(&p));
+            // Decorate label + expiry from the resolved hedge
+            // contract if we have one. Released here before locking
+            // hedge below.
+            Some((Some(p), 0.0, chrono::NaiveDate::default(), Right::Call))
         } else {
             ctx.instrument_label = format!("iid={}", fill.instrument_id.0);
             None
         }
     };
 
+    // For hedge fills (sentinel: strike == 0.0 from the branch above),
+    // pull the resolved contract's local_symbol + expiry now that the
+    // market_data lock is released. This block is a no-op for option
+    // fills (strike > 0) and the no-meta case (opt_meta is None).
+    let mut hedge_path = false;
+    if let Some((Some(product), strike, _, _)) = opt_meta.as_ref() {
+        if *strike == 0.0 {
+            hedge_path = true;
+            let h = runtime.hedge.lock().unwrap();
+            if let Some(mgr) = h.managers().iter().find(|m| &m.config().product == product) {
+                if let Some(c) = mgr.hedge_contract() {
+                    ctx.instrument_label = format!("{} hedge", c.local_symbol);
+                    ctx.leg_label = Some(c.local_symbol.clone());
+                    ctx.expiry_mmdd = Some(c.expiry.format("%m/%d").to_string());
+                } else {
+                    ctx.instrument_label = format!("{product} hedge");
+                    ctx.leg_label = Some(format!("{product} hedge"));
+                }
+            } else {
+                ctx.instrument_label = format!("{product} hedge");
+                ctx.leg_label = Some(format!("{product} hedge"));
+            }
+        }
+    }
+
     // ── Pass 3: vol_surface_cache → IV → theo / delta / theta ─────
-    if let Some((Some(product), strike, expiry, right)) = opt_meta.as_ref() {
+    //   Skipped for hedge-path fills (strike sentinel 0.0) since
+    //   futures don't have a vol surface.
+    if let Some((Some(product), strike, expiry, right)) = opt_meta.as_ref()
+        .filter(|_| !hedge_path)
+    {
         let multiplier = multipliers
             .iter()
             .find(|(p, _)| p == product)
