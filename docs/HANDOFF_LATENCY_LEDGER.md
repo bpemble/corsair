@@ -411,9 +411,21 @@ for tid in $(ls /proc/$TRADER_PID/task); do
     psr=$(awk '{print $39}' /proc/$TRADER_PID/task/$tid/stat)
     echo "tid=$tid comm=$comm cpus=$cpus current_cpu=$psr"
 done
-# Expect:  workers on different physical cores (8 and 10 on 13900K)
-#          bg thread on cpu 9 (SMT sibling of cpu 8 — shared L1/L2 with worker 0)
+# POST-Lever-1 expected layout (cpuset 8-11 on 13900K/14900K):
+#   corsair-hot      cpus=8     current_cpu=8    ← std::thread, busy-spin
+#   tokio-rt-worker  cpus=10    current_cpu=10   ← parked, different physical core
+#   corsair-bg       cpus=11    current_cpu=11   ← telemetry/staleness/signals
+#   jsonl-trader_*   cpus=11    current_cpu=11   ← disk-IO writers
+#   corsair_trader_  cpus=8-11  current_cpu=8    ← main thread (parked)
+# Cpu 9 (SMT sibling of cpu 8) MUST be empty — see §13.4 for the bug
+# that landed tokio worker / JSONL writers on cpu 9 and inflated TTT
+# p99 to 6 ms.
 ```
+
+**SMT-sibling bug check (REGRESSION TEST)**: confirm `cpu 9` (or
+whichever cpu shares a physical core with `corsair-hot`) is empty in
+the layout above. If a thread is on the SMT sibling of `corsair-hot`,
+TTT p99 will inflate by 50-100× from execution-unit contention.
 
 If your new host has different P/E-core layout, re-derive the cpuset map.
 On Raptor Lake (13900K/14900K): P-cores are CPU 0-15 (8 cores × 2 SMT),
@@ -793,7 +805,76 @@ OMS queue, so disabling it lets us measure the live-trading staleness
 penalty. If paper-style >50% gating reproduces in live, the cap should
 stay; if live has lower natural concurrency, it might be unnecessary.
 
-### 13.3 What's left after Tier A
+### 13.4 SMT-sibling pinning bug — TTT p99 6 ms → 80 µs
+
+Discovered in production telemetry shortly after the Tier A Exp 2
+deploy when the operator reported TTT p99 at 6 ms. The bug had been
+masked in the harness because the harness's cpuset (4,5) doesn't
+share the same hybrid-CPU SMT topology as production's (8-11).
+
+Diagnosis via `/proc/$TRADER_PID/task/*/status`:
+
+```
+hot std::thread     → cpu 8   ✓
+tokio worker        → cpu 9   ✗ SMT sibling of hot cpu 8
+corsair-bg          → cpu 11  ok
+jsonl-trader_events → cpu 11  ok (kernel placed; unpinned)
+jsonl-trader_decisions → cpu 9 ✗ SMT sibling of hot cpu 8 (unpinned drift)
+```
+
+When jsonl-trader_decisions or tokio worker had a brief activity burst
+on cpu 9, they stole pipeline execution units from cpu 8 (Intel Raptor
+Lake hybrid: SMT siblings share execution units, not just L1). The
+hot thread on cpu 8 saw 6 ms gaps in its busy-spin, manifesting as TTT
+p99 outliers.
+
+**Root cause**: two pinning gaps in Lever 1 (commit `632aea5`):
+
+1. **Tokio worker pinning fallback** in `main.rs::async_main` was
+   `allowed_cpus.iter().find(|&&c| c != hot_cpu)` — picks cpu 9 on
+   hybrid Intel parts where 8 and 9 share a physical core. Should
+   skip the entire physical core, not just the cpu id.
+
+2. **JsonlWriter::start did not pin** the spawned `std::thread`. The
+   kernel scheduler placed both writers within the cpuset (8-11), so
+   they drifted onto cpu 9 along with everything else.
+
+**Fix** (commit `4503cb3`):
+
+- Made `corsair_ipc::cpu_affinity::physical_core_id` `pub`. Tokio
+  worker pinning now uses `physical_core_id(c) != physical_core_id(hot_cpu)`
+  in the predicate. On cpuset 8-11 (8/9 sibling, 10/11 sibling), this
+  picks cpu 10 instead of cpu 9.
+- `JsonlWriter::start` now takes `pin_cpu: Option<usize>`. Trader
+  passes the last allowed cpu (cpu 11 — colocates with bg_rt, both
+  are disk-IO/sparse).
+
+**Verification**:
+
+```
+pre-fix:  TTT p50=17 µs  p99=6116 µs   (production)
+post-fix: TTT p50=18 µs  p99=  79 µs   (production, -99%)
+```
+
+Layout post-fix (verified via `/proc/$pid/task`):
+
+```
+cpu 8  → corsair-hot       (busy-spin, owns hot path)
+cpu 9  → IDLE              (deliberately empty — see warning above)
+cpu 10 → tokio-rt-worker   (parked on pending future)
+cpu 11 → corsair-bg + jsonl-trader_events + jsonl-trader_decisions
+```
+
+**Why the harness missed this**: harness pins both replay and trader to
+cpuset 4,5 on this Comet/Raptor host. `physical_core_id(4)` and
+`physical_core_id(5)` differ — cpu 4 and 5 are NOT SMT siblings on
+this layout. So the harness's tokio worker and JSONL writers don't
+share a physical core with the hot thread regardless of pinning logic.
+Only production cpuset 8-11 exposed the bug. **Future verification**:
+after any threading change, check thread placement via /proc on the
+*production* cpuset, not just the harness.
+
+### 13.5 What's left after Tier A + the SMT fix
 
 After Tier A:
 
