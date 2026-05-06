@@ -707,3 +707,110 @@ Add to §8:
 | `~/corsair_latency/exp_l12_pinfix.json` | post-cpu-pin-fix Lever 1+2 verification |
 | `/tmp/trader_perf.data` | 30s perf record post-Bundle-6, used for the §10.4 profile (note: tmpfs, ages out on reboot) |
 | `/tmp/corsair_trader_rust` | binary copy needed for symbol resolution against `/tmp/trader_perf.data` (matches BuildID `482ff10a...`) |
+
+---
+
+## 13. 2026-05-06 evening — Tier A experiments
+
+After §10's bundles + Levers and the §11 deferral discussion (trader+broker
+merge waits on a separate-FCM transition so the rework lands once),
+two Tier A experiments were run:
+
+### 13.1 Tier A Exp 1 — PURGE_DELAY-only mimalloc retest
+
+Hypothesis: §10.4 L3 rejected mimalloc env tuning bundled. The
+`MIMALLOC_RESERVE_HUGE_OS_PAGES=1` flag's huge-pages fallback was
+suspected; isolate `MIMALLOC_PURGE_DELAY=10000` alone.
+
+Result: **REJECTED** across two harness runs.
+
+```
+Run 1 (n=149 vs baseline n=151):
+  TTT p50:    +1 µs    p99:   +1 µs   KS p=0.38 (indistinguishable)
+Run 2 (n=148):
+  TTT p50:    +1 µs    p99:  +18 µs   p99.9: +37.7 µs   KS p=0.14
+```
+
+Interpretation: PURGE_DELAY=10000 defers purges, so when they fire
+they're larger and stall the calling thread longer. Net is a tail
+regression. Combined with the L3 reject, the conclusion is **mimalloc
+defaults are appropriate for this workload — do not tune env vars.**
+
+### 13.2 Tier A Exp 2 — Per-tick burst cap
+
+Goal: address the empirical inflight=2 RTT cliff observed in
+`logs-paper/wire_timing-2026-05-06.jsonl`:
+
+```
+inflight=0   p50= 42ms p99= 443ms   ← 64% of orders today
+inflight=1   p50= 50ms p99= 655ms   ← 26%
+inflight=2   p50=246ms p99= 920ms   ← 5.3% (5× p50 jump)
+inflight=3+  p50=349-683ms p99=1.0-1.1s   ← 4.7%
+```
+
+~10% of orders today fire at inflight≥2 and pay 200-700 ms p50 of
+JVM-OMS queue inflation. Designed gate: max 2 outbound sends in any
+50 ms sliding window. Implementation:
+
+- `OutboundLimiter` with two timestamp slots (`AtomicU64`); slot
+  eviction picks the oldest. Ordering Relaxed because a one-extra
+  slip on cross-thread races is acceptable.
+- Gated in `decide_on_tick` after the cooldown / dead-band gates,
+  before the modify-vs-place branch. Both kinds consume slots.
+- `CancelAll` (risk self-block) bypasses the cap — yanking quotes
+  on a kill is time-critical.
+- Window is configurable via `CORSAIR_TRADER_BURST_WINDOW_NS`;
+  read at boot into `SharedState::burst_window_ns`. Set to `0` to
+  disable.
+
+Pre-deploy harness check (replay doesn't simulate IBKR backpressure
+so TTT shouldn't change): TTT p50/p90/p99 unchanged, KS p=0.62. Drop
+in sample count (151→137) confirms the cap fires in the harness too.
+
+Production verification via wire_timing-2026-05-06.jsonl analysis
+(deploy at epoch 1778091399, n_pre=32769 / n_post=901):
+
+| metric | pre-cap | post-cap | delta |
+|---|---|---|---|
+| place p50 RTT | 172.4 ms | 92.2 ms | **-47%** |
+| place p99 RTT | 821.6 ms | 348.5 ms | **-58%** |
+| modify p50 RTT | -0.3 ms | -0.2 ms | unchanged |
+| modify p99 RTT | 594.4 ms | 318.5 ms | **-46%** |
+| % orders inflight≥2 at send | 10.0% | 3.8% | **-62%** |
+| inflight=4+ p99 RTT | 1086 ms | 445 ms | -59% |
+| inflight=8+ bucket | 0.4% | 0.0% | eliminated |
+
+Verdict: **SHIP**.
+
+Trade-off: ~45% of would-be sends are deferred up to 50 ms before
+re-firing. Net order rate halves (~5400/hr → ~2700/hr in this sample).
+For paper: clean win. **For live**: validate alpha-loss-from-staleness
+vs latency-improved-execution before keeping the cap on. Operator
+disable: `CORSAIR_TRADER_BURST_WINDOW_NS=0` in compose env.
+
+The cap only fires when the trader would have piled into the IBKR
+OMS queue, so disabling it lets us measure the live-trading staleness
+penalty. If paper-style >50% gating reproduces in live, the cap should
+stay; if live has lower natural concurrency, it might be unnecessary.
+
+### 13.3 What's left after Tier A
+
+After Tier A:
+
+- Mimalloc tuning is exhausted (defaults are correct).
+- Per-tick burst cap landed; the §3.4 RTT inflation pattern is broken.
+- §11's trader+broker merge remains the only large local lever, deferred
+  pending FCM transition.
+
+End-to-end p99 was 698 ms pre-cap (per §3.4); post-cap with most orders
+landing at inflight≤1, end-to-end p99 should drop into the 350-500 ms
+range. Not measured directly today — wire_timing-2026-05-07.jsonl will
+have a clean post-cap distribution to validate.
+
+The remaining infrastructure levers (FIX gateway, co-location) are
+unchanged from §6. Their ROI is now even stronger relative to local
+work — the local hot path contributes ~15 µs of TTT to a ~350-500 ms
+end-to-end p99, i.e. <0.005% of total. Any further locally-focused
+optimization is purely academic until those infrastructure changes
+land or until the trader+broker merge deletes the remaining ~9 µs of
+SHM IPC overhead.

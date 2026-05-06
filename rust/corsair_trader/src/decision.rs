@@ -57,6 +57,19 @@ pub const MIN_BBO_SIZE: i32 = 1;
 pub const MAX_FORWARD_DRIFT_TICKS: i32 = 200;
 pub const ATM_TOL_USD: f64 = 0.025; // half-strike tolerance for OTM-only
 
+/// Tier A Exp 2 burst-cap window (sliding) — gate fires when ≥2 sends
+/// have already happened within this many ns. 50 ms = 20/sec sustained
+/// throughput, max 2-burst within window. Targeted at the empirical
+/// inflight=2+ RTT cliff (5× p50 jump per wire_timing analysis).
+///
+/// At runtime the operator may override via env
+/// `CORSAIR_TRADER_BURST_WINDOW_NS` (resolved at boot in `main.rs`,
+/// stored as `SharedState::burst_window_ns`). Set to 0 to disable
+/// the gate entirely — useful for live deployments where alpha-loss
+/// from delayed quotes may outweigh the RTT-compression benefit
+/// observed in paper.
+pub const BURST_WINDOW_NS_DEFAULT: u64 = 50_000_000;
+
 #[derive(Debug)]
 pub enum Decision {
     /// Send place_order at this price for this side. If `cancel_old_oid`
@@ -572,6 +585,23 @@ pub fn decide_on_tick(
         // process a tick AFTER newer ticks have been queued. In the
         // single-thread Rust version they're identical, so skip the
         // duplicate check.
+
+        // Tier A Exp 2 (2026-05-06): outbound burst-cap gate. Caps
+        // concurrent wire round-trips at 2 within a sliding window
+        // (default 50 ms, env-overridable). Modify and Place both
+        // consume slots — empirical inflight=2 inflates RTT 5×
+        // regardless of kind. Cancels (CancelAll path) bypass the
+        // cap because they're rare and time-critical (yanking quotes
+        // during risk events). Window of 0 disables the gate.
+        let burst_window = state.burst_window_ns;
+        if burst_window > 0
+            && !state
+                .outbound_limiter
+                .try_consume(now_monotonic_ns, burst_window)
+        {
+            counters.skip_burst_cap.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
 
         // Re-quote path:
         //   - If we have a live order_id at this key, AMEND (single

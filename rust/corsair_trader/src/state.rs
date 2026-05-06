@@ -123,6 +123,13 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 /// Small fields read on every tick. Snapshot into `ScalarSnapshot`
 /// once per tick to avoid taking the lock repeatedly inside
 /// `decide_on_tick`.
@@ -312,6 +319,65 @@ pub struct SharedState {
     /// `ScalarSnapshot` to avoid repeated lock acquires in the hot
     /// path.
     pub scalars: Mutex<ScalarState>,
+
+    /// Tier A Exp 2 (2026-05-06): per-tick burst limiter.
+    ///
+    /// Caps concurrent outbound wire round-trips at `MAX_BURST_SENDS`
+    /// (2) within a `BURST_WINDOW_NS` (50ms) sliding window. Empirical
+    /// from `logs-paper/wire_timing-2026-05-06.jsonl` (n=32k):
+    ///
+    ///   inflight=0   p50= 42ms p99= 443ms
+    ///   inflight=1   p50= 50ms p99= 655ms
+    ///   inflight=2   p50=246ms p99= 920ms   ← 5× jump at p50
+    ///   inflight=3+  p50=351-683ms p99=1.0-1.1s
+    ///
+    /// ~10% of orders today fire at inflight≥2 and pay the inflated
+    /// RTT. Gating new sends at the 2nd-concurrent boundary defers
+    /// those by ≤50ms (one window), letting them re-fire when the
+    /// queue has drained.
+    pub outbound_limiter: OutboundLimiter,
+
+    /// Burst-cap window in ns. Default `BURST_WINDOW_NS_DEFAULT`
+    /// (50 ms); `CORSAIR_TRADER_BURST_WINDOW_NS=0` disables the gate.
+    /// Read once at boot in `main.rs` and stored here so the hot path
+    /// avoids touching the env on every tick.
+    pub burst_window_ns: u64,
+}
+
+/// Sliding-window burst limiter for outbound IPC commands.
+/// 2 timestamp slots — if both have entries within the last
+/// `BURST_WINDOW_NS`, new sends are gated. Slot eviction picks the
+/// oldest timestamp.
+#[derive(Default)]
+pub struct OutboundLimiter {
+    slot_a: AtomicU64,
+    slot_b: AtomicU64,
+}
+
+impl OutboundLimiter {
+    /// Try to consume a burst slot at `now_ns`. Returns true if the
+    /// caller may send (not at cap), false if it should skip.
+    /// `max_age_ns` is the sliding-window length.
+    #[inline]
+    pub fn try_consume(&self, now_ns: u64, max_age_ns: u64) -> bool {
+        let a = self.slot_a.load(Ordering::Relaxed);
+        let b = self.slot_b.load(Ordering::Relaxed);
+        let a_recent = now_ns.saturating_sub(a) < max_age_ns;
+        let b_recent = now_ns.saturating_sub(b) < max_age_ns;
+        if a_recent && b_recent {
+            return false;
+        }
+        // Overwrite the oldest slot. Under hot-path single-thread
+        // access this is race-free; under cross-thread (staleness
+        // loop calling concurrently) the worst case is one extra
+        // send slipping through — acceptable.
+        if a <= b {
+            self.slot_a.store(now_ns, Ordering::Relaxed);
+        } else {
+            self.slot_b.store(now_ns, Ordering::Relaxed);
+        }
+        true
+    }
 }
 
 impl SharedState {
@@ -327,6 +393,11 @@ impl SharedState {
             kills_count: AtomicUsize::new(0),
             histograms: Mutex::new(Histograms::default()),
             scalars: Mutex::new(ScalarState::new()),
+            outbound_limiter: OutboundLimiter::default(),
+            burst_window_ns: env_u64(
+                "CORSAIR_TRADER_BURST_WINDOW_NS",
+                crate::decision::BURST_WINDOW_NS_DEFAULT,
+            ),
         }
     }
 
@@ -454,6 +525,11 @@ pub struct DecisionCounters {
     /// between this counter and broker-side wire records is the
     /// invisible-drop magnitude we're trying to surface.
     pub place_dropped: AtomicU64,
+    /// Tier A Exp 2 (2026-05-06): outbound burst-cap gate fired —
+    /// ≥2 sends within the last 50ms, this side skipped to avoid
+    /// piling onto the IBKR OMS queue. Caller will re-evaluate on
+    /// the next tick (typically <20ms later).
+    pub skip_burst_cap: AtomicU64,
 }
 
 impl Default for DecisionCounters {
@@ -491,6 +567,7 @@ impl DecisionCounters {
             staleness_modify: AtomicU64::new(0),
             modify: AtomicU64::new(0),
             place_dropped: AtomicU64::new(0),
+            skip_burst_cap: AtomicU64::new(0),
         }
     }
 
@@ -526,6 +603,7 @@ impl DecisionCounters {
             ("staleness_modify", &self.staleness_modify),
             ("modify", &self.modify),
             ("place_dropped", &self.place_dropped),
+            ("skip_burst_cap", &self.skip_burst_cap),
         ];
         for (k, v) in pairs {
             let n = v.load(Ordering::Relaxed);
