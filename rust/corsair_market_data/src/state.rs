@@ -6,6 +6,14 @@ use std::collections::HashMap;
 
 use crate::option_state::OptionTick;
 
+// `hashbrown::HashMap` is API-compatible with `std::collections::HashMap`
+// for everything we use, plus exposes `raw_entry` (still unstable in
+// std). We use raw_entry on the `options` map only so the hot lookup
+// path can hash a borrowed (product: &str) key without an owning
+// `OptionKey { product: String, … }` temporary. Other maps in this
+// struct stay on std HashMap — only the `options` map is hot.
+type HBHashMap<K, V> = hashbrown::HashMap<K, V>;
+
 /// Market data state for a single broker connection. Holds
 /// underlying price per product and the option book keyed by
 /// (product, strike_key, expiry, right_char).
@@ -15,7 +23,7 @@ use crate::option_state::OptionTick;
 /// via the [`MarketDataView`](crate::view::MarketDataView) trait.
 pub struct MarketDataState {
     underlying: HashMap<String, f64>,
-    options: HashMap<OptionKey, OptionTick>,
+    options: HBHashMap<OptionKey, OptionTick>,
     /// Fast lookup from broker InstrumentId → option key.
     by_instrument: HashMap<InstrumentId, OptionKey>,
     /// Underlying instrument id → product (resolved via runtime
@@ -68,7 +76,7 @@ impl MarketDataState {
     pub fn new() -> Self {
         Self {
             underlying: HashMap::new(),
-            options: HashMap::new(),
+            options: HBHashMap::new(),
             by_instrument: HashMap::new(),
             underlying_instruments: HashMap::new(),
             hedge_underlying: HashMap::new(),
@@ -313,7 +321,14 @@ impl MarketDataState {
         }
     }
 
-    /// Direct lookup for OptionTick.
+    /// Direct lookup for OptionTick. Zero-alloc: hashes a borrowed
+    /// (product, strike_key, expiry, right) without constructing an
+    /// owning `OptionKey` (which would `String`-alloc product).
+    ///
+    /// Hashing must mirror the `Hash` derive on `OptionKey` field-by-
+    /// field in declaration order. The hash-consistency unit test
+    /// below pins this — if a maintainer reorders OptionKey fields
+    /// without updating this function, the test fails immediately.
     pub fn option(
         &self,
         product: &str,
@@ -321,12 +336,26 @@ impl MarketDataState {
         expiry: NaiveDate,
         right: Right,
     ) -> Option<&OptionTick> {
-        self.options.get(&OptionKey {
-            product: product.to_string(),
-            strike_key: strike_key(strike),
-            expiry,
-            right,
-        })
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let strike_key = strike_key(strike);
+        let mut hasher = self.options.hasher().build_hasher();
+        // Order matches OptionKey field declaration order. DO NOT
+        // reorder without also updating OptionKey + the consistency
+        // test in `mod tests`.
+        product.hash(&mut hasher);
+        strike_key.hash(&mut hasher);
+        expiry.hash(&mut hasher);
+        right.hash(&mut hasher);
+        let h = hasher.finish();
+        self.options
+            .raw_entry()
+            .from_hash(h, |k| {
+                k.product == product
+                    && k.strike_key == strike_key
+                    && k.expiry == expiry
+                    && k.right == right
+            })
+            .map(|(_, v)| v)
     }
 
     /// All options for a product. Used by snapshot serialization
@@ -374,6 +403,66 @@ mod tests {
         let t = s.option("HG", 6.05, exp(), Right::Call).unwrap();
         assert_eq!(t.strike, 6.05);
         assert_eq!(t.instrument_id, Some(InstrumentId(100)));
+    }
+
+    #[test]
+    fn raw_entry_hash_matches_owning_optionkey_hash() {
+        // The zero-alloc `option()` lookup hashes a borrowed key
+        // field-by-field. This MUST produce the same hash as the
+        // owning `OptionKey { product: String, … }` — otherwise the
+        // raw_entry probe lands in a different bucket and silently
+        // misses. Pin the invariant so a maintainer reordering
+        // OptionKey fields (or changing the field types) gets a
+        // loud compile-test failure rather than silent prod misses.
+        use std::hash::{BuildHasher, Hash, Hasher};
+
+        let s = MarketDataState::new();
+        let strike = 6.05_f64;
+        let expiry = exp();
+        let right = Right::Call;
+        let strike_k = strike_key(strike);
+        let owning = OptionKey {
+            product: "HG".to_string(),
+            strike_key: strike_k,
+            expiry,
+            right,
+        };
+
+        let mut h_owning = s.options.hasher().build_hasher();
+        owning.hash(&mut h_owning);
+        let owning_hash = h_owning.finish();
+
+        let mut h_borrowed = s.options.hasher().build_hasher();
+        "HG".hash(&mut h_borrowed);
+        strike_k.hash(&mut h_borrowed);
+        expiry.hash(&mut h_borrowed);
+        right.hash(&mut h_borrowed);
+        let borrowed_hash = h_borrowed.finish();
+
+        assert_eq!(
+            owning_hash, borrowed_hash,
+            "raw_entry hash must match OptionKey derive(Hash) — \
+             field order or type changed in OptionKey?"
+        );
+    }
+
+    #[test]
+    fn raw_entry_lookup_matches_owning_lookup_across_products() {
+        // Multiple products + strikes + rights — sanity check the
+        // raw_entry path resolves correctly across collision domains.
+        let mut s = MarketDataState::new();
+        s.register_option("HG", 6.05, exp(), Right::Call, InstrumentId(1));
+        s.register_option("HG", 6.05, exp(), Right::Put, InstrumentId(2));
+        s.register_option("HG", 6.10, exp(), Right::Call, InstrumentId(3));
+        s.register_option("ETH", 6.05, exp(), Right::Call, InstrumentId(4));
+
+        assert_eq!(s.option("HG", 6.05, exp(), Right::Call).unwrap().instrument_id, Some(InstrumentId(1)));
+        assert_eq!(s.option("HG", 6.05, exp(), Right::Put).unwrap().instrument_id, Some(InstrumentId(2)));
+        assert_eq!(s.option("HG", 6.10, exp(), Right::Call).unwrap().instrument_id, Some(InstrumentId(3)));
+        assert_eq!(s.option("ETH", 6.05, exp(), Right::Call).unwrap().instrument_id, Some(InstrumentId(4)));
+        // Negatives.
+        assert!(s.option("HG", 6.15, exp(), Right::Call).is_none());
+        assert!(s.option("XX", 6.05, exp(), Right::Call).is_none());
     }
 
     #[test]

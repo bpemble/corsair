@@ -12,6 +12,14 @@ chrono = { version = "0.4", features = ["serde"] }
 corsair_broker_api = { path = "../corsair_broker_api" }
 corsair_position = { path = "../corsair_position" }
 corsair_pricing = { path = "../corsair_pricing" }
+# hashbrown gives us `raw_entry` for borrow-keyed lookup on the
+# options HashMap. The `option(product, strike, expiry, right)`
+# query path fires ~180×/sec (snapshot tick + greek refresh + per-fill)
+# and the std HashMap forces a `product.to_string()` on every call.
+# Bench at rust/perf_bench: 31ns → 13ns per lookup (2.4× faster, no
+# heap alloc). std::collections::HashMap doesn't have raw_entry on
+# stable.
+hashbrown = "0.14"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 

@@ -1,0 +1,23 @@
+[workspace]
+# Standalone — not part of the corsair workspace. Stays out of
+# CI/image builds; one-off perf harness only.
+
+[package]
+name = "perf_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# One-off perf harness. NOT in the workspace (stays out of CI / image
+# builds). Build with `cargo run --release --manifest-path
+# rust/perf_bench/Cargo.toml` from a host that has the workspace built.
+
+[dependencies]
+bytes = "1"
+hashbrown = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
