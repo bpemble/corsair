@@ -7,10 +7,14 @@
 //! ~100 µs), one migration adds 10-50 µs of jitter — meaningful tail.
 //!
 //! Pinning is done at thread spawn via Builder::on_thread_start.
-//! We round-robin worker threads across the cores allowed by the
-//! current cpuset (sched_getaffinity), so containers with cpuset
-//! constraints get respected automatically — no need to hardcode
-//! cores per host.
+//! Workers are assigned to CPUs by `build_pinner`, which prefers to
+//! spread the first N workers across distinct physical cores before
+//! filling SMT siblings. On hybrid Intel parts (Alder/Raptor Lake)
+//! SMT siblings are interleaved (CPU 0,1 on the same physical core),
+//! so naive sequential picks would put both tokio workers on the
+//! same core and they'd fight for execution units. The SMT-aware
+//! algorithm below avoids that on hybrid layouts and is a no-op on
+//! traditional Intel layouts where SMT siblings are far apart.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -34,6 +38,38 @@ pub fn allowed_cpus() -> Vec<usize> {
             .filter(|&i| libc::CPU_ISSET(i, &set))
             .collect()
     }
+}
+
+/// Read the SMT thread sibling of `cpu` from sysfs. Returns None if
+/// sysfs isn't readable or the topology is degenerate (single-thread
+/// physical core has only itself as sibling). The lowest-numbered
+/// CPU in the sibling pair is the "physical core id" we use for
+/// uniqueness checks in build_pinner.
+fn physical_core_id(cpu: usize) -> usize {
+    let path = format!(
+        "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list",
+        cpu
+    );
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return cpu;
+    };
+    // Format is comma-separated CPUs and/or hyphenated ranges,
+    // e.g. "0,1" or "0-1". Take the smallest CPU id in the list.
+    let mut min_id = cpu;
+    for part in contents.trim().split(',') {
+        if let Some((lo, _hi)) = part.split_once('-') {
+            if let Ok(n) = lo.trim().parse::<usize>() {
+                if n < min_id {
+                    min_id = n;
+                }
+            }
+        } else if let Ok(n) = part.trim().parse::<usize>() {
+            if n < min_id {
+                min_id = n;
+            }
+        }
+    }
+    min_id
 }
 
 /// Pin the calling thread to a single logical CPU. Logs a warning
@@ -62,36 +98,65 @@ pub fn pin_thread_to_cpu(cpu: usize) {
 /// Build a round-robin pinner closure suitable for
 /// `tokio::runtime::Builder::on_thread_start`.
 ///
-/// Picks the first `desired_workers` CPUs from the allowed set
-/// (clamped to the actual size of the allowed set so we never pin
-/// to a CPU outside cpuset). Returns a tuple of:
+/// Returns a tuple of:
 ///   - the worker count to pass to `worker_threads(...)`
+///   - the chosen pin list (CPU id per spawned worker, in order)
 ///   - a closure to pass to `on_thread_start(...)` that round-robin
 ///     assigns each spawned worker thread to one of the picked CPUs.
 ///
-/// Logs at info level so operators can confirm the pinning at boot.
+/// The pin selection is SMT-aware: pass 1 picks one CPU per distinct
+/// physical core in cpuset order; pass 2 fills any remaining slots
+/// with leftover SMT siblings. With cpuset `8,9,10,11` on a hybrid
+/// 13900K (siblings 8↔9, 10↔11) and 2 workers, this yields pins
+/// `[8, 10]` — workers on different physical cores. With cpuset
+/// `4,5,10,11` on Comet Lake (siblings 4↔10, 5↔11) and 2 workers
+/// the result is `[4, 5]`, identical to the prior naive behavior.
 pub fn build_pinner(
     role: &'static str,
     desired_workers: usize,
-) -> (usize, impl Fn() + Send + Sync + 'static + Clone) {
+) -> (usize, Vec<usize>, impl Fn() + Send + Sync + 'static + Clone) {
     let allowed = allowed_cpus();
     let workers = desired_workers.min(allowed.len().max(1));
-    // Pick a contiguous slice of the allowed set; gives stable
-    // pinning across restarts and matches docker cpuset ordering.
+
     let pins: Vec<usize> = if allowed.is_empty() {
         // Pathological — sched_getaffinity failed. Don't pin.
         Vec::new()
     } else {
-        allowed.into_iter().take(workers).collect()
+        let mut pins: Vec<usize> = Vec::with_capacity(workers);
+        let mut seen_cores: Vec<usize> = Vec::with_capacity(workers);
+        // Pass 1: one CPU per distinct physical core, in cpuset order.
+        for &cpu in &allowed {
+            if pins.len() >= workers {
+                break;
+            }
+            let core = physical_core_id(cpu);
+            if !seen_cores.contains(&core) {
+                seen_cores.push(core);
+                pins.push(cpu);
+            }
+        }
+        // Pass 2: fill remaining slots with leftover SMT siblings.
+        if pins.len() < workers {
+            for &cpu in &allowed {
+                if pins.len() >= workers {
+                    break;
+                }
+                if !pins.contains(&cpu) {
+                    pins.push(cpu);
+                }
+            }
+        }
+        pins
     };
     log::warn!(
-        "{}: tokio runtime — {} worker(s), pin cpus = {:?}",
+        "{}: tokio runtime — {} worker(s), pin cpus = {:?} (allowed = {:?})",
         role,
         workers,
-        pins
+        pins,
+        allowed
     );
     let counter = Arc::new(AtomicUsize::new(0));
-    let pins_arc = Arc::new(pins);
+    let pins_arc = Arc::new(pins.clone());
     let closure = move || {
         if pins_arc.is_empty() {
             return;
@@ -106,5 +171,5 @@ pub fn build_pinner(
             cpu
         );
     };
-    (workers, closure)
+    (workers, pins, closure)
 }

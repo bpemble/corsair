@@ -2,15 +2,13 @@
 name = "corsair_oms"
 version = "0.1.0"
 edition = "2021"
-description = "Order management — our_orders index, send-or-update, cancel-before-replace, GTD refresh."
+description = "Minimal orderId → terminal-state cache for the v3 broker daemon."
 
 [lib]
 name = "corsair_oms"
 
 [dependencies]
-chrono = { version = "0.4", features = ["serde"] }
 corsair_broker_api = { path = "../corsair_broker_api" }
-log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]

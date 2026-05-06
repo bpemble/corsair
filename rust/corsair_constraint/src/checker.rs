@@ -60,6 +60,21 @@ pub struct ConstraintCheck {
     /// Hedge contract qty (signed), needed for effective_delta_gating.
     /// Caller passes 0 if no hedge or gating disabled.
     pub hedge_qty: i32,
+    /// Freshness of `hedge_qty` per CLAUDE.md §14. The caller is
+    /// responsible for computing this against `HedgeState::is_fresh`
+    /// (or equivalent). Encoding:
+    ///   - `None`     = legacy behavior; hedge_qty is trusted iff
+    ///                  effective_delta_gating is on (back-compat)
+    ///   - `Some(true)`  = hedge state was reconciled recently
+    ///   - `Some(false)` = hedge state is stale → gate FAILS CLOSED
+    ///                     (treat hedge_qty as 0 + log WARN once;
+    ///                     reject any order pushing options-only
+    ///                     delta past the ceiling)
+    /// TODO-NOTE for callers in OTHER crates (corsair_broker::tasks):
+    /// you must compute freshness via HedgeState::is_fresh(now_ns,
+    /// freshness_ns) and pass Some(bool) here. Default `None` keeps
+    /// compile-compat but disables the fail-closed guarantee.
+    pub hedge_state_fresh: Option<bool>,
 }
 
 /// Calibration bounds on the synthetic-vs-IBKR scale factor (CLAUDE.md
@@ -78,6 +93,10 @@ pub struct ConstraintChecker {
     ibkr_scale: f64,
     /// Last-observed raw / IBKR / scale tuple. Useful for telemetry.
     last_calibration: Option<MarginCalibration>,
+    /// Audit T1-1 / CLAUDE.md §14: log a stale-hedge WARN at most
+    /// once per process; stale-hedge events are noisy and the warn
+    /// should be loud-but-not-spammy.
+    stale_hedge_warned: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +113,7 @@ impl ConstraintChecker {
             cfg,
             ibkr_scale: 1.0,
             last_calibration: None,
+            stale_hedge_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -170,11 +190,29 @@ impl ConstraintChecker {
         let cur_theta = portfolio.theta_for_product(&self.cfg.product);
 
         // Effective delta = options + hedge, when gating is on.
-        let effective_hedge_qty = if self.cfg.effective_delta_gating {
-            c.hedge_qty
-        } else {
-            0
-        };
+        // Audit T1-1 / CLAUDE.md §14: if the caller declares the hedge
+        // state STALE (Some(false)), zero out hedge_qty and fail
+        // closed — the gate then operates on options-only delta. WARN
+        // once so the operator sees the degradation. Some(true) trusts
+        // hedge_qty as fresh; None keeps legacy behavior for callers
+        // that haven't been updated to compute freshness yet.
+        let trust_hedge = self.cfg.effective_delta_gating
+            && match c.hedge_state_fresh {
+                Some(true) => true,
+                Some(false) => {
+                    use std::sync::atomic::Ordering;
+                    if !self.stale_hedge_warned.swap(true, Ordering::Relaxed) {
+                        log::warn!(
+                            "ConstraintChecker: hedge state STALE — gating falls back \
+                             to options-only delta (fail-closed). Subsequent stale \
+                             events suppressed."
+                        );
+                    }
+                    false
+                }
+                None => true, // legacy callers — preserve prior behavior
+            };
+        let effective_hedge_qty = if trust_hedge { c.hedge_qty } else { 0 };
         let cur_delta = cur_options_delta + effective_hedge_qty as f64;
         let post_delta =
             cur_delta + c.option_delta_per_contract * (c.fill_qty_signed as f64);
@@ -264,13 +302,23 @@ impl ConstraintChecker {
 
         // Delta
         if post_delta.abs() > self.cfg.delta_ceiling {
-            // Improving: if abs(post) < abs(cur), allow.
-            if post_delta.abs() >= cur_delta.abs() {
+            // Improving: if abs(post) < abs(cur), allow — BUT only when
+            // post does not flip sign relative to cur. A sign flip
+            // means the fill rotated us through zero into the opposite
+            // exposure, which is not "improving" — it's overshooting.
+            // Without this check, a fill from cur=+3.5 to post=-3.4
+            // gets accepted as "improving" even though we're now short
+            // delta past the ceiling.
+            let sign_eq = (post_delta >= 0.0) == (cur_delta >= 0.0);
+            if post_delta.abs() >= cur_delta.abs() || !sign_eq {
                 return GateOutcome::Rejected {
                     reason: "delta".into(),
                     detail: format!(
-                        "delta: post={:+.2} > ±{:.1} (cur={:+.2})",
-                        post_delta, self.cfg.delta_ceiling, cur_delta
+                        "delta: post={:+.2} > ±{:.1} (cur={:+.2}{})",
+                        post_delta,
+                        self.cfg.delta_ceiling,
+                        cur_delta,
+                        if !sign_eq { ", sign-flip" } else { "" }
                     ),
                 };
             }
@@ -349,6 +397,7 @@ mod tests {
             cur_long_premium: 0.0,
             post_long_premium: 0.0,
             hedge_qty: 0,
+            hedge_state_fresh: None,
         }
     }
 
@@ -516,6 +565,105 @@ mod tests {
         // post_delta = 4.0 → breaches ceiling 3.0 but escape on.
         // Should accept under escape (margin reducing).
         assert!(matches!(outcome, GateOutcome::AcceptedMarginEscape { .. }));
+    }
+
+    // ── Sign-flip improving delta exception ────────────────────
+
+    #[test]
+    fn delta_improving_with_sign_flip_rejected() {
+        // cur_delta = +3.5 (over ceiling 3.0). A SELL of 4 contracts
+        // at delta 1.7 → post = +3.5 - 4*1.7 = -3.3. abs(post)=3.3 <
+        // abs(cur)=3.5, so old logic would call this "improving" and
+        // accept. New logic rejects on sign flip — we crossed zero.
+        let cc = ConstraintChecker::new(cfg());
+        let mut r = ProductRegistry::new();
+        r.register(ProductInfo {
+            product: "HG".into(),
+            multiplier: 25_000.0,
+            default_iv: 0.30,
+        });
+        let mut p = PortfolioState::new(r);
+        use chrono::Utc;
+        use corsair_position::Position;
+        // Pre-existing options at delta 0.7 × 5 = 3.5
+        p.replace_positions(vec![Position {
+            product: "HG".into(),
+            strike: 6.05,
+            expiry: NaiveDate::from_ymd_opt(2026, 6, 26).unwrap(),
+            right: Right::Call,
+            quantity: 5,
+            avg_fill_price: 0.025,
+            fill_time: Utc::now(),
+            multiplier: 25_000.0,
+            delta: 0.7,
+            gamma: 0.0,
+            theta: 0.0,
+            vega: 0.0,
+            current_price: 0.025,
+        }]);
+        let outcome = cc.check(&p, &check(50_000.0, 1.7, 0.0, -4));
+        assert_eq!(outcome.rejection_reason(), Some("delta"));
+    }
+
+    #[test]
+    fn delta_improving_same_sign_still_accepted() {
+        // cur_delta = +3.5, post = +3.0 (under ceiling) — accept.
+        let cc = ConstraintChecker::new(cfg());
+        let mut r = ProductRegistry::new();
+        r.register(ProductInfo {
+            product: "HG".into(),
+            multiplier: 25_000.0,
+            default_iv: 0.30,
+        });
+        let mut p = PortfolioState::new(r);
+        use chrono::Utc;
+        use corsair_position::Position;
+        p.replace_positions(vec![Position {
+            product: "HG".into(),
+            strike: 6.05,
+            expiry: NaiveDate::from_ymd_opt(2026, 6, 26).unwrap(),
+            right: Right::Call,
+            quantity: 5,
+            avg_fill_price: 0.025,
+            fill_time: Utc::now(),
+            multiplier: 25_000.0,
+            delta: 0.7,
+            gamma: 0.0,
+            theta: 0.0,
+            vega: 0.0,
+            current_price: 0.025,
+        }]);
+        // Post = 3.5 + (-0.5)*1 = 3.0; under ceiling; accept.
+        let outcome = cc.check(&p, &check(50_000.0, -0.5, 0.0, 1));
+        assert!(matches!(outcome, GateOutcome::Accepted));
+    }
+
+    // ── Stale-hedge fail-closed ────────────────────────────────
+
+    #[test]
+    fn stale_hedge_zeros_out_hedge_credit() {
+        // gating on, hedge -3 (would offset +4 options to +1), but
+        // hedge_state_fresh = Some(false) → ignore hedge → post=+4
+        // breaches ceiling → reject.
+        let cc = ConstraintChecker::new(cfg());
+        let p = portfolio_empty();
+        let mut c = check(50_000.0, 4.0, 0.0, 1);
+        c.hedge_qty = -3;
+        c.hedge_state_fresh = Some(false);
+        let outcome = cc.check(&p, &c);
+        assert_eq!(outcome.rejection_reason(), Some("delta"));
+    }
+
+    #[test]
+    fn fresh_hedge_credits_normally() {
+        let cc = ConstraintChecker::new(cfg());
+        let p = portfolio_empty();
+        let mut c = check(50_000.0, 4.0, 0.0, 1);
+        c.hedge_qty = -3;
+        c.hedge_state_fresh = Some(true);
+        // post = 4 + (-3) = 1 → under ceiling → accept
+        let outcome = cc.check(&p, &c);
+        assert_eq!(outcome, GateOutcome::Accepted);
     }
 
     #[test]

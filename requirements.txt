@@ -15,6 +15,3 @@ streamlit-autorefresh>=1.0
 
 # Test runner
 pytest>=8.0
-
-# Ops scripts (live_monitor, parity_compare, etc.)
-docker>=7.0

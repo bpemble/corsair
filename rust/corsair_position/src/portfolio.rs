@@ -10,6 +10,13 @@ use corsair_broker_api::Right;
 use corsair_pricing::greeks::compute_greeks;
 use std::collections::HashMap;
 
+/// Audit T4-20: total positions excluded from `compute_mtm_pnl` since
+/// process boot due to a non-positive `live` price (no quote, no
+/// cached value). Snapshot publisher reads this for telemetry; a
+/// non-zero value flags one or more stale-quote contracts.
+pub static MTM_SKIPPED_POSITIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 use crate::aggregation::{AggregateResult, PortfolioGreeks};
 use crate::fill::FillOutcome;
 use crate::market_view::{strike_key as strike_key_fn, MarketView};
@@ -111,13 +118,15 @@ impl PortfolioState {
     /// Apply a fill to the book. Returns the outcome describing what
     /// happened (for the caller's logging / risk-callback decisions).
     ///
-    /// Mirrors `position_manager.add_fill`. The avg_fill_price update
-    /// rule is the position's mark — Python's behavior is to set
-    /// avg_fill_price to the FILL price (not a volume-weighted
-    /// average across previous fills); we preserve that here for
-    /// parity. Volume-weighted averaging happens in IBKR's own
-    /// position book (avgCost from `IB.positions()`), which is what
-    /// reconciliation re-syncs against.
+    /// Mirrors `position_manager.add_fill`. Audit T1-3 (2026-05-05):
+    /// avg_fill_price now uses a running VWAP over same-direction
+    /// fills (and resets to fill_price on a flip), instead of the
+    /// prior "set to last fill price" simplification. realized_on_close
+    /// reads avg_fill_price as the cost basis, so a true VWAP
+    /// improves realized accuracy between periodic IBKR reconciles —
+    /// reconcile still re-syncs against IBKR's avgCost periodically
+    /// to correct any residual drift from partial fills the broker
+    /// reports differently than us.
     pub fn add_fill(
         &mut self,
         product: &str,
@@ -149,7 +158,21 @@ impl PortfolioState {
             // Existing position. Merge. Read fields up front so we
             // don't hold a mutable borrow across record_fill_accounting.
             let prev_qty = self.positions[idx].quantity;
+            let prev_avg = self.positions[idx].avg_fill_price;
             let new_qty = prev_qty + quantity;
+
+            // Realized accounting on close/partial-close/flip. Note:
+            // `prev_avg` is the position's last-fill price, not the
+            // true IBKR VWAP — the existing simplification (see line
+            // ~118) means this number can drift between periodic
+            // reconciles. Periodic reconcile re-syncs avg_fill_price
+            // to IBKR's avg_cost / multiplier, after which subsequent
+            // closes are accurate. Without this accumulator,
+            // realized_pnl_persisted stays at 0.0 forever and the
+            // daily P&L kill misses every closed-leg P&L (Finding B).
+            let realized_delta =
+                realized_on_close(prev_qty, prev_avg, quantity, fill_price, multiplier);
+            self.realized_pnl_persisted += realized_delta;
 
             if new_qty == 0 {
                 self.positions.remove(idx);
@@ -158,10 +181,41 @@ impl PortfolioState {
                 return FillOutcome::Closed;
             }
             // Mutate fields, drop the borrow, then update accounting.
+            //
+            // VWAP rule: when same-direction (open or increase), blend
+            // the fill into the running average using ABSOLUTE qty so
+            // the math is symmetric for longs and shorts. When the
+            // fill closes / partially closes / flips, prev_avg stays
+            // attached to the residual position — closing fills don't
+            // change the average. On a flip, the residual on the new
+            // side opens at fill_price (the leg that crosses zero
+            // realized at prev_avg, then the residual opens fresh).
+            //
+            // Audit T1-3: prior behavior `pos.avg_fill_price = fill_price`
+            // overwrote on every same-side fill, so the position's
+            // average drifted to whatever the last fill happened at.
+            // With this fix, realized_on_close (which reads prev_avg)
+            // gets a stable VWAP between IBKR reconciles.
             {
                 let pos = &mut self.positions[idx];
+                let same_dir = prev_qty.signum() == quantity.signum();
+                let flipped = prev_qty.signum() != new_qty.signum() && prev_qty.signum() != 0;
+                if same_dir {
+                    // Open or increase: VWAP across absolute qtys.
+                    let prev_abs = prev_qty.unsigned_abs() as f64;
+                    let fill_abs = quantity.unsigned_abs() as f64;
+                    let new_abs = new_qty.unsigned_abs() as f64;
+                    if new_abs > 0.0 {
+                        pos.avg_fill_price =
+                            (prev_avg * prev_abs + fill_price * fill_abs) / new_abs;
+                    }
+                } else if flipped {
+                    // Crossed zero: residual opens at fill_price.
+                    pos.avg_fill_price = fill_price;
+                }
+                // else: partial close — keep prev_avg attached to the
+                // residual position; closing fills don't shift VWAP.
                 pos.quantity = new_qty;
-                pos.avg_fill_price = fill_price;
                 pos.fill_time = Utc::now();
             }
             self.record_fill_accounting(quantity, spread_captured, spread_captured_mid);
@@ -336,16 +390,41 @@ impl PortfolioState {
     /// `current_price` when no live observation exists.
     ///
     /// MTM = sum_pos(quantity * (current_price - avg_fill_price) * multiplier)
+    ///
+    /// Audit T4-20: positions with `live <= 0.0` (no current quote
+    /// AND no cached price) are silently skipped. That is correct
+    /// behavior — pricing them at zero would over-report MTM losses
+    /// — but the operator should know when a position is excluded.
+    /// We bump a counter (`MTM_SKIPPED_POSITIONS`) on every skip and
+    /// log a throttled WARN; the snapshot publisher / dashboard can
+    /// surface this number to flag stale-quote contracts.
     pub fn compute_mtm_pnl(&self, market: &dyn MarketView) -> f64 {
         let mut total = 0.0;
+        let mut skipped = 0u64;
         for p in &self.positions {
             let live = market
                 .current_price(&p.product, p.strike, p.expiry, p.right)
                 .unwrap_or(p.current_price);
             if live <= 0.0 {
+                skipped += 1;
                 continue;
             }
             total += (p.quantity as f64) * (live - p.avg_fill_price) * p.multiplier;
+        }
+        if skipped > 0 {
+            let total_skipped = MTM_SKIPPED_POSITIONS
+                .fetch_add(skipped, std::sync::atomic::Ordering::Relaxed)
+                + skipped;
+            // Throttle: log every power-of-two count so the operator
+            // sees a steady stream early then it backs off.
+            if total_skipped.is_power_of_two() {
+                log::warn!(
+                    "compute_mtm_pnl: {} position(s) skipped this call due to no \
+                     live or cached price; running total since boot = {}",
+                    skipped,
+                    total_skipped
+                );
+            }
         }
         total
     }
@@ -375,10 +454,18 @@ impl PortfolioState {
 }
 
 /// Compute time-to-expiry in years from a date. Uses CME's calendar
-/// convention: 365.25 days/year, end-of-day expiry.
+/// convention: 365.25 days/year.
+///
+/// COMEX HG options expire at 13:00 ET (18:00 UTC in winter / 17:00
+/// UTC in summer DST; we approximate with 18:00 UTC). If the codebase
+/// grows to other products with different settlement times (e.g. ETH
+/// 16:00 CT), generalize this to a per-product cutoff. The prior
+/// 20:00 UTC anchor was wrong for HG and overstated TTE on the last
+/// trading day — small pricing error on the wing where TTE matters
+/// most.
 pub fn time_to_expiry_years(expiry: NaiveDate) -> f64 {
     let now: DateTime<Utc> = Utc::now();
-    let expiry_end = expiry.and_hms_opt(20, 0, 0).unwrap(); // 20:00 UTC ≈ 15:00 CT
+    let expiry_end = expiry.and_hms_opt(18, 0, 0).unwrap(); // 18:00 UTC ≈ 13:00 ET (HG)
     let expiry_dt = DateTime::<Utc>::from_naive_utc_and_offset(expiry_end, Utc);
     let secs = (expiry_dt - now).num_seconds() as f64;
     if secs <= 0.0 {
@@ -386,6 +473,41 @@ pub fn time_to_expiry_years(expiry: NaiveDate) -> f64 {
     } else {
         secs / (365.25 * 24.0 * 3600.0)
     }
+}
+
+/// Realized P&L contribution of a fill that closes (fully, partially,
+/// or by flipping) a prior position. Returns 0.0 when the fill is
+/// purely opening or increasing. Sign convention matches MTM:
+/// positive = gain.
+///
+/// `prev_avg` should be the position's `avg_fill_price` BEFORE this
+/// fill mutates it. Post-T1-3 (2026-05-05) that's a running VWAP
+/// across same-direction fills, so realized P&L accumulates against
+/// a stable cost basis. Periodic IBKR reconciles still re-sync
+/// against avgCost to correct any drift from partial fills.
+pub(crate) fn realized_on_close(
+    prev_qty: i32,
+    prev_avg: f64,
+    fill_qty: i32,
+    fill_price: f64,
+    multiplier: f64,
+) -> f64 {
+    if prev_qty == 0 || fill_qty == 0 {
+        return 0.0;
+    }
+    if prev_qty.signum() == fill_qty.signum() {
+        return 0.0; // increasing — no realized
+    }
+    let closed_abs = fill_qty.abs().min(prev_qty.abs());
+    // Sign of the realized contribution: long close (prev>0) realizes
+    // (fill - avg) per share; short close (prev<0) realizes (avg - fill).
+    // Combined: (avg - fill) × closed_abs × sign(prev_qty<0 ? +1 : -1).
+    let signed = if prev_qty > 0 {
+        -(closed_abs as f64)
+    } else {
+        closed_abs as f64
+    };
+    (prev_avg - fill_price) * signed * multiplier
 }
 
 #[cfg(test)]
@@ -570,6 +692,132 @@ mod tests {
         let view = RecordingMarketView::new(); // no current price
         let mtm = p.compute_mtm_pnl(&view);
         assert_eq!(mtm, 0.0);
+    }
+
+    // ── Realized P&L accumulation (Finding B) ──────────────────
+
+    #[test]
+    fn realized_on_close_short_then_buy_to_close() {
+        // Short 2 @ 0.085, BUY 2 @ 0.082 → realized = +$150.
+        let r = realized_on_close(-2, 0.085, 2, 0.082, 25_000.0);
+        assert!((r - 150.0).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn realized_on_close_long_then_sell_to_close_at_loss() {
+        // Long 2 @ 0.085, SELL 2 @ 0.082 → realized = -$150.
+        let r = realized_on_close(2, 0.085, -2, 0.082, 25_000.0);
+        assert!((r - -150.0).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn realized_on_close_partial() {
+        // Short 4 @ 0.085, BUY 1 @ 0.082 (partial close) → +$75.
+        let r = realized_on_close(-4, 0.085, 1, 0.082, 25_000.0);
+        assert!((r - 75.0).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn realized_on_close_increasing_returns_zero() {
+        // Short 2 @ 0.085, SELL 1 @ 0.084 (more short) → 0.
+        let r = realized_on_close(-2, 0.085, -1, 0.084, 25_000.0);
+        assert_eq!(r, 0.0);
+    }
+
+    #[test]
+    fn realized_on_close_flip_realizes_only_closed_portion() {
+        // Short 2 @ 0.085, BUY 5 @ 0.082 (closes 2, opens 3 long).
+        // Realized portion: 2 contracts of short closed at +$0.003 each
+        // = +$150. The new long opens at fill_price; not part of this fn.
+        let r = realized_on_close(-2, 0.085, 5, 0.082, 25_000.0);
+        assert!((r - 150.0).abs() < 1e-6, "got {r}");
+    }
+
+    #[test]
+    fn add_fill_accumulates_realized_on_close() {
+        let mut p = PortfolioState::new(registry());
+        // Short 2 @ 0.085, then close at 0.082 → realized_pnl_persisted += $150.
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, -2, 0.085, 0.0, 0.0);
+        assert_eq!(p.realized_pnl_persisted, 0.0, "no realized on open");
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, 2, 0.082, 0.0, 0.0);
+        assert!(
+            (p.realized_pnl_persisted - 150.0).abs() < 1e-6,
+            "got {}",
+            p.realized_pnl_persisted
+        );
+    }
+
+    // ── VWAP cost-basis (Audit T1-3) ───────────────────────────
+
+    #[test]
+    fn vwap_blends_same_direction_fills() {
+        let mut p = PortfolioState::new(registry());
+        // Long 2 @ 0.025, then long 1 @ 0.030. VWAP = (0.025*2 + 0.030*1)/3 = 0.02667.
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, 2, 0.025, 0.0, 0.0);
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, 1, 0.030, 0.0, 0.0);
+        let pos = &p.positions()[0];
+        assert!(
+            (pos.avg_fill_price - 0.026666666666666665).abs() < 1e-9,
+            "VWAP mismatch: got {}",
+            pos.avg_fill_price
+        );
+    }
+
+    #[test]
+    fn vwap_short_side_blends_correctly() {
+        let mut p = PortfolioState::new(registry());
+        // Short 2 @ 0.085, then short 3 @ 0.090. VWAP = (0.085*2 + 0.090*3)/5 = 0.088.
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, -2, 0.085, 0.0, 0.0);
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, -3, 0.090, 0.0, 0.0);
+        let pos = &p.positions()[0];
+        assert!((pos.avg_fill_price - 0.088).abs() < 1e-9, "got {}", pos.avg_fill_price);
+        assert_eq!(pos.quantity, -5);
+    }
+
+    #[test]
+    fn vwap_partial_close_keeps_avg() {
+        let mut p = PortfolioState::new(registry());
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, 4, 0.025, 0.0, 0.0);
+        // Partial close — avg should stay at 0.025.
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, -1, 0.030, 0.0, 0.0);
+        let pos = &p.positions()[0];
+        assert!((pos.avg_fill_price - 0.025).abs() < 1e-9);
+        assert_eq!(pos.quantity, 3);
+    }
+
+    #[test]
+    fn vwap_flip_resets_to_fill_price() {
+        let mut p = PortfolioState::new(registry());
+        // Long 1 @ 0.025, sell 3 @ 0.030 → flip to short 2 at fill_price 0.030.
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, 1, 0.025, 0.0, 0.0);
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, -3, 0.030, 0.0, 0.0);
+        let pos = &p.positions()[0];
+        assert_eq!(pos.quantity, -2);
+        assert!((pos.avg_fill_price - 0.030).abs() < 1e-9);
+    }
+
+    #[test]
+    fn vwap_realized_uses_blended_cost_basis() {
+        let mut p = PortfolioState::new(registry());
+        // Two opens at different prices, then close.
+        // Long 2 @ 0.025, long 2 @ 0.035 → VWAP 0.030.
+        // Sell 4 @ 0.040 → realized = (0.040 - 0.030) * 4 * 25000 = $1000.
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, 2, 0.025, 0.0, 0.0);
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, 2, 0.035, 0.0, 0.0);
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, -4, 0.040, 0.0, 0.0);
+        assert!(
+            (p.realized_pnl_persisted - 1000.0).abs() < 1e-6,
+            "expected $1000 realized via VWAP, got {}",
+            p.realized_pnl_persisted
+        );
+    }
+
+    #[test]
+    fn add_fill_no_realized_on_pure_open() {
+        let mut p = PortfolioState::new(registry());
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, 1, 0.025, 0.0, 0.0);
+        p.add_fill("HG", 6.05, exp_2026_06(), Right::Call, 1, 0.027, 0.0, 0.0);
+        assert_eq!(p.realized_pnl_persisted, 0.0);
     }
 
     // ── Daily reset ───────────────────────────────────────────

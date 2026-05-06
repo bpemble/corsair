@@ -5,9 +5,16 @@ use corsair_broker_api::{ConnectionState, OrderStatus};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::time::interval;
+use tokio::time::{interval, MissedTickBehavior};
 
 use crate::runtime::Runtime;
+
+/// Hedge-state freshness tolerance. CLAUDE.md §14: when any
+/// HedgeManager's last reconcile/fill is older than this, the risk and
+/// constraint gates strip hedge_qty back out and evaluate options-only
+/// (fail-closed). 5 min is 2.5× the periodic reconcile cadence (~2 min)
+/// so a single missed reconcile is tolerated; two in a row trips it.
+const HEDGE_FRESHNESS_MAX_AGE_NS: u64 = 300_000_000_000;
 
 /// Spawn every task. Returns a Vec of join handles so the caller
 /// can wait on shutdown.
@@ -26,6 +33,9 @@ pub fn spawn_all(runtime: Arc<Runtime>) -> Vec<tokio::task::JoinHandle<()>> {
     handles.push(tokio::spawn(crate::subscriptions::run_depth_rotator(
         runtime.clone(),
     )));
+    handles.push(tokio::spawn(crate::subscriptions::run_window_recenter(
+        runtime.clone(),
+    )));
     handles.push(tokio::spawn(periodic_hedge(runtime.clone())));
     handles.push(tokio::spawn(periodic_snapshot(runtime.clone())));
     handles.push(tokio::spawn(periodic_account_poll(runtime.clone())));
@@ -41,6 +51,7 @@ pub fn spawn_all(runtime: Arc<Runtime>) -> Vec<tokio::task::JoinHandle<()>> {
 /// put OI (28) flows, that's a data-feed problem, not a code bug.
 async fn periodic_tick_type_hist(runtime: Arc<Runtime>) {
     let mut t = interval(Duration::from_secs(30));
+    t.set_missed_tick_behavior(MissedTickBehavior::Skip);
     log::info!("periodic_tick_type_hist: cadence 30s");
     loop {
         t.tick().await;
@@ -184,15 +195,20 @@ async fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::F
     );
 
     // Per-fill daily P&L halt check. Mirrors
-    // FillHandler.check_daily_pnl_only in Python.
+    // Per-fill daily-P&L gate (CLAUDE.md §8).
+    //
+    // Lock order: portfolio → market_data → risk → hedge (matches
+    // worst_per_product's acquisition pattern in the periodic check).
     let halt_outcome = {
         let p = runtime.portfolio.lock().unwrap();
         let md = runtime.market_data.lock().unwrap();
         let mut r = runtime.risk.lock().unwrap();
-        r.check_daily_pnl_only(&p, &*md)
+        let h = runtime.hedge.lock().unwrap();
+        r.check_daily_pnl_only(&p, &*md, &*h)
     };
     if let corsair_risk::RiskCheckOutcome::Killed(ref ev) = halt_outcome {
         crate::notify::notify_kill(ev.clone());
+        crate::ipc::publish_kill(runtime, ev);
         cancel_all_resting(runtime, "daily_halt_per_fill").await;
     }
 
@@ -201,19 +217,33 @@ async fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::F
     // contracts in ~4 minutes (options_delta 0 → -14.6) before the
     // periodic check fired. This gate runs on EVERY option fill and
     // forces the kill the moment effective_delta crosses delta_kill.
-    let effective_delta_post_fill: f64 = {
+    let (effective_delta_post_fill, hedge_qty_total, hedge_fresh): (f64, f64, bool) = {
         let p = runtime.portfolio.lock().unwrap();
         let h = runtime.hedge.lock().unwrap();
         let agg = p.aggregate();
         let hedge_qty: i32 = h.managers().iter().map(|m| m.hedge_qty()).sum();
-        agg.total.net_delta + hedge_qty as f64
+        // CLAUDE.md §14: hedge state must be fresh for the gate to
+        // trust hedge_qty as a delta offset. all_fresh ⇒ no strip;
+        // any stale ⇒ RiskMonitor::check_per_fill_delta strips
+        // hedge_qty back out and gates options-only (fail-closed).
+        let now_ns = crate::time::now_ns();
+        let all_fresh = h
+            .managers()
+            .iter()
+            .all(|m| m.state().is_fresh(now_ns, HEDGE_FRESHNESS_MAX_AGE_NS));
+        (
+            agg.total.net_delta + hedge_qty as f64,
+            hedge_qty as f64,
+            all_fresh,
+        )
     };
     let delta_outcome = {
         let mut r = runtime.risk.lock().unwrap();
-        r.check_per_fill_delta(effective_delta_post_fill)
+        r.check_per_fill_delta(effective_delta_post_fill, hedge_qty_total, hedge_fresh)
     };
     if let corsair_risk::RiskCheckOutcome::Killed(ref ev) = delta_outcome {
         crate::notify::notify_kill(ev.clone());
+        crate::ipc::publish_kill(runtime, ev);
         cancel_all_resting(runtime, "delta_kill_per_fill").await;
     }
 
@@ -231,7 +261,8 @@ async fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::F
         if matches!(runtime.mode, crate::runtime::RuntimeMode::Live) {
             place_hedge_order(runtime, &product, is_buy, qty, &reason).await;
         } else {
-            log::info!("hedge[{product}]: shadow Place {is_buy} qty={qty} ({reason})");
+            let side = if is_buy { "BUY" } else { "SELL" };
+            log::info!("hedge[{product}]: shadow Place {side} qty={qty} ({reason})");
         }
     }
 }
@@ -311,6 +342,12 @@ async fn pump_ticks(runtime: Arc<Runtime>) {
         b.subscribe_ticks_stream()
     };
     log::info!("pump_ticks: subscribed");
+    // TODO(perf): the lock is taken once per tick. Under heavy bursts
+    // (~500/sec at session open) this contends with the snapshot/risk
+    // tasks. A future optimization: drain N ticks via try_recv before
+    // locking, batch-apply under a single acquisition. Atomic-load
+    // alternatives don't fit because update_bid/ask mutate a HashMap
+    // that's iterated by snapshot.
     loop {
         match rx.recv().await {
             Ok(tick) => {
@@ -385,10 +422,9 @@ async fn pump_errors(runtime: Arc<Runtime>) {
         match rx.recv().await {
             Ok(err) => {
                 log::warn!("broker error: {err}");
-                // Phase 4.x: route certain protocol errors (e.g.
-                // 1100 disconnect) to risk.fire as
-                // KillSource::Disconnect. Today the connection
-                // stream handles disconnects.
+                // TODO: route certain protocol errors (e.g. 1100
+                // disconnect) to risk.fire as KillSource::Disconnect.
+                // Today the connection stream handles disconnects.
                 let _ = runtime;
             }
             Err(RecvError::Lagged(_)) => {}
@@ -435,6 +471,7 @@ async fn periodic_greek_refresh(runtime: Arc<Runtime>) {
     // 5s gives the dashboard near-live position marks at negligible
     // CPU cost (the loop is just a hashmap lookup per position).
     let mut t = interval(Duration::from_secs(5));
+    t.set_missed_tick_behavior(MissedTickBehavior::Skip);
     log::info!("periodic_greek_refresh: cadence 5s");
     loop {
         t.tick().await;
@@ -445,33 +482,77 @@ async fn periodic_greek_refresh(runtime: Arc<Runtime>) {
 }
 
 async fn periodic_risk_check(runtime: Arc<Runtime>) {
-    let mut t = interval(Duration::from_secs(300));
-    log::info!("periodic_risk_check: cadence 300s");
+    // 30s (was 300s 2026-05-05) — the old cadence meant theta/vega/
+    // delta breaches could go undetected for up to 5 min after a
+    // fill, since per-fill check covers only daily_pnl. Trader
+    // self-gating (Layer 2) was the only stop-gap during that window.
+    let mut t = interval(Duration::from_secs(30));
+    t.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    log::info!("periodic_risk_check: cadence 30s");
     // Race condition fix: tokio::interval fires the first tick
     // immediately. At boot, options Greeks haven't been computed yet
-    // (greek_refresh runs every 5s starting after first interval),
-    // so the seeded positions show delta=0. If hedge_qty is non-zero
-    // at seed, options_delta+hedge_qty == hedge_qty alone, which can
-    // wrongly trip delta_kill (sticky → trader stuck blocked).
-    // Burn the immediate tick so the first real risk eval happens
-    // ~6s after boot, well after the first greek_refresh has run.
+    // (`periodic_greek_refresh` runs every 5 s — see `GREEK_REFRESH_S`
+    // semantics tied to the 5 s constant), so seeded positions show
+    // delta=0. If hedge_qty is non-zero at seed,
+    // options_delta + hedge_qty == hedge_qty alone, which can wrongly
+    // trip delta_kill (sticky → trader stuck blocked). Burn the
+    // immediate tick + sleep slightly longer than greek_refresh's
+    // 5 s cadence so the first real risk eval happens after the
+    // first refresh has run.
     t.tick().await;
+    // 6 s = 5 s greek_refresh cadence + 1 s slack.
     tokio::time::sleep(Duration::from_secs(6)).await;
     loop {
         t.tick().await;
         // Compute outcome under locks; release before any await.
+        //
+        // Lock order (canonical, used everywhere in this file):
+        //   account → hedge → portfolio → market_data → risk
+        //
+        // We pre-fetch the per-product hedge_qty map here BEFORE
+        // entering the portfolio/risk critical section so
+        // worst_per_product doesn't need to re-acquire `hedge` while
+        // holding `risk` — the prior arrangement (acquire-inside-loop)
+        // crossed the established lock order whenever effective_delta
+        // gating was on.
         let (outcome, agg_summary) = {
-            let p = runtime.portfolio.lock().unwrap();
-            let md = runtime.market_data.lock().unwrap();
-            let mut r = runtime.risk.lock().unwrap();
-            let agg = p.aggregate();
-            let (worst_delta, worst_theta, worst_vega) =
-                worst_per_product(&agg, &runtime);
             let margin_used = runtime
                 .account
                 .lock()
                 .map(|a| a.maintenance_margin)
                 .unwrap_or(0.0);
+            let hedge_qty_by_product: std::collections::HashMap<String, i32> = if runtime
+                .config
+                .constraints
+                .effective_delta_gating
+            {
+                let h = runtime.hedge.lock().unwrap();
+                h.managers()
+                    .iter()
+                    .map(|m| (m.config().product.clone(), m.hedge_qty()))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+            let p = runtime.portfolio.lock().unwrap();
+            let md = runtime.market_data.lock().unwrap();
+            let mut r = runtime.risk.lock().unwrap();
+            let agg = p.aggregate();
+            let (worst_delta, worst_theta, worst_vega, hedge_qty_in_worst) =
+                worst_per_product(&agg, &hedge_qty_by_product);
+            // Hedge fanout — for the daily P&L halt's hedge MTM/realized
+            // sum AND the §14 staleness gate. Acquired separately from
+            // worst_per_product's snapshot because RiskMonitor::check
+            // needs &HedgeFanout. This is the only place we re-take the
+            // hedge lock; with portfolio still held the canonical order
+            // (hedge → portfolio) is preserved by the snapshot above
+            // already having taken it.
+            let h = runtime.hedge.lock().unwrap();
+            let now_ns = crate::time::now_ns();
+            let hedge_fresh = h
+                .managers()
+                .iter()
+                .all(|m| m.state().is_fresh(now_ns, HEDGE_FRESHNESS_MAX_AGE_NS));
             let outcome = r.check(
                 &p,
                 margin_used,
@@ -479,7 +560,11 @@ async fn periodic_risk_check(runtime: Arc<Runtime>) {
                 worst_theta,
                 worst_vega,
                 &*md,
+                &*h,
+                hedge_qty_in_worst,
+                hedge_fresh,
             );
+            drop(h);
             let summary = (
                 agg.total.gross_positions,
                 agg.total.long_count,
@@ -494,6 +579,7 @@ async fn periodic_risk_check(runtime: Arc<Runtime>) {
             corsair_risk::RiskCheckOutcome::Killed(ev) => {
                 log::error!("risk check fired kill: {ev:?}");
                 crate::notify::notify_kill(ev.clone());
+                crate::ipc::publish_kill(&runtime, ev);
                 // CLAUDE.md §7/§8: every kill must cancel all resting
                 // orders. Without this, kill is cosmetic — orders
                 // continue resting until GTD-expiry.
@@ -516,9 +602,9 @@ async fn periodic_risk_check(runtime: Arc<Runtime>) {
 }
 
 /// Cancel every live order at the broker. Called from any kill path
-/// (risk check, per-fill daily-halt). Mirrors `quote_engine.cancel_all_quotes`
-/// in Python broker. Best-effort: logs cancel failures but doesn't propagate
-/// (kill semantics need to fire even if a cancel races a fill).
+/// (risk check, per-fill daily-halt). Best-effort: logs cancel
+/// failures but doesn't propagate (kill semantics need to fire even
+/// if a cancel races a fill).
 ///
 /// Uses `Broker::open_orders()` (IBKR-authoritative) instead of the
 /// runtime OMS, which is not populated by the broker daemon — using
@@ -545,35 +631,48 @@ async fn cancel_all_resting(runtime: &Arc<Runtime>, reason: &str) {
         "cancel_all_resting[{reason}]: cancelling {} orders",
         actionable.len()
     );
-    for oid in actionable {
-        if let Err(e) = b.cancel_order(oid).await {
-            log::warn!("cancel_all_resting[{reason}]: cancel {oid:?} failed: {e}");
+    // Fan out cancels concurrently — kill semantics need to fire fast,
+    // so don't serialize through O(N) IBKR RTTs (one cancel per loop
+    // iteration was costing N × ~30 ms on a busy book).
+    let cancels = actionable.into_iter().map(|oid| {
+        let b = b.clone();
+        let reason = reason.to_string();
+        async move {
+            if let Err(e) = b.cancel_order(oid).await {
+                log::warn!("cancel_all_resting[{reason}]: cancel {oid:?} failed: {e}");
+            }
         }
-    }
+    });
+    futures::future::join_all(cancels).await;
 }
 
 /// Find the worst per-product Greeks. For delta we use absolute
 /// magnitude (worst is largest |delta|); for theta, the most-negative
-/// number; for vega, largest magnitude. Mirrors the per-product
-/// loop in risk_monitor.py.
+/// number; for vega, largest magnitude.
+///
+/// Caller pre-fetches `hedge_qty_by_product` (typically while NOT
+/// holding the risk/portfolio locks) so this routine doesn't violate
+/// the canonical hedge → portfolio → risk lock order.
 fn worst_per_product(
     agg: &corsair_position::aggregation::AggregateResult,
-    runtime: &Arc<Runtime>,
-) -> (f64, f64, f64) {
+    hedge_qty_by_product: &std::collections::HashMap<String, i32>,
+) -> (f64, f64, f64, f64) {
     let mut worst_delta = 0.0_f64;
     let mut worst_theta = 0.0_f64;
     let mut worst_vega = 0.0_f64;
+    // CLAUDE.md §14: track which product owns worst_delta and the
+    // hedge_qty contribution that was folded into it. RiskMonitor
+    // strips this back out when hedge state is stale.
+    let mut hedge_qty_in_worst: f64 = 0.0;
 
     for (prod, g) in &agg.per_product {
-        // Effective delta = options + hedge_qty when gating on.
-        let hedge_qty = if runtime.config.constraints.effective_delta_gating {
-            runtime.hedge.lock().unwrap().hedge_qty_for_product(prod)
-        } else {
-            0
-        };
+        // Effective delta = options + hedge_qty when gating on (caller
+        // populates the map only when effective_delta_gating is on).
+        let hedge_qty = hedge_qty_by_product.get(prod).copied().unwrap_or(0);
         let d = g.net_delta + hedge_qty as f64;
         if d.abs() > worst_delta.abs() {
             worst_delta = d;
+            hedge_qty_in_worst = hedge_qty as f64;
         }
         if g.net_theta < worst_theta {
             worst_theta = g.net_theta;
@@ -582,11 +681,12 @@ fn worst_per_product(
             worst_vega = g.net_vega;
         }
     }
-    (worst_delta, worst_theta, worst_vega)
+    (worst_delta, worst_theta, worst_vega, hedge_qty_in_worst)
 }
 
 async fn periodic_hedge(runtime: Arc<Runtime>) {
     let mut t = interval(Duration::from_secs(30));
+    t.set_missed_tick_behavior(MissedTickBehavior::Skip);
     log::info!("periodic_hedge: cadence 30s");
     let mut tick_count: u64 = 0;
     loop {
@@ -649,6 +749,13 @@ async fn periodic_hedge(runtime: Arc<Runtime>) {
         // Take a snapshot of products + forwards while holding
         // market_data + portfolio briefly, then release before
         // hitting hedge.
+        //
+        // `forward` here is the mark passed to `rebalance_periodic`
+        // for tolerance-gating and IOC anchoring. Prefer the hedge
+        // contract's own tick (HGM6) over the options-engine
+        // underlying (HGK6) — they're different futures and the
+        // calendar spread is non-trivial. Fall back to underlying if
+        // the hedge subscription hasn't ticked yet (boot race).
         let products_and_forwards: Vec<(String, f64)> = {
             let p = runtime.portfolio.lock().unwrap();
             let md = runtime.market_data.lock().unwrap();
@@ -656,7 +763,10 @@ async fn periodic_hedge(runtime: Arc<Runtime>) {
                 .products()
                 .iter()
                 .map(|prod| {
-                    let f = md.underlying_price(prod).unwrap_or(0.0);
+                    let f = md
+                        .hedge_underlying_price(prod)
+                        .or_else(|| md.underlying_price(prod))
+                        .unwrap_or(0.0);
                     (prod.clone(), f)
                 })
                 .collect()
@@ -707,14 +817,10 @@ async fn place_hedge_order(
     qty: u32,
     reason: &str,
 ) {
-    let (contract_opt, ioc_offset, hedge_tick) = {
+    let contract_opt = {
         let h = runtime.hedge.lock().unwrap();
         match h.for_product(product) {
-            Some(mgr) => (
-                mgr.hedge_contract().cloned(),
-                mgr.config().ioc_tick_offset,
-                mgr.config().hedge_tick_size,
-            ),
+            Some(mgr) => mgr.hedge_contract().cloned(),
             None => {
                 log::warn!("hedge[{product}]: no manager registered, skipping");
                 return;
@@ -728,27 +834,34 @@ async fn place_hedge_order(
             return;
         }
     };
-    // IOC limit anchored at current underlying ± ioc_offset ticks.
+    // Mark gate: prefer hedge contract's tick, fall back to options
+    // underlying. Used only as a sanity gate (orders are MKT-IOC, not
+    // limit-anchored — see comment below). Without the hedge-first
+    // preference this guard reads the wrong contract's tick during
+    // calendar-spread regimes and could pass even when the hedge
+    // contract has no live ticker at all.
     let f = {
         let md = runtime.market_data.lock().unwrap();
-        md.underlying_price(product).unwrap_or(0.0)
+        md.hedge_underlying_price(product)
+            .or_else(|| md.underlying_price(product))
+            .unwrap_or(0.0)
     };
     if f <= 0.0 {
         log::warn!("hedge[{product}]: no underlying price, skipping");
         return;
     }
-    // Hedge order type: MARKET. The original design was IOC ±N ticks
-    // — small bounded slippage if filled, but the IOC dies when
-    // market moves >N ticks during the ~140ms IBKR RTT. In a fast
-    // move (exactly when we MOST need to be hedged) the IOC reliably
-    // missed. HG futures depth is deep enough that a 4-contract
-    // market order slips 1-2 ticks at worst. "Fill at any reasonable
-    // price" beats "fill at +N ticks or never". `_ioc_offset` and
-    // `_hedge_tick` are retained for the price-anchor field but
-    // unused on the market path. 2026-05-04: switched after
-    // observing 4 consecutive 30s-periodic IOC misses while
-    // options_delta sat at -4.3.
-    let _ = (ioc_offset, hedge_tick);
+    // Hedge order type: MARKET-IOC. The original design was limit-IOC
+    // anchored at F ± `ioc_tick_offset` ticks — small bounded slippage
+    // if filled, but the IOC dies when the market moves >N ticks
+    // during the ~140 ms IBKR RTT. In a fast move (exactly when we
+    // MOST need to be hedged) the IOC reliably missed. HG futures
+    // depth is deep enough that a 4-contract market order slips 1-2
+    // ticks at worst — "fill at any reasonable price" beats "fill at
+    // +N ticks or never". 2026-05-04: switched after observing 4
+    // consecutive 30 s periodic IOC misses while options_delta sat
+    // at −4.3. The `ioc_tick_offset` and `hedge_tick_size` fields are
+    // dead since the switch — see runtime.rs build_hedge_fanout for
+    // the ignored placeholder values.
     let req = corsair_broker_api::PlaceOrderReq {
         contract,
         side: if is_buy {
@@ -791,6 +904,7 @@ async fn place_hedge_order(
 async fn periodic_snapshot(runtime: Arc<Runtime>) {
     let cadence = runtime.config.snapshot.cadence_ms;
     let mut t = interval(Duration::from_millis(cadence));
+    t.set_missed_tick_behavior(MissedTickBehavior::Skip);
     log::info!("periodic_snapshot: cadence {cadence}ms");
     loop {
         t.tick().await;
@@ -817,9 +931,39 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
         // OpenOrder/OrderStatus event from IBKR. Used by the chain
         // payload to populate our_bid / our_ask per strike so the
         // dashboard's chain table can highlight our resting prices.
+        //
+        // Cached with a 1s TTL so back-to-back snapshot ticks (4 Hz)
+        // share a single broker query. The cache is stale by at most
+        // ~1s — within the dashboard's tolerance for resting-quote
+        // freshness, since order_status events still update OurOrder
+        // state in-band. Observed ~80 µs per call avoided × 3 of
+        // every 4 ticks.
         let open_orders_snapshot = {
-            let b = runtime.broker.clone();
-            b.open_orders().await.unwrap_or_default()
+            use std::sync::OnceLock;
+            static OO_CACHE: OnceLock<
+                std::sync::Mutex<(u64, Vec<corsair_broker_api::OpenOrder>)>,
+            > = OnceLock::new();
+            const TTL_NS: u64 = 1_000_000_000;
+            let cache_cell = OO_CACHE.get_or_init(|| std::sync::Mutex::new((0, Vec::new())));
+            let now = now_ns();
+            let cached = {
+                let g = cache_cell.lock().unwrap();
+                if now.saturating_sub(g.0) < TTL_NS && !(g.0 == 0 && g.1.is_empty()) {
+                    Some(g.1.clone())
+                } else {
+                    None
+                }
+            };
+            match cached {
+                Some(v) => v,
+                None => {
+                    let b = runtime.broker.clone();
+                    let v = b.open_orders().await.unwrap_or_default();
+                    let mut g = cache_cell.lock().unwrap();
+                    *g = (now, v.clone());
+                    v
+                }
+            }
         };
         // Diagnostic: log status histogram every snapshot tick (info
         // level temporarily so we can see WITHOUT a custom RUST_LOG).
@@ -892,6 +1036,7 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
 async fn daily_halt_rollover(runtime: Arc<Runtime>) {
     use chrono::Timelike;
     let mut t = interval(Duration::from_secs(60));
+    t.set_missed_tick_behavior(MissedTickBehavior::Skip);
     log::info!("daily_halt_rollover: armed; clears at 17:00 US/Central");
     // Track the last day we fired so we don't double-fire if a tick
     // lands twice in the same minute window. Day key is in CT zone.
@@ -909,6 +1054,31 @@ async fn daily_halt_rollover(runtime: Arc<Runtime>) {
         let past_boundary = now_ct.hour() >= 17;
         let already_fired_today = last_fired_day == Some(today_ct);
         if past_boundary && !already_fired_today {
+            // Lock order: portfolio → risk (matches the established
+            // ordering used by periodic_risk_check).
+            //
+            // Reset daily counters AND realized_pnl_persisted at the
+            // session boundary. Without the realized reset, the
+            // Finding-B accumulator (closed-leg P&L) carries across
+            // sessions and the daily halt drifts toward false
+            // positives — yesterday's losses + today's losses both
+            // count against the −5% threshold. Symmetric with
+            // `RiskMonitor::clear_daily_halt`: same trigger, same
+            // boundary semantics.
+            {
+                let mut p = runtime.portfolio.lock().unwrap();
+                let prev_realized = p.realized_pnl_persisted;
+                let prev_fills = p.fills_today;
+                p.reset_daily();
+                p.realized_pnl_persisted = 0.0;
+                if prev_realized != 0.0 || prev_fills > 0 {
+                    log::warn!(
+                        "daily_halt_rollover: reset session counters at \
+                         {now_ct} (US/Central) — closed_realized=${:.0} fills={}",
+                        prev_realized, prev_fills
+                    );
+                }
+            }
             let mut r = runtime.risk.lock().unwrap();
             if r.clear_daily_halt() {
                 log::warn!(
@@ -929,6 +1099,7 @@ async fn periodic_account_poll(runtime: Arc<Runtime>) {
     // AccountValue updates every ~5s anyway; this is just refreshing
     // our cache from the streamed map.
     let mut t = interval(Duration::from_secs(15));
+    t.set_missed_tick_behavior(MissedTickBehavior::Skip);
     log::info!("periodic_account_poll: cadence 15s");
     loop {
         t.tick().await;
@@ -966,13 +1137,7 @@ async fn periodic_account_poll(runtime: Arc<Runtime>) {
     }
 }
 
-fn now_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
+use crate::time::now_ns;
 
 /// Build the chain payload for the snapshot from market_data state +
 /// portfolio. Per-expiry blocks of strikes, with call/put market quotes
@@ -991,13 +1156,20 @@ fn build_chain_payload(
     let products = portfolio.registry().products();
     let mut underlying_price = 0.0_f64;
     // Snapshot vol_surface cache once for theo computation. Keyed by
-    // (product, expiry_str). Empty when no fit has run yet.
-    let vol_cache = runtime.vol_surface_cache.lock().unwrap().clone();
+    // (product, expiry_str, side). Empty when no fit has run yet.
+    // Cheap Arc clone — the inner HashMap is shared via Arc.
+    let vol_cache: Arc<HashMap<(String, String, char), crate::runtime::VolSurfaceCacheEntry>> = {
+        let g = runtime.vol_surface_cache.lock().unwrap();
+        Arc::clone(&*g)
+    };
     for prod in &products {
         if let Some(p) = corsair_position::MarketView::underlying_price(md, prod) {
             underlying_price = p;
         }
         for opt in md.options_for_product(prod) {
+            // TODO(perf): expiry/strike strings are reformatted per leg
+            // per snapshot (4 Hz). Pre-cache per-strike strings keyed by
+            // f64::to_bits if profile shows allocator pressure here.
             let expiry_str = opt.expiry.format("%Y%m%d").to_string();
             let strike_str = format!("{:.4}", opt.strike);
             let block = chains.entry(expiry_str.clone()).or_default();
@@ -1005,10 +1177,19 @@ fn build_chain_payload(
                 call: None,
                 put: None,
             });
-            // Per-leg theo from cached SABR fit + Black76. None if no
-            // fit yet for this expiry, or if the fit math degenerates.
+            // Per-leg theo from cached per-side SABR fit + Black76.
+            // Keyed by (product, expiry, side) since the 2026-05-05
+            // per-side-fits change. Falls back to the opposite-side
+            // cache if the matching side hasn't fit yet (e.g.,
+            // strikes-on-one-side-only chains during boot).
+            let right_char = match opt.right {
+                Right::Call => 'C',
+                Right::Put => 'P',
+            };
+            let other_char = if right_char == 'C' { 'P' } else { 'C' };
             let theo: Option<f64> = vol_cache
-                .get(&(prod.clone(), expiry_str.clone()))
+                .get(&(prod.clone(), expiry_str.clone(), right_char))
+                .or_else(|| vol_cache.get(&(prod.clone(), expiry_str.clone(), other_char)))
                 .and_then(|e| {
                     let iv = corsair_pricing::sabr_implied_vol(
                         e.forward, opt.strike, e.tte,
@@ -1017,10 +1198,6 @@ fn build_chain_payload(
                     if !iv.is_finite() || iv <= 0.0 {
                         return None;
                     }
-                    let right_char = match opt.right {
-                        Right::Call => 'C',
-                        Right::Put => 'P',
-                    };
                     let p = corsair_pricing::black76_price_inner(
                         e.forward, opt.strike, e.tte, iv, 0.0, right_char,
                     );
@@ -1117,12 +1294,22 @@ fn build_chain_payload(
     let mut expiries: Vec<String> = chains_typed.keys().cloned().collect();
     expiries.sort();
     let front_month_expiry = expiries.first().cloned();
-    // ATM strike: round underlying_price to nearest 0.05 (HG grid).
-    // Could be product-aware in future; HG-only for now.
-    let atm_strike = if underlying_price > 0.0 {
-        (underlying_price * 20.0).round() / 20.0
-    } else {
-        0.0
+    // ATM strike: anchor on parity-implied forward (HGM6 for HG
+    // options) when the vol_cache has a fit, falling back to
+    // underlying spot rounding only at boot before the first fit.
+    // This matches what the trader's strike-window gate uses (parity
+    // F at decision.rs), so the dashboard's highlighted "ATM" row
+    // lines up with the actual quoted ATM strike instead of being
+    // off by the K6/M6 calendar carry.
+    let parity_forward = vol_cache
+        .iter()
+        .find(|((_, exp, _), _)| Some(exp) == front_month_expiry.as_ref())
+        .map(|(_, e)| e.forward)
+        .or_else(|| vol_cache.values().next().map(|e| e.forward));
+    let atm_strike = match parity_forward {
+        Some(f) if f > 0.0 => (f * 20.0).round() / 20.0,
+        _ if underlying_price > 0.0 => (underlying_price * 20.0).round() / 20.0,
+        _ => 0.0,
     };
     corsair_snapshot::ChainBuild {
         chains: chains_typed,

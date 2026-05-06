@@ -8,7 +8,8 @@ use crate::orders::{OrderId, Side};
 /// Trade execution. Emitted on the fills stream when a venue confirms
 /// a fill (or partial fill) on one of our orders.
 ///
-/// Maps to: ib_insync `Fill` (execution + commissionReport).
+/// Wire equivalent on IBKR: `execDetails` (the execution report) +
+/// `commissionReport` correlated by `exec_id`.
 #[derive(Debug, Clone)]
 pub struct Fill {
     /// Globally unique execution id from the venue. Adapters dedupe

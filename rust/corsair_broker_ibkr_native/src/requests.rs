@@ -196,6 +196,17 @@ pub struct PlaceOrderParams {
 ///
 /// This is the BIG one in IBKR's API — tons of fields. We send a
 /// minimal but valid set; unset-defaults handle the rest.
+///
+/// **Slow-path**. Production code should use
+/// [`crate::place_template::place_order_fast`], which uses a cached
+/// `ContractTemplate` and direct-write `write_*` family for ~6×
+/// throughput. This function is retained as a parity reference for
+/// the byte-for-byte test that proves the fast path encodes the
+/// same wire frame.
+#[deprecated(
+    note = "use place_template::place_order_fast for production. \
+            Slow-path retained for parity testing only."
+)]
 pub fn place_order(
     order_id: i32,
     contract: &ContractRequest,

@@ -37,9 +37,14 @@ pub struct LMResult {
     pub x: Vec<f64>,
     pub residuals: Vec<f64>,
     pub cost: f64, // 0.5 * sum(r_i^2)
+    /// Total residual evaluations across LM iterations. Kept for
+    /// telemetry / diagnostics; not used by callers today.
     #[allow(dead_code)]
     pub nfev: usize,
-    #[allow(dead_code)]
+    /// True when LM converged (gradient-norm or step-norm or
+    /// relative-cost bound met). Audit T3-15: `calibrate_sabr`
+    /// prefers `success=true` guesses over lower-cost-but-stuck
+    /// guesses when picking the best fit across initial conditions.
     pub success: bool,
 }
 
@@ -110,15 +115,29 @@ fn build_normal_eqs(
     (jtj, jtr)
 }
 
+/// Compute the Jacobian via central differences into a caller-owned
+/// buffer. Audit T2-9: the prior signature returned a fresh
+/// `Vec<Vec<f64>>` per LM iteration — at 200 iters × 4 SABR
+/// initial-guess restarts that's ~800 allocs per fit, and refits
+/// happen at 1Hz. Caller now reuses `j_buf` across iterations.
 fn numerical_jacobian<F: Fn(&[f64]) -> Vec<f64>>(
     f: &F,
     x: &[f64],
     r0: &[f64],
     nfev: &mut usize,
-) -> Vec<Vec<f64>> {
+    j_buf: &mut Vec<Vec<f64>>,
+) {
     let n = x.len();
     let m = r0.len();
-    let mut j = vec![vec![0.0_f64; n]; m];
+    // Resize without reallocating inner Vecs when shape matches.
+    if j_buf.len() != m {
+        j_buf.resize_with(m, || vec![0.0; n]);
+    }
+    for row in j_buf.iter_mut() {
+        if row.len() != n {
+            row.resize(n, 0.0);
+        }
+    }
     let mut x_pert = x.to_vec();
     for i in 0..n {
         let h = FD_STEP * (x[i].abs().max(1.0));
@@ -131,10 +150,9 @@ fn numerical_jacobian<F: Fn(&[f64]) -> Vec<f64>>(
         x_pert[i] = x[i];
         let inv = 0.5 / h;
         for k in 0..m {
-            j[k][i] = (r_plus[k] - r_minus[k]) * inv;
+            j_buf[k][i] = (r_plus[k] - r_minus[k]) * inv;
         }
     }
-    j
 }
 
 #[inline]
@@ -174,12 +192,13 @@ pub fn lm_solve<F: Fn(&[f64]) -> Vec<f64>>(
     let mut c = cost(&r);
     let mut mu = LM_MU_INIT;
     let mut success = false;
+    let mut j: Vec<Vec<f64>> = Vec::with_capacity(m);
 
     for _iter in 0..200 {
         if nfev >= max_nfev {
             break;
         }
-        let j = numerical_jacobian(f, &x, &r, &mut nfev);
+        numerical_jacobian(f, &x, &r, &mut nfev, &mut j);
 
         // Gradient = J^T r. Convergence on gradient norm.
         let mut grad_norm = 0.0_f64;
@@ -341,16 +360,30 @@ pub fn calibrate_sabr(
         out
     };
 
-    let mut best: Option<LMResult> = None;
+    // Audit T3-15: prefer LM results that converged (`success=true`)
+    // over stuck guesses with marginally lower raw cost. A guess that
+    // hits LM_MU_CEIL early can have lower cost than one that ran to
+    // gradient-norm convergence but the latter is the real fit.
+    // Fall back to lowest-cost when no guess converged.
+    let mut best_success: Option<LMResult> = None;
+    let mut best_any: Option<LMResult> = None;
     for guess in initial_guesses.iter() {
         let res = lm_solve(&residual, guess, &lb, &ub, 200);
-        match &best {
-            None => best = Some(res),
-            Some(b) if res.cost < b.cost => best = Some(res),
-            _ => {}
+        let lower_any = best_any.as_ref().map(|b| res.cost < b.cost).unwrap_or(true);
+        if lower_any {
+            best_any = Some(res.clone());
+        }
+        if res.success {
+            let lower_succ = best_success
+                .as_ref()
+                .map(|b| res.cost < b.cost)
+                .unwrap_or(true);
+            if lower_succ {
+                best_success = Some(res);
+            }
         }
     }
-    let best = best?;
+    let best = best_success.or(best_any)?;
     let rmse =
         (best.residuals.iter().map(|v| v * v).sum::<f64>() / best.residuals.len() as f64).sqrt();
     if rmse > max_rmse {
@@ -491,7 +524,17 @@ fn interp1(xs: &[f64], ys: &[f64], x: f64) -> f64 {
     }
     for i in 1..xs.len() {
         if x <= xs[i] {
-            let t = (x - xs[i - 1]) / (xs[i] - xs[i - 1]);
+            // Audit T1-8: guard against duplicate xs[]. With a small
+            // chain (5 strikes) and a tied log-moneyness on two
+            // adjacent strikes (rare but possible — same float
+            // representation after the ln), the denominator goes to 0
+            // and we return NaN. Pick the prior endpoint when the
+            // interval has zero width.
+            let dx = xs[i] - xs[i - 1];
+            if dx.abs() < 1e-12 {
+                return ys[i - 1];
+            }
+            let t = (x - xs[i - 1]) / dx;
             return ys[i - 1] + t * (ys[i] - ys[i - 1]);
         }
     }

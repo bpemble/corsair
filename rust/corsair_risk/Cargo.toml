@@ -10,6 +10,7 @@ name = "corsair_risk"
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 corsair_broker_api = { path = "../corsair_broker_api" }
+corsair_hedge = { path = "../corsair_hedge" }
 corsair_position = { path = "../corsair_position" }
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }

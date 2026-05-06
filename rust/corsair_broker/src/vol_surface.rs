@@ -1,31 +1,24 @@
 //! Vol-surface fitter — periodic SABR refit + IPC publish.
 //!
-//! Mirrors what today's Python `src/sabr.py::MultiExpirySABR` does
-//! at runtime, in a stripped-down Rust form sufficient for the
-//! trader's needs.
-//!
-//! Per cycle (~60s cadence):
+//! Per cycle (~60 s cadence):
 //!   1. For each registered product:
 //!      a. Walk options in market_data
-//!      b. For each option with bid+ask, compute mid, solve IV via
-//!         corsair_pricing::implied_vol (Brent on Black-76)
-//!      c. Group by expiry
-//!      d. For each expiry with ≥3 valid (strike, IV) pairs, run
-//!         corsair_pricing::calibrate::calibrate_sabr
-//!      e. Publish a "vol_surface" event with the fit params
-//!
-//! Skip:
-//!   - Per-side (C vs P) fitting — fits one combined surface per
-//!     expiry (Python is per-side; Rust simpler version is OK for
-//!     shadow validation).
-//!   - SVI fitting — SABR only for now.
-//!   - Quality-rejection RMSE thresholds — accepts any fit.
-//!
-//! Phase 6+ work: rebuild full Python parity (per-side fits, SVI,
-//! quality gates, fast-recal triggers, async fit pool).
+//!      b. For each option with bid+ask, compute microprice (size-
+//!         weighted), solve IV via `corsair_pricing::implied_vol`
+//!         (Brent on Black-76)
+//!      c. Group by (expiry, side) — calls and puts fit
+//!         independently so one-sided flow can't smear C/P smile
+//!         asymmetries
+//!      d. For each (expiry, side) with ≥3 valid (strike, IV) pairs,
+//!         run `corsair_pricing::calibrate::calibrate_sabr` with
+//!         vega² weights (Lesniewski 2008)
+//!      e. Publish a "vol_surface" event with the fit params; on
+//!         too-few-strikes or fit rejection emit a
+//!         "vol_surface_failed" diagnostic instead.
 
 use corsair_ipc::SHMServer;
 use corsair_pricing::calibrate::calibrate_sabr;
+use corsair_pricing::greeks::compute_greeks;
 use corsair_pricing::implied_vol;
 use serde::Serialize;
 use std::sync::Arc;
@@ -48,6 +41,13 @@ struct VolSurfaceEvent<'a> {
     rmse: f64,
     /// Number of (strike, IV) pairs the fit consumed.
     n_points: usize,
+    /// Lowest strike used in the fit. Trader uses these as the
+    /// calibrated-range bounds (audit item 6, spec §3.3): refuse to
+    /// quote strikes outside [calibrated_min_k, calibrated_max_k]
+    /// because SABR extrapolation past the fit's strike envelope is
+    /// unreliable.
+    calibrated_min_k: f64,
+    calibrated_max_k: f64,
     /// ts_ns — unix epoch nanoseconds.
     ts_ns: u64,
 }
@@ -82,6 +82,7 @@ pub fn spawn_vol_surface(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
 
 async fn periodic_vol_surface(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
     let mut t = tokio::time::interval(std::time::Duration::from_secs(60));
+    t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     log::info!("ipc periodic_vol_surface: cadence 60s");
     // Skip the first immediate tick — let market_data accumulate
     // ticks before we try to fit.
@@ -89,7 +90,16 @@ async fn periodic_vol_surface(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     loop {
         t.tick().await;
-        fit_and_publish(&runtime, &server);
+        // SABR LM solve runs ~5–50 ms per (expiry, side). With 2-3
+        // expiries × 2 sides per cycle that's enough sync compute to
+        // stall a worker — defer to spawn_blocking so the hot tokio
+        // workers (cmd_pump, tick fastpath) keep ticking.
+        let runtime = runtime.clone();
+        let server = server.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            fit_and_publish(&runtime, &server);
+        })
+        .await;
     }
 }
 
@@ -103,11 +113,16 @@ fn fit_and_publish(runtime: &Arc<Runtime>, server: &Arc<SHMServer>) {
         .products();
 
     for product in products {
-        let (forward, expiry_groups) = match snapshot_chain(runtime, &product) {
+        let (forward, expiry_side_groups) = match snapshot_chain(runtime, &product) {
             Some(v) => v,
             None => continue,
         };
-        for (expiry_str, strikes_with_iv) in expiry_groups {
+        // Per-side fits (Rec 2 expanded, 2026-05-05 evening). One LM
+        // solve per (expiry, side) — calls and puts get independent
+        // params so today's heavy-put-flow demand doesn't drag the
+        // call-side smile (and vice versa). Side-specific param
+        // shapes go into the cache keyed (product, expiry, side).
+        for ((expiry_str, side_char), strikes_with_iv) in expiry_side_groups {
             if strikes_with_iv.len() < 3 {
                 let _ = server.publish(
                     &rmp_serde::to_vec_named(&VolSurfaceFailedEvent {
@@ -127,29 +142,66 @@ fn fit_and_publish(runtime: &Arc<Runtime>, server: &Arc<SHMServer>) {
             };
             let ks: Vec<f64> = strikes_with_iv.iter().map(|(k, _, _)| *k).collect();
             let ivs: Vec<f64> = strikes_with_iv.iter().map(|(_, iv, _)| *iv).collect();
+
+            // Vega² weights for residuals (Rec 2 expanded). ATM
+            // strikes (high vega) carry most of the dollar pricing
+            // sensitivity, so wing IV jitter shouldn't dominate the
+            // loss. compute_greeks gives us per-strike vega; squaring
+            // turns it into the dollar-error-equivalent weighting from
+            // Lesniewski 2008. Without this, far-OTM jitter pulls fit
+            // params in directions that degrade ATM accuracy.
+            let weights: Vec<f64> = ks
+                .iter()
+                .zip(ivs.iter())
+                .map(|(&k, &iv)| {
+                    let g = compute_greeks(forward, k, tte, iv, 0.0, side_char, 1.0);
+                    let v = g.vega;
+                    if v.is_finite() && v > 0.0 { v * v } else { 1e-9 }
+                })
+                .collect();
+
+            // Min/max strike for the calibrated-range gate. Strikes
+            // are sorted in build_chain_payload, but be defensive.
+            let (min_k, max_k) = ks.iter().fold(
+                (f64::INFINITY, f64::NEG_INFINITY),
+                |(lo, hi), &k| (lo.min(k), hi.max(k)),
+            );
             // beta=0.5 + max_rmse=0.05 mirrors the operational config
             // (config/hg_v1_4_paper.yaml).
-            let fit = calibrate_sabr(forward, tte, &ks, &ivs, None, 0.5, 0.05);
+            let fit = calibrate_sabr(forward, tte, &ks, &ivs, Some(&weights), 0.5, 0.05);
+            // Upstream `snapshot_chain` only inserts entries with
+            // side_char ∈ {'C', 'P'}, so the wildcard arm is dead.
+            let side_label = match side_char {
+                'C' => "C",
+                _ => "P",
+            };
             match fit {
                 Some(f) => {
-                    // Cache for build_chain_payload's per-leg theo
-                    // computation. Key by (product, expiry_str) so the
-                    // chain looks them up directly.
-                    runtime.vol_surface_cache.lock().unwrap().insert(
-                        (product.clone(), expiry_str.clone()),
-                        crate::runtime::VolSurfaceCacheEntry {
-                            forward,
-                            tte,
-                            alpha: f.alpha,
-                            beta: f.beta,
-                            rho: f.rho,
-                            nu: f.nu,
-                        },
-                    );
+                    // Copy-on-write: clone the previous Arc's contents,
+                    // mutate the copy, publish a new Arc. Readers
+                    // holding the old Arc keep using their snapshot
+                    // (no torn reads).
+                    {
+                        let mut guard = runtime.vol_surface_cache.lock().unwrap();
+                        let mut next: std::collections::HashMap<_, _> =
+                            (**guard).clone();
+                        next.insert(
+                            (product.clone(), expiry_str.clone(), side_char),
+                            crate::runtime::VolSurfaceCacheEntry {
+                                forward,
+                                tte,
+                                alpha: f.alpha,
+                                beta: f.beta,
+                                rho: f.rho,
+                                nu: f.nu,
+                            },
+                        );
+                        *guard = std::sync::Arc::new(next);
+                    }
                     let ev = VolSurfaceEvent {
                         ty: "vol_surface",
                         expiry: expiry_str.clone(),
-                        side: "BOTH",
+                        side: side_label,
                         forward,
                         params: SabrParams {
                             model: "sabr",
@@ -160,6 +212,8 @@ fn fit_and_publish(runtime: &Arc<Runtime>, server: &Arc<SHMServer>) {
                         },
                         rmse: f.rmse,
                         n_points: f.n_points,
+                        calibrated_min_k: min_k,
+                        calibrated_max_k: max_k,
                         ts_ns: now_ns(),
                     };
                     if let Ok(body) = rmp_serde::to_vec_named(&ev) {
@@ -167,8 +221,9 @@ fn fit_and_publish(runtime: &Arc<Runtime>, server: &Arc<SHMServer>) {
                             log::warn!("vol_surface ring full — dropped");
                         } else {
                             log::info!(
-                                "vol_surface {} {} → α={:.3} ρ={:+.2} ν={:.2} rmse={:.4} (n={})",
-                                product, expiry_str, f.alpha, f.rho, f.nu, f.rmse, f.n_points
+                                "vol_surface {} {} {} → α={:.3} ρ={:+.2} ν={:.2} rmse={:.4} (n={})",
+                                product, expiry_str, side_label,
+                                f.alpha, f.rho, f.nu, f.rmse, f.n_points
                             );
                         }
                     }
@@ -190,13 +245,24 @@ fn fit_and_publish(runtime: &Arc<Runtime>, server: &Arc<SHMServer>) {
     }
 }
 
-/// For a product, build a per-expiry list of (strike, iv, tte) from
-/// the current market_data. Returns None when underlying isn't
+/// For a product, build a per-(expiry, side) list of (strike, iv, tte)
+/// from the current market_data. Returns None when underlying isn't
 /// populated yet.
+///
+/// Per-side grouping (Rec 2 expanded, 2026-05-05 evening): calls and
+/// puts go into separate buckets so the fitter runs an independent
+/// LM on each. Combined fits smear C/P smile asymmetry under
+/// one-sided flow.
+///
+/// Microprice for IV inversion: uses size-weighted price
+/// `(bid×ask_size + ask×bid_size) / (bid_size+ask_size)` instead of
+/// raw mid. Reflects queue imbalance — when one side has heavy
+/// resting size, the price the market actually clears at is closer
+/// to the lighter side.
 fn snapshot_chain(
     runtime: &Arc<Runtime>,
     product: &str,
-) -> Option<(f64, std::collections::HashMap<String, Vec<(f64, f64, f64)>>)> {
+) -> Option<(f64, std::collections::HashMap<(String, char), Vec<(f64, f64, f64)>>)> {
     let md = runtime.market_data.lock().unwrap();
     let und_spot = md.underlying_price(product)?;
     if und_spot <= 0.0 {
@@ -245,7 +311,45 @@ fn snapshot_chain(
             }
         }
         if samples.len() >= 2 {
-            samples.iter().sum::<f64>() / (samples.len() as f64)
+            let parity_f = samples.iter().sum::<f64>() / (samples.len() as f64);
+            // Sanity-check parity F against spot. There are TWO
+            // structurally-different drift sources we must NOT
+            // conflate:
+            //   1. CARRY (legitimate, structural): options on HGM6
+            //      price against HGM6, but we tick HGK6 (front-month)
+            //      as our spot reference. The K6→M6 calendar spread
+            //      is normally $0.04–0.05 in HG. Parity F correctly
+            //      reflects that carry.
+            //   2. BIAS from one-sided market mids (the failure
+            //      mode that actually motivated this guard, observed
+            //      2026-05-05 morning at $0.044 drift).
+            //
+            // We can't tell them apart from drift magnitude alone.
+            // Original threshold of $0.025 sat right inside the normal
+            // carry range, triggered constantly during US session,
+            // forced spot fallback, fit RMSE blew out, fits got
+            // rejected, no vol_surface events emitted.
+            //
+            // Threshold raised to $0.20 (400 ticks): wide enough to
+            // absorb normal carry + most one-sided-mid bias episodes,
+            // narrow enough to still catch parity computations that
+            // are genuinely broken. The trader's MAX_FORWARD_DRIFT_TICKS
+            // (100) catches the smaller bias on the hot path; this
+            // guard catches catastrophic parity failures only.
+            const PARITY_VS_SPOT_LIMIT_USD: f64 = 0.20;
+            if (parity_f - und_spot).abs() > PARITY_VS_SPOT_LIMIT_USD {
+                log::warn!(
+                    "vol_surface[{}]: parity F={:.4} drifted {:+.4} from spot {:.4} \
+                     (>$0.20 limit) — falling back to spot",
+                    product,
+                    parity_f,
+                    parity_f - und_spot,
+                    und_spot
+                );
+                und_spot
+            } else {
+                parity_f
+            }
         } else {
             // Fall back to spot. Theo will be biased by carry but at
             // least the chain has *some* fit, and the bias decays
@@ -254,11 +358,26 @@ fn snapshot_chain(
         }
     };
     let now = chrono::Utc::now();
-    let mut by_expiry: std::collections::HashMap<String, Vec<(f64, f64, f64)>> =
+    let mut by_expiry_side: std::collections::HashMap<(String, char), Vec<(f64, f64, f64)>> =
         std::collections::HashMap::new();
     for opt in md.options_for_product(product) {
-        let mid = opt.mid()?;
-        if mid <= 0.0 {
+        // Microprice for IV inversion (Rec 2 expanded, 2026-05-05).
+        // Skip dark / one-sided / inverted books — also strikes with
+        // zero size on either side, since the displayed mid is stale
+        // (no recent two-sided quote means the price isn't anchored
+        // to live liquidity). Stale strikes were pulling fits high
+        // during fast spot moves, contributing to the 5.90 P /
+        // 6.05 C accumulation incident on 2026-05-05.
+        if opt.bid <= 0.0 || opt.ask <= 0.0 || opt.bid >= opt.ask {
+            continue;
+        }
+        if opt.bid_size == 0 || opt.ask_size == 0 {
+            continue;
+        }
+        let total = (opt.bid_size + opt.ask_size) as f64;
+        let price =
+            (opt.bid * (opt.ask_size as f64) + opt.ask * (opt.bid_size as f64)) / total;
+        if price <= 0.0 {
             continue;
         }
         // TTE in years (CME 365.25-day convention).
@@ -273,30 +392,24 @@ fn snapshot_chain(
             continue;
         }
         let tte = secs / (365.25 * 24.0 * 3600.0);
-        let right_str = match opt.right {
-            corsair_broker_api::Right::Call => "C",
-            corsair_broker_api::Right::Put => "P",
+        let (right_str, side_char) = match opt.right {
+            corsair_broker_api::Right::Call => ("C", 'C'),
+            corsair_broker_api::Right::Put => ("P", 'P'),
         };
-        let iv = match implied_vol(mid, forward, opt.strike, tte, 0.0, right_str) {
+        let iv = match implied_vol(price, forward, opt.strike, tte, 0.0, right_str) {
             Some(v) if v > 0.001 && v < 5.0 => v,
             _ => continue,
         };
         let expiry_str = opt.expiry.format("%Y%m%d").to_string();
-        by_expiry
-            .entry(expiry_str)
+        by_expiry_side
+            .entry((expiry_str, side_char))
             .or_default()
             .push((opt.strike, iv, tte));
     }
-    if by_expiry.is_empty() {
+    if by_expiry_side.is_empty() {
         return None;
     }
-    Some((forward, by_expiry))
+    Some((forward, by_expiry_side))
 }
 
-fn now_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
+use crate::time::now_ns;

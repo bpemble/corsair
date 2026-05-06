@@ -1,25 +1,20 @@
 //! IPC server task — bridges the trader binary to the Rust broker.
 //!
 //! Responsibilities:
-//!   - Create the SHM rings (events + commands) at the configured base path.
-//!   - Forward fills / order_status / connection events from the broker
+//!   - Create the SHM rings (events + commands) at the configured
+//!     base path.
+//!   - Forward fills / order_status / connection / tick / vol_surface /
+//!     risk_state / kill / hello / place_ack events from the broker
 //!     stream to the trader via the events ring.
-//!   - Receive place_order / cancel_order commands from the trader and
-//!     dispatch to `Broker::place_order` / `Broker::cancel_order`.
+//!   - Receive place_order / cancel_order / modify_order commands from
+//!     the trader and dispatch to the matching Broker trait methods.
 //!
-//! This is the keystone for Phase 5B cutover. With this task running,
-//! the corsair_trader binary can connect to the Rust broker exactly as
-//! it currently connects to the Python broker.
-//!
-//! Phase 5B scope (this session):
-//!   ✓ Ring creation
-//!   ✓ Forward fills + order_status + connection events
-//!   ✓ Dispatch place_order / cancel_order
-//!   ⏸ Forward ticks (the trader needs these to make decisions —
-//!     wire when corsair_market_data is integrated)
-//!   ⏸ Forward vol_surface events (needs SABR fitter orchestration
-//!     in Rust — Phase 6 work)
-//!   ✓ Forward risk_state at 1Hz (Phase 5B.6, see periodic_risk_state)
+//! Tick fast-path: when the broker adapter exposes
+//! `set_tick_publisher`, we install a closure that writes consolidated
+//! tick events directly to the events ring — bypassing the broadcast
+//! channel + forward_ticks pump. NativeBroker supports the fast-path
+//! (~20 µs/tick saved); other adapters fall back to the broadcast
+//! pump.
 
 use corsair_broker_api::{
     ModifyOrderReq, OrderId, OrderType, PlaceOrderReq, Right, Side, TickKind, TimeInForce,
@@ -35,7 +30,8 @@ use crate::runtime::Runtime;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcConfig {
     /// Base path for the SHM rings. Conventional value:
-    /// /app/data/corsair_ipc — matches today's Python broker.
+    /// /app/data/corsair_ipc — the canonical location consumed by
+    /// the Rust trader binary.
     pub base_path: PathBuf,
     /// Per-ring capacity in bytes. Default 1 MiB.
     pub capacity: usize,
@@ -133,19 +129,57 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
             ) {
                 return;
             }
-            // Underlying-tick fork: if this instrument is registered as
-            // an underlying for some product, emit "underlying_tick"
-            // with the price and return. The trader's UnderlyingTickMsg
-            // consumer drives state.underlying_price, which gates
-            // decide_on_tick (forward must be > 0). Without this fork
-            // the trader stays at forward=0 forever (latent since
-            // cutover; broker.market_data populated correctly for the
-            // hedge subsystem, but no IPC emission to the trader).
-            let underlying_product = {
+            // Coalesce the (underlying-check + option seed + depth read)
+            // trio into ONE market_data lock acquisition. Pre-2026-05-05
+            // the hot path took md.lock() three times per tick — at
+            // ~50 ticks/sec across 30 strikes that's 4500 lock pairs/sec
+            // of wasted contention against pump_ticks (which holds the
+            // same lock for every TickKind dispatch).
+            enum FastpathRoute {
+                Underlying,
+                Option {
+                    seed_strike: f64,
+                    seed_expiry: chrono::NaiveDate,
+                    seed_right: Right,
+                    seed_bid: Option<f64>,
+                    seed_ask: Option<f64>,
+                    seed_bid_size: Option<i32>,
+                    seed_ask_size: Option<i32>,
+                    depth_bid_0: Option<f64>,
+                    depth_bid_1: Option<f64>,
+                    depth_ask_0: Option<f64>,
+                    depth_ask_1: Option<f64>,
+                },
+                Skip,
+            }
+            let route: FastpathRoute = {
                 let md = runtime_for_closure.market_data.lock().unwrap();
-                md.product_for_underlying(tick.instrument_id)
+                if md.product_for_underlying(tick.instrument_id).is_some() {
+                    FastpathRoute::Underlying
+                } else if let Some(opt) = md.option_by_iid(tick.instrument_id) {
+                    let pos_or_none = |x: f64| if x > 0.0 { Some(x) } else { None };
+                    let pos_or_none_size = |x: u64| if x > 0 { Some(x as i32) } else { None };
+                    FastpathRoute::Option {
+                        seed_strike: opt.strike,
+                        seed_expiry: opt.expiry,
+                        seed_right: opt.right,
+                        seed_bid: pos_or_none(opt.bid),
+                        seed_ask: pos_or_none(opt.ask),
+                        seed_bid_size: pos_or_none_size(opt.bid_size),
+                        seed_ask_size: pos_or_none_size(opt.ask_size),
+                        depth_bid_0: opt.depth.bids.first().map(|l| l.price),
+                        depth_bid_1: opt.depth.bids.get(1).map(|l| l.price),
+                        depth_ask_0: opt.depth.asks.first().map(|l| l.price),
+                        depth_ask_1: opt.depth.asks.get(1).map(|l| l.price),
+                    }
+                } else {
+                    FastpathRoute::Skip
+                }
             };
-            if underlying_product.is_some() {
+            // Underlying-tick fork: emit "underlying_tick" so trader's
+            // UnderlyingTickMsg consumer can drive state.underlying_price
+            // (gates decide_on_tick — forward must be > 0).
+            if matches!(route, FastpathRoute::Underlying) {
                 if matches!(tick.kind, TickKind::Bid | TickKind::Ask | TickKind::Last) {
                     if let Some(price) = tick.price {
                         if price > 0.0 {
@@ -172,42 +206,56 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
             ) {
                 return;
             }
-            // Pull metadata + seed values for the publisher cache from
-            // market_data in one lock acquisition. Seeding is what
-            // saves us from the 2026-05-04 bug: after a broker restart,
-            // the publisher cache started all-None and only filled as
-            // Bid/Ask price-change ticks arrived. In thin markets where
-            // only size ticks flow (overnight), cache stayed all-None
-            // for hours, the trader saw bid=None ask=None on every tick,
-            // and the dark-book guard fired on what was actually a
-            // perfectly two-sided book. Seeding from market_data picks
-            // up the IBKR initial-snapshot values so the very first
-            // TickEvent for an instrument carries the live BBO.
-            let seed = {
-                let md = runtime_for_closure.market_data.lock().unwrap();
-                md.option_by_iid(tick.instrument_id).map(|opt| {
-                    let pos_or_none = |x: f64| if x > 0.0 { Some(x) } else { None };
-                    let pos_or_none_size = |x: u64| if x > 0 { Some(x as i32) } else { None };
-                    (
-                        opt.strike,
-                        opt.expiry,
-                        opt.right,
-                        pos_or_none(opt.bid),
-                        pos_or_none(opt.ask),
-                        pos_or_none_size(opt.bid_size),
-                        pos_or_none_size(opt.ask_size),
-                    )
-                })
+            let (
+                seed_strike,
+                seed_expiry,
+                seed_right,
+                seed_bid,
+                seed_ask,
+                seed_bid_size,
+                seed_ask_size,
+                depth_bid_0,
+                depth_bid_1,
+                depth_ask_0,
+                depth_ask_1,
+            ) = match route {
+                FastpathRoute::Option {
+                    seed_strike,
+                    seed_expiry,
+                    seed_right,
+                    seed_bid,
+                    seed_ask,
+                    seed_bid_size,
+                    seed_ask_size,
+                    depth_bid_0,
+                    depth_bid_1,
+                    depth_ask_0,
+                    depth_ask_1,
+                } => (
+                    seed_strike,
+                    seed_expiry,
+                    seed_right,
+                    seed_bid,
+                    seed_ask,
+                    seed_bid_size,
+                    seed_ask_size,
+                    depth_bid_0,
+                    depth_bid_1,
+                    depth_ask_0,
+                    depth_ask_1,
+                ),
+                _ => return,
             };
-            let Some((seed_strike, seed_expiry, seed_right, seed_bid, seed_ask, seed_bid_size, seed_ask_size)) = seed else { return };
+            let seed_expiry_str = seed_expiry.format("%Y%m%d").to_string();
+            let seed_right_str: &'static str = match seed_right {
+                Right::Call => "C",
+                Right::Put => "P",
+            };
             let mut cache_guard = cache.lock().unwrap();
             let entry = cache_guard.entry(tick.instrument_id.0).or_insert_with(|| {
                 ConsolidatedTick {
-                    expiry: seed_expiry.format("%Y%m%d").to_string(),
-                    right: match seed_right {
-                        Right::Call => "C",
-                        Right::Put => "P",
-                    },
+                    expiry: seed_expiry_str.clone(),
+                    right: seed_right_str,
                     strike: seed_strike,
                     bid: seed_bid,
                     ask: seed_ask,
@@ -215,6 +263,20 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
                     ask_size: seed_ask_size,
                 }
             });
+            // Stale-key guard: if the cached entry's identity (strike,
+            // expiry, right) no longer matches the seeded value from
+            // market_data, the underlying instrument was re-registered
+            // (subscription rotation) under the same instrument_id.
+            // Refresh the identity fields so we don't publish stale
+            // strike/expiry/right downstream.
+            if entry.strike != seed_strike
+                || entry.expiry != seed_expiry_str
+                || entry.right != seed_right_str
+            {
+                entry.expiry = seed_expiry_str;
+                entry.right = seed_right_str;
+                entry.strike = seed_strike;
+            }
             match tick.kind {
                 TickKind::Bid => entry.bid = tick.price,
                 TickKind::Ask => entry.ask = tick.price,
@@ -222,26 +284,11 @@ async fn install_tick_fastpath(runtime: &Arc<Runtime>, server: Arc<SHMServer>) {
                 TickKind::AskSize => entry.ask_size = tick.size.map(|s| s as i32),
                 _ => return,
             }
-            // L2 depth: top-2 levels per side. The trader uses these
-            // to compute external best (subtracting its own resting
-            // size) so we don't tick-jump ourselves.
-            //
-            // None when the depth rotator hasn't subscribed this leg
-            // (only ATM-nearest ~5 strikes have active L2 at any
-            // given time) — trader falls back to the depth-1
-            // self-fill approximation.
-            let (depth_bid_0, depth_bid_1, depth_ask_0, depth_ask_1) = {
-                let md = runtime_for_closure.market_data.lock().unwrap();
-                if let Some(opt) = md.option_by_iid(tick.instrument_id) {
-                    let b0 = opt.depth.bids.first().map(|l| l.price);
-                    let b1 = opt.depth.bids.get(1).map(|l| l.price);
-                    let a0 = opt.depth.asks.first().map(|l| l.price);
-                    let a1 = opt.depth.asks.get(1).map(|l| l.price);
-                    (b0, b1, a0, a1)
-                } else {
-                    (None, None, None, None)
-                }
-            };
+            // L2 depth was captured in the same lock snapshot above.
+            // depth_*_0/1 are None when the depth rotator hasn't
+            // subscribed this leg (only ATM-nearest ~5 strikes have
+            // active L2 at any given time) — trader falls back to the
+            // depth-1 self-fill approximation.
             let ev = TickEvent {
                 ty: "tick",
                 strike: entry.strike,
@@ -577,13 +624,14 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
         }
     };
     if matches!(runtime.mode, crate::runtime::RuntimeMode::Shadow) {
+        // Format: side, strike+right@expiry, price, qty (one side print —
+        // pre-fix this line printed `cmd.side` twice).
         log::info!(
-            "ipc place_order (SHADOW; not placing): {} {}{}@{} {} @ {} qty {}",
+            "ipc place_order (SHADOW; not placing): {} {}{}@{} @ {} qty {}",
             cmd.side,
             cmd.strike,
             cmd.right,
             cmd.expiry,
-            cmd.side,
             cmd.price,
             cmd.qty
         );
@@ -721,7 +769,7 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
     // Push latency samples for the dashboard's TTT/RTT pill. Only on
     // successful acks — rejected orders skew the rolling window.
     //
-    // Definitions (match the Python broker / industry convention):
+    // Definitions (industry convention):
     //   TTT = trigger tick recv → broker SENDS place_order to IBKR
     //         (purely our hot-path work: trader decide + IPC + broker
     //         frame build + TCP write_all). Tens of µs in steady state.
@@ -957,6 +1005,192 @@ async fn handle_modify(runtime: &Arc<Runtime>, body: &[u8]) {
 
 // ─── Event publishing ─────────────────────────────────────────────
 
+/// Gather decoration fields for a Discord fill embed. Designed to be
+/// called from `forward_fills` immediately when a fill arrives —
+/// acquires each runtime mutex briefly and releases before the next.
+/// Any field that can't be resolved (boot before the first SABR fit,
+/// hedge fill on the underlying contract, etc.) stays `None` and the
+/// embed renders "—" in its slot.
+fn build_fill_notify_context(
+    runtime: &Arc<Runtime>,
+    fill: &corsair_broker_api::events::Fill,
+) -> crate::notify::FillNotifyContext {
+    use corsair_broker_api::Right;
+    use corsair_pricing::greeks::compute_greeks;
+    use corsair_pricing::{black76_price_inner, sabr_implied_vol};
+
+    let mut ctx = crate::notify::FillNotifyContext::default();
+
+    // ── Pass 1: portfolio → registry snapshot. Lock order in this
+    //   crate is portfolio → market_data (see tasks.rs); take the
+    //   per-product multiplier table and aggregates in one lock so
+    //   later passes only need market_data / vol_surface / hedge /
+    //   account.
+    let (registry_products, multipliers, agg, fills_today) = {
+        let p = runtime.portfolio.lock().unwrap();
+        let products = p.registry().products();
+        let mults: Vec<(String, f64)> = products
+            .iter()
+            .map(|prod| (prod.clone(), p.registry().multiplier_for(prod).unwrap_or(0.0)))
+            .collect();
+        (products, mults, p.aggregate(), p.fills_today)
+    };
+
+    // ── Pass 2: market_data — option meta + BBO + underlying ──────
+    let opt_meta: Option<(Option<String>, f64, chrono::NaiveDate, Right)> = {
+        let md = runtime.market_data.lock().unwrap();
+        if let Some(opt) = md.option_by_iid(fill.instrument_id) {
+            let r = match opt.right {
+                Right::Call => 'C',
+                Right::Put => 'P',
+            };
+            // Mirrors the prior label format (e.g. "HXE260626 P585").
+            let instrument_label = format!(
+                "HXE{} {}{}",
+                opt.expiry.format("%y%m%d"),
+                r,
+                (opt.strike * 100.0).round() as i32
+            );
+            // Title leg label, e.g. "5.85P".
+            let leg_label = format!("{:.2}{}", opt.strike, r);
+            let expiry_mmdd = opt.expiry.format("%m/%d").to_string();
+            let bid = if opt.bid > 0.0 { Some(opt.bid) } else { None };
+            let ask = if opt.ask > 0.0 { Some(opt.ask) } else { None };
+            // Resolve owning product by scanning the registry snapshot
+            // we already grabbed (cheap, <10 entries).
+            let mut underlying: Option<f64> = None;
+            let mut product: Option<String> = None;
+            for prod in &registry_products {
+                if md.option(prod, opt.strike, opt.expiry, opt.right).is_some() {
+                    underlying = md.underlying_price(prod);
+                    product = Some(prod.clone());
+                    break;
+                }
+            }
+            ctx.instrument_label = instrument_label;
+            ctx.leg_label = Some(leg_label);
+            ctx.expiry_mmdd = Some(expiry_mmdd);
+            ctx.bid = bid;
+            ctx.ask = ask;
+            ctx.underlying = underlying;
+            Some((product, opt.strike, opt.expiry, opt.right))
+        } else if let Some(p) = md.product_for_underlying(fill.instrument_id) {
+            ctx.instrument_label = format!("{p} hedge");
+            ctx.underlying = md.underlying_price(&p);
+            None
+        } else {
+            ctx.instrument_label = format!("iid={}", fill.instrument_id.0);
+            None
+        }
+    };
+
+    // ── Pass 3: vol_surface_cache → IV → theo / delta / theta ─────
+    if let Some((Some(product), strike, expiry, right)) = opt_meta.as_ref() {
+        let multiplier = multipliers
+            .iter()
+            .find(|(p, _)| p == product)
+            .map(|(_, m)| *m)
+            .unwrap_or(0.0);
+        let side_char = match right {
+            Right::Call => 'C',
+            Right::Put => 'P',
+        };
+        let expiry_str = expiry.format("%Y%m%d").to_string();
+        let fit = {
+            // Cheap Arc clone keeps the lock window small; we look up
+            // and then drop the snapshot.
+            let cache_arc = {
+                let g = runtime.vol_surface_cache.lock().unwrap();
+                std::sync::Arc::clone(&*g)
+            };
+            cache_arc
+                .get(&(product.clone(), expiry_str, side_char))
+                .cloned()
+        };
+        if let Some(f) = fit {
+            // Recompute TTE at fill time (fit's tte may be up to ~60s
+            // stale). 21:00 UTC settlement / 365.0-day year matches
+            // the trader's tte_cache convention.
+            let expiry_dt = chrono::NaiveDateTime::new(
+                *expiry,
+                chrono::NaiveTime::from_hms_opt(21, 0, 0).unwrap(),
+            );
+            let now = chrono::Utc::now();
+            let secs = (chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                expiry_dt,
+                chrono::Utc,
+            ) - now)
+                .num_seconds() as f64;
+            let tte = if secs > 0.0 {
+                secs / (365.0 * 24.0 * 3600.0)
+            } else {
+                f.tte
+            };
+            let iv = sabr_implied_vol(f.forward, *strike, tte, f.alpha, f.beta, f.rho, f.nu);
+            if iv.is_finite() && iv > 0.0 {
+                let theo = black76_price_inner(f.forward, *strike, tte, iv, 0.0, side_char);
+                if theo.is_finite() && theo > 0.0 {
+                    ctx.theo = Some(theo);
+                    if multiplier > 0.0 {
+                        // Edge: side-signed gap × multiplier × qty.
+                        // SELL above theo → positive; BUY below theo →
+                        // positive.
+                        let sign = match fill.side {
+                            corsair_broker_api::Side::Sell => 1.0,
+                            corsair_broker_api::Side::Buy => -1.0,
+                        };
+                        ctx.edge_usd =
+                            Some(sign * (fill.price - theo) * multiplier * fill.qty as f64);
+                    }
+                }
+                let g = compute_greeks(
+                    f.forward,
+                    *strike,
+                    tte,
+                    iv,
+                    0.0,
+                    side_char,
+                    multiplier.max(1.0),
+                );
+                if g.delta.is_finite() {
+                    ctx.delta = Some(g.delta);
+                }
+                if g.theta.is_finite() {
+                    ctx.theta = Some(g.theta);
+                }
+            }
+        }
+    }
+
+    // ── Pass 4: portfolio aggregates from Pass 1 + hedge fanout
+    //   for effective delta (CLAUDE.md §14: gates use options + hedge).
+    ctx.portfolio_theta = Some(agg.total.net_theta);
+    ctx.fills_today = Some(fills_today);
+    {
+        let h = runtime.hedge.lock().unwrap();
+        let hedge_qty: i64 = h.managers().iter().map(|m| m.hedge_qty() as i64).sum();
+        ctx.portfolio_delta = Some(agg.total.net_delta + hedge_qty as f64);
+    }
+
+    // ── Pass 5: account → maintenance margin ──────────────────────
+    {
+        let acct = runtime.account.lock().unwrap();
+        if acct.maintenance_margin > 0.0 {
+            ctx.margin_used = Some(acct.maintenance_margin);
+        }
+    }
+
+    ctx
+}
+
+// NOTE: forward_fills / forward_status / forward_connection share the
+// same shape (broadcast::Receiver → msgpack-encode → SHMServer.publish
+// → log on Lagged/Closed). A generic helper would need to accept a
+// closure that takes the typed event by reference and returns the
+// msgpack body. Punted because each encoder reaches into different
+// fields of the typed envelope (e.g. status_str format!() above) and
+// the saved LoC isn't worth the increased indirection in the hot
+// publishing path. Kept side-by-side for readability instead.
 async fn forward_fills(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
     let mut rx = {
         let b = runtime.broker.clone();
@@ -986,30 +1220,13 @@ async fn forward_fills(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
                         log::warn!("ipc events ring full — dropped fill");
                     }
                 }
-                // Discord notification (rate-limited inside).
-                // Look up the human-readable label from market_data
-                // so the embed says "HXEM6 P565" not just "iid=N".
-                let label = {
-                    let md = runtime.market_data.lock().unwrap();
-                    if let Some(opt) = md.option_by_iid(fill.instrument_id) {
-                        let r = match opt.right {
-                            Right::Call => "C",
-                            Right::Put => "P",
-                        };
-                        format!(
-                            "HXE{} {}{}",
-                            opt.expiry.format("%y%m%d"),
-                            r,
-                            (opt.strike * 100.0).round() as i32
-                        )
-                    } else if let Some(p) = md.product_for_underlying(fill.instrument_id) {
-                        // Hedge fill on the underlying contract.
-                        format!("{p} hedge")
-                    } else {
-                        format!("iid={}", fill.instrument_id.0)
-                    }
-                };
-                crate::notify::notify_fill(fill.clone(), label);
+                // Discord notification (rate-limited inside). Gather
+                // theo / Greeks / BBO / portfolio context so the embed
+                // assembles the embed fields. Locks are taken
+                // briefly and released before the spawn — see notify.rs
+                // for the embed shape.
+                let ctx = build_fill_notify_context(&runtime, &fill);
+                crate::notify::notify_fill(fill.clone(), ctx);
             }
             Err(RecvError::Lagged(n)) => log::warn!("forward_fills: lagged {n}"),
             Err(RecvError::Closed) => break,
@@ -1423,11 +1640,12 @@ struct RiskStateEvent {
     n_positions: u32,
 }
 
-/// Publish risk aggregates to the trader at 1Hz. Mirrors
-/// `BrokerIPC.publish_risk_state` in Python — same field names so
-/// the trader's existing self-gating logic works unchanged.
+/// Publish risk aggregates to the trader at 1 Hz. Field names match
+/// the trader's `RiskStateMsg` exactly so self-gating logic on the
+/// trader side stays decoupled from the broker's internal types.
 async fn periodic_risk_state(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
     let mut t = tokio::time::interval(std::time::Duration::from_secs(1));
+    t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     log::info!("ipc periodic_risk_state: cadence 1s");
     let capital = runtime.config.constraints.capital;
     loop {
@@ -1485,11 +1703,18 @@ async fn periodic_risk_state(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
         //
         // Fail-closed semantics: when the cache has never been
         // populated (timestamp_ns == 0, pre-first-poll) or is too
-        // stale (>30s old), publish margin_pct = 1.0 so the trader
-        // blocks ALL placements. The trader's `risk_state stale >5s`
-        // gate is the upstream backstop; this is the within-event
-        // backstop.
-        const MARGIN_CACHE_MAX_AGE_NS: u64 = 30_000_000_000;
+        // stale, publish margin_pct = 1.0 so the trader blocks ALL
+        // placements. The trader's `risk_state stale >5s` gate is the
+        // upstream backstop; this is the within-event backstop.
+        //
+        // Window invariant: max-age MUST be >= 2× the
+        // `periodic_account_poll` cadence (15 s). At 30 s a single
+        // missed poll trips the fail-closed (slack=0); at 60 s we
+        // tolerate two consecutive missed polls before flipping.
+        // 60 s is the chosen value — the trader still gets a fresh
+        // margin number every 15 s in steady state, and a transient
+        // gateway hiccup doesn't yank quoting offline.
+        const MARGIN_CACHE_MAX_AGE_NS: u64 = 60_000_000_000;
         let (margin_usd, margin_cache_fresh) = {
             let a = runtime.account.lock().unwrap();
             let now = now_ns();
@@ -1527,13 +1752,7 @@ async fn periodic_risk_state(runtime: Arc<Runtime>, server: Arc<SHMServer>) {
     }
 }
 
-fn now_ns() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
+use crate::time::now_ns;
 
 #[cfg(test)]
 mod tests {

@@ -21,29 +21,33 @@ use crate::messages::{
     OUT_START_API,
 };
 
-/// Enable SO_TIMESTAMPNS on a TCP socket so subsequent recvmsg() calls
-/// return a CLOCK_REALTIME nanosecond timestamp via SCM_TIMESTAMPNS in
-/// the cmsg ancillary data. Returns true on success.
+/// Enable SO_BUSY_POLL on a TCP socket. Tells the kernel to spin in
+/// the syscall waiting for new packets for up to N microseconds before
+/// falling back to interrupt-driven sleep. Saves the wakeup-from-softirq
+/// path on the broker→Gateway loopback hop, where packets arrive
+/// frequently enough that the busy-poll budget is mostly absorbed.
 ///
-/// The timestamp is captured by the kernel when a packet leaves the
-/// driver's RX queue, before user-space dispatch — much closer to NIC
-/// ingress than the moment our recv() syscall returns. On loopback
-/// (gateway → broker) the gap to user-space is small (~µs); on a real
-/// NIC at colo it can be tens of µs.
-fn enable_so_timestampns(fd: std::os::unix::io::RawFd) -> bool {
+/// Trade-off: when the gateway is idle, this burns CPU. With 50µs and
+/// the Gateway sending order_status / market_data ticks at multi-kHz,
+/// that's near-100% absorbed during a session. Returns true on success.
+fn enable_so_busy_poll(fd: std::os::unix::io::RawFd, usecs: u32) -> bool {
     unsafe {
-        let on: libc::c_int = 1;
+        let val: libc::c_int = usecs as libc::c_int;
         let r = libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
-            libc::SO_TIMESTAMPNS,
-            &on as *const _ as *const libc::c_void,
+            libc::SO_BUSY_POLL,
+            &val as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as u32,
         );
         if r != 0 {
+            // Common failure: CAP_NET_ADMIN required on older kernels
+            // (≤5.7). Modern Linux (≥5.7) lifted that to allow any user
+            // up to sysctl net.core.busy_poll. Log + continue.
             log::warn!(
-                "SO_TIMESTAMPNS enable failed on fd={}: {}",
+                "SO_BUSY_POLL enable failed on fd={} (val={}us): {}",
                 fd,
+                usecs,
                 std::io::Error::last_os_error()
             );
             false
@@ -53,63 +57,17 @@ fn enable_so_timestampns(fd: std::os::unix::io::RawFd) -> bool {
     }
 }
 
-/// Non-blocking recvmsg that also extracts the kernel's CLOCK_REALTIME
-/// SCM_TIMESTAMPNS ingress timestamp. Returns (bytes_read, timestamp_ns).
-/// timestamp_ns is None when SO_TIMESTAMPNS wasn't enabled (caller
-/// should fall back to now_ns()).
-///
-/// Currently unused — the recv loop reverted to tokio's read API
-/// after a readiness-clear bug caused 100% CPU spin (readable() didn't
-/// auto-clear when we bypassed try_read). Re-introduce later via
-/// `try_io(Interest::READABLE, |_| recvmsg(...))` so tokio handles
-/// WouldBlock signaling. Kept for that future migration.
-#[allow(dead_code)]
-fn recvmsg_with_kernel_ts(
-    fd: std::os::unix::io::RawFd,
-    buf: &mut [u8],
-) -> std::io::Result<(usize, Option<u64>)> {
-    unsafe {
-        let mut iov = libc::iovec {
-            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        };
-        // Reserve cmsg space for SCM_TIMESTAMPNS (one timespec).
-        let cmsg_capacity =
-            libc::CMSG_SPACE(std::mem::size_of::<libc::timespec>() as u32) as usize;
-        let mut cmsg_buf = vec![0u8; cmsg_capacity];
-        let mut hdr = libc::msghdr {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: &mut iov,
-            msg_iovlen: 1,
-            msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
-            msg_controllen: cmsg_capacity,
-            msg_flags: 0,
-        };
-        let n = libc::recvmsg(fd, &mut hdr, libc::MSG_DONTWAIT);
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // Walk cmsg list looking for SCM_TIMESTAMPNS.
-        let mut ts_ns: Option<u64> = None;
-        let mut cmsg = libc::CMSG_FIRSTHDR(&hdr);
-        while !cmsg.is_null() {
-            let c = &*cmsg;
-            if c.cmsg_level == libc::SOL_SOCKET
-                && c.cmsg_type == libc::SCM_TIMESTAMPNS
-            {
-                let data = libc::CMSG_DATA(cmsg) as *const libc::timespec;
-                let ts = *data;
-                ts_ns = Some(
-                    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64,
-                );
-                break;
-            }
-            cmsg = libc::CMSG_NXTHDR(&hdr, cmsg);
-        }
-        Ok((n as usize, ts_ns))
-    }
-}
+// SO_TIMESTAMPNS support and recvmsg_with_kernel_ts() were removed
+// 2026-05-05. The recv loop went back to tokio's read API after a
+// readiness-clear bug (readable() didn't auto-clear when we bypassed
+// try_read), and nothing today consumes the cmsg timestamp. The
+// channel-recv now_ns() in the dispatcher is sufficient for the
+// trader's TTT histogram. If we ever colo and need true NIC-ingress
+// timing, re-introduce both via
+//   `try_io(Interest::READABLE, |_| recvmsg(...))`
+// (so tokio's machinery handles WouldBlock/clear_ready) plus the
+// SCM_TIMESTAMPNS cmsg walk. The shape was ~120 lines; it lives in
+// git history at HEAD~ before this commit.
 
 /// Configuration for a NativeClient.
 #[derive(Debug, Clone)]
@@ -213,15 +171,46 @@ impl NativeClient {
     }
 
     /// Atomically allocate the next order id and advance the local
-    /// counter. Returns 0 if the gateway hasn't yet streamed the
-    /// initial nextValidId — caller should `wait_for_bootstrap` first.
+    /// counter. Bounded-wait: if the gateway hasn't yet streamed the
+    /// initial nextValidId, sleep-poll for up to 1s before falling
+    /// back to returning 0 (caller treats `<= 0` as "not seeded").
+    ///
+    /// The wait is a defense against startup races where a caller
+    /// invokes `alloc_order_id` between `connect` returning and the
+    /// recv task processing the gateway's nextValidId broadcast.
+    /// `wait_for_bootstrap` is the canonical gate for this — the
+    /// poll here is belt-and-braces. A return of 0 still indicates
+    /// a real failure (gateway lost mid-handshake or never sent the
+    /// initial nextValidId at all); caller must treat it as such.
+    ///
+    /// (Returning Result<i32, NativeError> would be the cleaner API
+    /// shape but the cross-crate impact is non-trivial — broker.rs
+    /// + every test that mocks the call site. Captured for the
+    /// parent to schedule.)
     pub async fn alloc_order_id(&self) -> i32 {
-        let mut g = self.next_order_id.lock().await;
-        let id = *g;
-        if id > 0 {
-            *g = id + 1;
+        // Fast path — already seeded.
+        {
+            let mut g = self.next_order_id.lock().await;
+            let id = *g;
+            if id > 0 {
+                *g = id + 1;
+                return id;
+            }
         }
-        id
+        // Slow path — bounded poll. 20ms ticks × 50 = 1s budget.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut g = self.next_order_id.lock().await;
+            let id = *g;
+            if id > 0 {
+                *g = id + 1;
+                return id;
+            }
+        }
+        log::warn!(
+            "alloc_order_id: next_valid_id still 0 after 1s — gateway not seeded"
+        );
+        0
     }
 
     pub async fn managed_accounts(&self) -> Vec<String> {
@@ -242,14 +231,19 @@ impl NativeClient {
         .map_err(|_| NativeError::HandshakeTimeout)?
         .map_err(NativeError::Io)?;
         stream.set_nodelay(true)?;
-        // Enable SO_TIMESTAMPNS so the recv loop can stamp each frame
-        // with the kernel's RX ingress time (much closer to NIC arrival
-        // than the moment recv() returns). Both halves share the same
-        // underlying socket, so setting the option pre-split is fine.
-        let ts_enabled = enable_so_timestampns(stream.as_raw_fd());
-        if ts_enabled {
+        // SO_TIMESTAMPNS used to be enabled here; removed 2026-05-05
+        // along with `recvmsg_with_kernel_ts` since no caller consumed
+        // the cmsg timestamp. See the comment block at the top of this
+        // file for the migration story.
+        //
+        // SO_BUSY_POLL: kernel busy-polls for incoming packets up to
+        // 50µs before sleeping. Saves the softirq-wakeup path on the
+        // broker→Gateway loopback hop. ~1-3µs reduction per recv.
+        // Audit Phase 1 #4 (2026-05-05).
+        let bp_enabled = enable_so_busy_poll(stream.as_raw_fd(), 50);
+        if bp_enabled {
             log::warn!(
-                "native client: SO_TIMESTAMPNS enabled on gateway fd={}",
+                "native client: SO_BUSY_POLL=50us enabled on gateway fd={}",
                 stream.as_raw_fd()
             );
         }
@@ -393,6 +387,22 @@ impl NativeClient {
     }
 }
 
+/// Handshake-read result discriminator. WouldBlock and EOF both
+/// produced `Ok(0)` in the original helper, hiding genuine
+/// peer-closed-socket as a benign "no data yet, retry" condition
+/// (caller would loop until handshake_timeout). Distinguish them
+/// with an explicit enum so EOF surfaces a real error instead of
+/// a misleading timeout.
+enum HandshakeStep {
+    /// Read N bytes into `buf`.
+    Got(usize),
+    /// `readable()` returned but `try_read` saw WouldBlock —
+    /// spurious wake; safe to retry.
+    WouldBlock,
+    /// `try_read` returned Ok(0) — clean EOF from peer.
+    Eof,
+}
+
 /// Read the handshake reply: a single length-prefixed frame with two
 /// fields — server_version and conn_time.
 async fn read_handshake_reply(
@@ -418,21 +428,27 @@ async fn read_handshake_reply(
             // semantics. Easiest path: use readable() + try_read.
             read_half.readable().await?;
             let mut tmp = [0u8; 256];
-            let n = match read_half.try_read(&mut tmp) {
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-                Err(e) => return Err::<usize, std::io::Error>(e),
-            };
-            Ok::<usize, std::io::Error>(if n == 0 {
-                0
-            } else {
-                buf.extend_from_slice(&tmp[..n]);
-                n
-            })
+            match read_half.try_read(&mut tmp) {
+                Ok(0) => Ok::<HandshakeStep, std::io::Error>(HandshakeStep::Eof),
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    Ok(HandshakeStep::Got(n))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Ok(HandshakeStep::WouldBlock)
+                }
+                Err(e) => Err(e),
+            }
         };
         match tokio::time::timeout(remaining, read_fut).await {
-            Ok(Ok(0)) => continue,
-            Ok(Ok(_)) => {
+            Ok(Ok(HandshakeStep::Eof)) => {
+                return Err(NativeError::Protocol(
+                    "handshake: connection closed by peer (EOF) before \
+                     server sent serverVersion+connTime".into(),
+                ));
+            }
+            Ok(Ok(HandshakeStep::WouldBlock)) => continue,
+            Ok(Ok(HandshakeStep::Got(_))) => {
                 if let Some(fields) = crate::codec::try_decode_frame(&mut buf)? {
                     if fields.len() < 2 {
                         return Err(NativeError::Protocol(format!(

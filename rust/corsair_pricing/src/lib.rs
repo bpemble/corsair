@@ -20,12 +20,20 @@ pub mod span;
 
 use pyo3::prelude::*;
 use statrs::distribution::{ContinuousCDF, Normal};
+use std::sync::OnceLock;
+
+/// Cached standard normal — Normal::new() does work that's cheap but
+/// non-trivial (validates inputs, stores the variance), and Black-76
+/// is on the trader's hot path. Audit T2-10: the per-call alloc was
+/// ~1% of compute_theo CPU at quote-density peaks; caching pulls
+/// that to zero.
+static STD_NORMAL: OnceLock<Normal> = OnceLock::new();
 
 #[inline]
 fn norm_cdf(x: f64) -> f64 {
-    // Normal::new(0,1) is cheap (just stores mean+stddev). Constructing
-    // per-call avoids the lazy-static / once_cell dance.
-    Normal::new(0.0, 1.0).unwrap().cdf(x)
+    STD_NORMAL
+        .get_or_init(|| Normal::new(0.0, 1.0).unwrap())
+        .cdf(x)
 }
 
 #[pyfunction]
@@ -156,7 +164,17 @@ fn brent<F: Fn(f64) -> f64>(f: &F, mut a: f64, mut b: f64, xtol: f64, max_iter: 
             std::mem::swap(&mut fa, &mut fb);
         }
     }
-    Some(b)
+    // Audit T1-7c: prior behavior returned `Some(b)` after exhausting
+    // max_iter, masking non-convergence. Implied vol now sees None on
+    // a stuck root and the caller can fall back to a vol surface
+    // estimate instead of pretending we got an answer. Use the
+    // bracket width and residual together as the stop condition: if
+    // both are tiny, treat it as converged at the iteration limit.
+    if (b - a).abs() < xtol || fb.abs() < 1e-9 {
+        Some(b)
+    } else {
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -180,6 +198,12 @@ pub(crate) fn svi_total_variance_inner(k: f64, a: f64, b: f64, rho: f64, m: f64,
 /// Returns 0.0 for invalid inputs and 0.001 for non-positive variance
 /// (matches Python's safe-floor behavior). The 0.001 floor is what
 /// keeps Black76 from blowing up on early-fit junk parameters.
+///
+/// Audit T1-7b: a w<=0 floor means the caller cannot distinguish
+/// "calibration produced a degenerate point in the wing" from a
+/// healthy 0.1% IV; the counter below counts floor-events so the
+/// operator can grep telemetry. Ideally the caller refits when this
+/// rate spikes — that's a TODO for the surface-fit driver.
 #[pyfunction]
 #[pyo3(signature = (f, k_strike, t, a, b, rho, m, sigma))]
 fn svi_implied_vol(
@@ -192,10 +216,27 @@ fn svi_implied_vol(
     let k = (k_strike / f).ln();
     let w = svi_total_variance_inner(k, a, b, rho, m, sigma);
     if w <= 0.0 {
+        // Loud-but-throttled: log on every Nth floor-event to flag a
+        // surface that's degenerated in the wing. The trader's IV
+        // gate then sees the floor and skips the strike.
+        let n = SVI_FLOOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n.is_power_of_two() {
+            log::warn!(
+                "svi_implied_vol: total variance w={w} <= 0 at k={k:.4} \
+                 (params: a={a:.4} b={b:.4} rho={rho:.4} m={m:.4} sigma={sigma:.4}); \
+                 returning 0.001 floor [hits={}]",
+                n + 1
+            );
+        }
         return 0.001;
     }
     (w / t).sqrt()
 }
+
+/// Counter for SVI w<=0 floor events. Monotonic; reset on process
+/// restart. Useful for grepping telemetry to spot degenerate fits.
+pub static SVI_FLOOR_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// |F-K| < 1e-7 * F (matches the Python `eps = 1e-7` branch).
 #[pyfunction]
@@ -229,7 +270,15 @@ pub fn sabr_implied_vol(
     let xz = if z.abs() < eps {
         1.0
     } else {
-        let sqrt_term = (1.0 - 2.0 * rho * z + z * z).sqrt();
+        // Audit T1-7a: clamp the radicand at 0. With certain
+        // parameter combinations (rho near +/-1, large |z|), floating
+        // arithmetic can produce a tiny-negative argument and `sqrt`
+        // returns NaN, which then propagates through the model IV.
+        // Downstream Black-76 swallows the NaN as theo=NaN; the
+        // trader's iv_invalid gate catches it but only after a wasted
+        // dispatch. Clamp here so the function never returns NaN.
+        let radicand = (1.0 - 2.0 * rho * z + z * z).max(0.0);
+        let sqrt_term = radicand.sqrt();
         z / ((sqrt_term + z - rho) / (1.0 - rho)).ln()
     };
 
@@ -243,7 +292,17 @@ pub fn sabr_implied_vol(
     let p2 = 0.25 * rho * beta * nu * alpha / fk_beta;
     let p3 = (2.0 - 3.0 * rho * rho) * nu * nu / 24.0;
 
-    (alpha / denom1) * xz * (1.0 + (p1 + p2 + p3) * t)
+    let result = (alpha / denom1) * xz * (1.0 + (p1 + p2 + p3) * t);
+    // Audit T1-7a: if ANY of the intermediate terms went non-finite
+    // (NaN/inf), fall back to alpha (the ATM short-leg vol) as a
+    // conservative substitute. This matches the spirit of the Python
+    // 0.001 floor on SVI: prefer a sane number to a NaN that pollutes
+    // pricing downstream.
+    if result.is_finite() && result > 0.0 {
+        result
+    } else {
+        alpha.max(0.001)
+    }
 }
 
 /// Trader's quote decision (Option B per mm_service_split). Returns a

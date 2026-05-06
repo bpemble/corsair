@@ -1,9 +1,9 @@
 //! `NativeBroker` — `corsair_broker_api::Broker` impl over `NativeClient`.
 //!
-//! Phase 6.6 of the v3 migration. Replaces the PyO3 + ib_insync adapter
-//! in `corsair_broker_ibkr` with a direct-wire IBKR adapter. Once this
-//! is complete and validated, the existing PyO3 crate can be retired
-//! and Phase 5B.7 cutover can finally happen.
+//! Direct-wire IBKR adapter. Embedded by the `corsair_broker` daemon
+//! as its production `Broker` implementation. The PyO3 + ib_insync
+//! bridge it replaced (`corsair_broker_ibkr`) was retired during the
+//! Phase 6.7 cutover and the crate has since been deleted.
 //!
 //! # Architecture
 //!
@@ -53,7 +53,7 @@ use corsair_broker_api::{
 use crate::client::{NativeClient, NativeClientConfig};
 use crate::error::NativeError;
 use crate::requests::{
-    cancel_mkt_data, cancel_mkt_depth, cancel_order, place_order, req_account_updates,
+    cancel_mkt_data, cancel_mkt_depth, cancel_order, req_account_updates,
     req_contract_details, req_executions, req_mkt_data, req_mkt_depth, req_open_orders,
     req_positions, ContractRequest,
     ExecutionFilter, PlaceOrderParams,
@@ -95,12 +95,23 @@ struct BrokerState {
     /// Pending recent_fills responses, keyed by reqId.
     pending_executions: HashMap<i32, PendingExecutionsRequest>,
 
-    /// Pending place_order acks, keyed by orderId. Resolved on the
-    /// first OpenOrder message OR an Error with req_id == orderId.
-    /// Lets place_order detect IBKR rejects synchronously instead of
-    /// returning a phantom OrderId that the trader treats as live
-    /// (P0-4 + CLAUDE.md §14 hedge_qty trust concern).
-    pending_place_acks: HashMap<i32, oneshot::Sender<Result<(), BrokerError>>>,
+    /// Pending place_order / modify_order acks, keyed by orderId.
+    ///
+    /// Place path: resolved on the first OpenOrder OR OrderStatus
+    /// (Submitted/PendingSubmit/Filled/Cancelled/PendingCancel) for
+    /// this orderId, OR an Error with req_id == orderId. Lets the
+    /// caller detect IBKR rejects synchronously instead of returning
+    /// a phantom OrderId (P0-4 + CLAUDE.md §14 hedge_qty trust).
+    ///
+    /// Amend path (`expected_amend_price = Some`): resolved ONLY by
+    /// `OpenOrder` whose `lmt_price` matches the requested price.
+    /// PreSubmitted/PendingSubmit comes back from the local IB
+    /// Gateway before IBKR's server has actually processed the
+    /// amend, so resolving on it under-reports amend RTT (~hundreds
+    /// of µs vs the real ~tens of ms). Matching the price-out vs
+    /// price-back means we resolve only after IBKR's server has
+    /// updated its book to the new price.
+    pending_place_acks: HashMap<i32, PendingAck>,
 
     /// v2 wire-timing — broker-internal precise timestamps per orderId.
     /// `place_order` populates `send_ns` immediately before client.send_raw;
@@ -110,6 +121,24 @@ struct BrokerState {
     /// that included ~30 µs of place_order setup overhead.
     pub wire_send_ns: HashMap<i32, u64>,
     pub wire_ack_ns: HashMap<i32, u64>,
+
+    /// HONEST amend ack timestamp: stamped only when the dispatcher
+    /// observes an OpenOrder whose `lmt_price` matches the amend's
+    /// requested price. Captures the moment IBKR's server has
+    /// applied the amend, not the IB Gateway's PreSubmitted echo
+    /// (which lands in microseconds and gives a phantom-fast amend
+    /// RTT). The functional ack path (the `tx` on PendingAck)
+    /// resolves permissively on any accept-state signal so the
+    /// trader never timeouts; this map is consumed independently
+    /// via `drain_strict_amend_timing` for dashboard reporting.
+    pub strict_ack_ns: HashMap<i32, u64>,
+
+    /// Expected amend price keyed by orderId, kept separate from
+    /// PendingAck so the dispatcher can stamp `strict_ack_ns` even
+    /// after the permissive resolution has removed the PendingAck.
+    /// Cleared by `drain_strict_amend_timing` after handle_modify
+    /// reads the strict ack timestamp.
+    pub expected_amend_prices: HashMap<i32, f64>,
 
     /// Cached place_order contract templates keyed by InstrumentId.
     /// Avoids re-encoding the 14 contract-fixed fields on every
@@ -162,6 +191,24 @@ struct PendingExecutionsRequest {
     accumulated: Vec<Fill>,
     sender: Option<oneshot::Sender<Result<Vec<Fill>, BrokerError>>>,
 }
+
+/// Pending place/modify ack. The dispatcher resolves `tx`
+/// permissively on any OpenOrder or accept-state OrderStatus for
+/// the matching orderId so the trader's modify call never
+/// timeouts on amends where IBKR emits something other than a
+/// matching-price OpenOrder. The honest amend RTT (where
+/// available) is captured separately in `BrokerState::strict_ack_ns`
+/// — see the OpenOrder branch of `route()` and
+/// `drain_strict_amend_ack_ns()`.
+struct PendingAck {
+    tx: oneshot::Sender<Result<(), BrokerError>>,
+}
+
+/// Floating-point tolerance for amend price match. CME tick sizes for
+/// our products are ≥ 0.0005 USD, so an epsilon two orders of magnitude
+/// smaller is safely below tick precision while absorbing any rounding
+/// the wire format introduces.
+const AMEND_PRICE_EPS: f64 = 1e-6;
 
 /// Tracks whether we've seen the initial PositionEnd / OpenOrderEnd /
 /// AccountDownloadEnd signals after connect. Lets callers gate
@@ -403,17 +450,35 @@ impl NativeBroker {
             }
             InboundMsg::OpenOrder(o) => {
                 let order_id = o.order_id;
+                let lmt_price = o.lmt_price;
                 let parsed = native_to_open_order(&o);
                 let ack = {
                     let mut s = state.lock();
                     if let Some(open) = parsed {
                         s.open_orders.insert(order_id, open);
                     }
-                    // v2 wire-timing — first ack signal, stamp the
-                    // moment we observe it. OrderStatus may also
-                    // arrive; whichever lands first sets ack_ns.
-                    s.wire_ack_ns.entry(order_id).or_insert_with(now_ns);
-                    s.pending_place_acks.remove(&order_id)
+                    let now = now_ns();
+                    // Always resolve permissively (place + amend) so
+                    // the trader's modify call never timeouts on
+                    // amends where IBKR doesn't emit a matching-price
+                    // OpenOrder. The "honest" amend ack is observed
+                    // separately below.
+                    s.wire_ack_ns.entry(order_id).or_insert(now);
+                    // Honest amend RTT instrumentation: if this
+                    // OpenOrder has a matching expected price, stamp
+                    // strict_ack_ns. Lives outside PendingAck (in
+                    // `expected_amend_prices`) so we can still stamp
+                    // even after the permissive resolver has removed
+                    // the PendingAck on an earlier non-matching
+                    // OpenOrder. Drained by handle_modify post-ack
+                    // to compute the dashboard's amend metric
+                    // independent of the resolution path.
+                    if let Some(&expected) = s.expected_amend_prices.get(&order_id) {
+                        if (lmt_price - expected).abs() < AMEND_PRICE_EPS {
+                            s.strict_ack_ns.entry(order_id).or_insert(now);
+                        }
+                    }
+                    s.pending_place_acks.remove(&order_id).map(|p| p.tx)
                 };
                 if let Some(tx) = ack {
                     // Resolve to Ok regardless of native_to_open_order
@@ -436,13 +501,14 @@ impl NativeBroker {
                     parsed_status,
                     OrderStatus::Submitted
                         | OrderStatus::PendingSubmit  // PreSubmitted = IBKR
-                            // accepted the message (place or amend); for
-                            // place_ack semantics this is sufficient
-                            // confirmation. Without including this, every
-                            // amend hit the 2s timeout because IBKR's
-                            // first response is PreSubmitted and we
-                            // never see Submitted on a re-amend that
-                            // didn't transition state.
+                            // gateway accepted the message — used for
+                            // PLACE acks only. Amend acks ignore
+                            // OrderStatus and gate on OpenOrder with
+                            // matching lmt_price (see OpenOrder branch
+                            // + PendingAck doc). PreSubmitted from
+                            // local Gateway lands in microseconds
+                            // before IBKR's server has actually applied
+                            // the amend, which under-reports amend RTT.
                         | OrderStatus::Filled
                         | OrderStatus::Cancelled
                         | OrderStatus::PendingCancel
@@ -461,10 +527,14 @@ impl NativeBroker {
                     // entries; build_chain_payload + cancel_all_resting
                     // already filter on status so the bloat is
                     // cosmetic. Cleanup belongs in a periodic GC.
-                    // v2 wire-timing — first ack signal lands here
-                    // when OrderStatus precedes OpenOrder.
+                    //
+                    // Permissive resolver: any accept-state signal
+                    // resolves the waiter (place AND amend). Honest
+                    // amend RTT is observed separately via OpenOrder
+                    // matching-price in the OpenOrder branch above
+                    // and surfaced through `strict_ack_ns`.
                     s.wire_ack_ns.entry(o.order_id).or_insert_with(now_ns);
-                    s.pending_place_acks.remove(&o.order_id)
+                    s.pending_place_acks.remove(&o.order_id).map(|p| p.tx)
                 } else {
                     let mut s = state.lock();
                     if let Some(open) = s.open_orders.get_mut(&o.order_id) {
@@ -688,8 +758,8 @@ impl NativeBroker {
                         )));
                     }
                 }
-                if let Some(tx) = to_fail_place {
-                    let _ = tx.send(Err(BrokerError::OrderRejected {
+                if let Some(p) = to_fail_place {
+                    let _ = p.tx.send(Err(BrokerError::OrderRejected {
                         order_id: Some(e.req_id as u64),
                         reason: e.error_string.clone(),
                     }));
@@ -1129,6 +1199,17 @@ impl Broker for NativeBroker {
             .await
             .map_err(Self::map_native_err)?;
 
+        // Spawn the dispatcher BEFORE issuing any user reqs so that
+        // OpenOrderEnd / PositionEnd / AccountDownloadEnd terminators
+        // have a consumer the moment they arrive on the recv channel.
+        // (The mpsc is bounded at 16K — high enough to absorb the
+        // pre-dispatcher startApi burst, but we still don't want to
+        // rely on that capacity for correctness.) The yield_now()
+        // below gives the just-spawned task a chance to actually
+        // start polling before we generate downstream traffic — not
+        // strictly required (tokio drains the channel either way) but
+        // tightens the steady-state where the dispatcher is in the
+        // ready queue when the first reply lands.
         let rx = self
             .rx_holder
             .lock()
@@ -1136,6 +1217,7 @@ impl Broker for NativeBroker {
             .take()
             .ok_or_else(|| BrokerError::Internal("rx already taken".into()))?;
         self.spawn_dispatcher(rx);
+        tokio::task::yield_now().await;
 
         // CLAUDE.md §1: when clientId=0 (FA master client mode),
         // call reqAutoOpenOrders(True) so IBKR forwards OpenOrder /
@@ -1196,8 +1278,8 @@ impl Broker for NativeBroker {
                     )));
                 }
             }
-            for (_, tx) in s.pending_place_acks.drain() {
-                let _ = tx.send(Err(BrokerError::ConnectionLost(
+            for (_, p) in s.pending_place_acks.drain() {
+                let _ = p.tx.send(Err(BrokerError::ConnectionLost(
                     "disconnect during pending place_order ack".into(),
                 )));
             }
@@ -1232,33 +1314,39 @@ impl Broker for NativeBroker {
         // Install a pending place_order waiter BEFORE sending the
         // wire frame so we don't race the dispatcher.
         let (tx, rx) = oneshot::channel::<Result<(), BrokerError>>();
-        {
-            let mut s = self.state.lock();
-            s.pending_place_acks.insert(order_id, tx);
-        }
 
         let params = build_place_params(&req, &self.cfg.account)?;
 
-        // Hot-path: use the pre-encoded contract template if cached.
-        // First place_order for a given InstrumentId pays the encode
-        // cost; subsequent calls memcpy. Saves ~30 µs per call by
-        // skipping the Vec<String> of 14 contract-fixed fields.
+        // Coalesce the three short critical sections (insert ack,
+        // entry-or-build template, stamp send_ns) into ONE lock.
+        // Each individual lock pre-coalesce was sub-microsecond
+        // under parking_lot, but on a contended dispatcher they
+        // were three round-trips per place_order (~1-2 µs of
+        // saved jitter on 10K places/session). The encode cost
+        // for a fresh template lives inside the lock — it's
+        // ~5 µs once per instrument and amortizes to nothing.
+        // No `.await` inside — parking_lot::Mutex is not
+        // .await-safe and we never need to be.
         let frame = {
             let mut s = self.state.lock();
-            let template = s.place_templates
+            s.pending_place_acks.insert(order_id, PendingAck { tx });
+            let template = s
+                .place_templates
                 .entry(req.contract.instrument_id)
                 .or_insert_with(|| {
                     let cr = place_order_contract_request(&req.contract);
                     crate::place_template::ContractTemplate::from_contract(&cr)
                 });
-            crate::place_template::place_order_fast(order_id, template, &params)
-        };
-        // v2 wire-timing — stamp send_ns immediately before the TCP
-        // write. Pairs with ack_ns set in route() on OpenOrder/OrderStatus.
-        {
-            let mut s = self.state.lock();
+            // Build the wire frame against a *borrow* of the cached
+            // template — no clone, no extra allocation beyond the
+            // returned Vec<u8>.
+            let frame = crate::place_template::place_order_fast(order_id, template, &params);
+            // v2 wire-timing — stamp send_ns immediately, inside
+            // the same critical section. Pairs with ack_ns set in
+            // route() on OpenOrder/OrderStatus.
             s.wire_send_ns.insert(order_id, now_ns());
-        }
+            frame
+        };
         if let Err(e) = self.client.send_raw(&frame).await {
             // Send failed; clean up waiter.
             let mut s = self.state.lock();
@@ -1290,10 +1378,18 @@ impl Broker for NativeBroker {
                 // prevent slow leak of timing entries on chronic
                 // timeout (each leaked entry = ~24B; over months of
                 // FUT-ack issues this would build up).
+                //
+                // Audit (2026-05-05): place_order doesn't seed
+                // expected_amend_prices / strict_ack_ns (those are
+                // amend-side maps), but we drain them defensively in
+                // case a stale entry from a prior modify on the same
+                // orderId was orphaned by an earlier failure path.
                 let mut s = self.state.lock();
                 s.pending_place_acks.remove(&order_id);
                 s.wire_send_ns.remove(&order_id);
                 s.wire_ack_ns.remove(&order_id);
+                s.expected_amend_prices.remove(&order_id);
+                s.strict_ack_ns.remove(&order_id);
                 drop(s);
                 Err(BrokerError::Protocol {
                     code: None,
@@ -1321,6 +1417,20 @@ impl Broker for NativeBroker {
         let send = s.wire_send_ns.remove(&(order_id as i32))?;
         let ack = s.wire_ack_ns.remove(&(order_id as i32))?;
         Some((send, ack))
+    }
+
+    /// Honest amend RTT timestamp. Returns the wall-clock ns at
+    /// which the dispatcher observed an OpenOrder whose lmt_price
+    /// matched the modify request — i.e. when IBKR's server has
+    /// applied the price change. Returns None if no matching
+    /// OpenOrder was observed for this orderId (same-price refresh,
+    /// IBKR edge cases, or the modify hadn't completed yet).
+    /// Clears both `strict_ack_ns` and `expected_amend_prices`
+    /// for this orderId so the maps don't grow unbounded.
+    fn drain_strict_amend_ack_ns(&self, order_id: u64) -> Option<u64> {
+        let mut s = self.state.lock();
+        s.expected_amend_prices.remove(&(order_id as i32));
+        s.strict_ack_ns.remove(&(order_id as i32))
     }
 
     // Fast-path modify: uses the pre-encoded ContractTemplate cache
@@ -1379,18 +1489,37 @@ impl Broker for NativeBroker {
             frame.len(),
         );
 
-        // Pattern mirrors place_order — install a per-orderId waiter
-        // BEFORE the wire send so the route() handler can signal back
-        // when IBKR's OpenOrder/OrderStatus reply for this amend
-        // arrives. Without this, handle_modify's drain_wire_timing
-        // returned None (ack hadn't landed yet) and amend_us
-        // collapsed to ~50µs of local encode latency rather than the
-        // true round trip. Same 2s timeout as place_order.
+        // Permissive resolver path (functional). The dispatcher
+        // resolves on any accept-state OrderStatus or OpenOrder for
+        // this orderId. amend_us via this path is phantom-fast for
+        // price-change amends because PreSubmitted is the IB
+        // Gateway's local echo, not a server-confirmed price update.
+        //
+        // To recover an honest server-side amend RTT, the dispatcher
+        // ALSO observes OpenOrder-with-matching-price separately and
+        // records its arrival timestamp in `strict_ack_ns`. That
+        // observation does NOT affect the channel resolution (the
+        // permissive path remains the functional ack path). After
+        // modify_order returns, callers can drain `strict_ack_ns`
+        // alongside `wire_send_ns`/`wire_ack_ns` to compute the
+        // honest amend RTT for the dashboard.
+        //
+        // `expected_amend_price` is set so the dispatcher knows what
+        // to compare incoming OpenOrder.lmt_price against. The
+        // resolver itself ignores the field (returns true for both
+        // None and Some) — gating logic is moved into the per-signal
+        // observation in the dispatcher.
+        let expected_amend_price = placeholder.price.unwrap_or(0.0);
         let (tx, rx) = oneshot::channel::<Result<(), BrokerError>>();
         {
             let mut s = self.state.lock();
-            s.pending_place_acks.insert(id.0 as i32, tx);
+            s.pending_place_acks.insert(id.0 as i32, PendingAck { tx });
             s.wire_send_ns.insert(id.0 as i32, now_ns());
+            // Seed expected_amend_prices so the dispatcher can
+            // continue stamping strict_ack_ns even after the
+            // permissive resolver removes the PendingAck. Cleared
+            // by drain_strict_amend_timing.
+            s.expected_amend_prices.insert(id.0 as i32, expected_amend_price);
         }
         if let Err(e) = self.client.send_raw(&frame).await {
             let mut s = self.state.lock();
@@ -1399,6 +1528,11 @@ impl Broker for NativeBroker {
             return Err(Self::map_native_err(e));
         }
 
+        // Permissive 2s wait — same shape as place_order. The
+        // dispatcher resolves on any accept-state signal. The honest
+        // amend RTT (if any) is observed separately by the
+        // dispatcher via `strict_ack_ns` and exposed through
+        // `drain_strict_amend_us`.
         match tokio::time::timeout(Duration::from_secs(2), rx).await {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(broker_err))) => Err(broker_err),
@@ -1406,10 +1540,17 @@ impl Broker for NativeBroker {
                 "modify_order ack channel dropped".into(),
             )),
             Err(_elapsed) => {
+                // Drain ALL maps the modify path seeds.
+                // expected_amend_prices and strict_ack_ns were leaking
+                // pre-fix; the ConstraintChecker-style amend-RTT
+                // dashboard reads them via drain_strict_amend_ack_ns,
+                // but on timeout the caller doesn't reach that drain.
                 let mut s = self.state.lock();
                 s.pending_place_acks.remove(&(id.0 as i32));
                 s.wire_send_ns.remove(&(id.0 as i32));
                 s.wire_ack_ns.remove(&(id.0 as i32));
+                s.expected_amend_prices.remove(&(id.0 as i32));
+                s.strict_ack_ns.remove(&(id.0 as i32));
                 Err(BrokerError::Protocol {
                     code: None,
                     message: format!("modify_order ack timeout (orderId={})", id.0),

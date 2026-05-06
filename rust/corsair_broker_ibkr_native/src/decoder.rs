@@ -165,6 +165,9 @@ fn parse_market_depth(fields: &[String], is_l2: bool) -> Result<InboundMsg, Nati
 /// Server >= 173: tickOptionComputation has an attrib field after
 /// tickType. Layout: `[21, reqId, tickType, attrib, iv, delta,
 /// optPrice, pvDividend, gamma, vega, theta, undPrice]`.
+///
+/// VERIFY: field offsets vs ib_insync `wrapper.tickOptionComputation`
+/// — covered by `parse_tick_option_computation_basic` in tests.
 fn parse_tick_option_computation(fields: &[String]) -> Result<InboundMsg, NativeError> {
     if fields.len() < 12 {
         return Err(NativeError::Malformed(format!(
@@ -210,6 +213,11 @@ fn parse_order_status(fields: &[String]) -> Result<InboundMsg, NativeError> {
 }
 
 /// `[4, version, reqId, errorCode, errorString, advancedOrderRejectJson?]`
+///
+/// VERIFY: field offsets vs ib_insync `wrapper.error` —
+/// errMsg always retains the version field on every API version
+/// we negotiate (≤176). Covered by `parse_error_basic` and
+/// `parse_error_advanced_order_reject_json` in tests.
 fn parse_error(fields: &[String]) -> Result<InboundMsg, NativeError> {
     if fields.len() < 5 {
         return Err(NativeError::Malformed(format!(
@@ -278,7 +286,12 @@ fn parse_position(fields: &[String]) -> Result<InboundMsg, NativeError> {
 ///   tradingClass, conId, minTick, mdSizeMultiplier, multiplier,
 ///   ...many more...]`
 fn parse_contract_details(fields: &[String]) -> Result<InboundMsg, NativeError> {
-    if fields.len() < 13 {
+    // Bumped 13→16 to cover the multiplier slot at fields[15] that
+    // we read below. Without this, a truncated contractDetails
+    // (rare but possible on partially-permissioned products) would
+    // pass the gate and then silently default-empty the multiplier
+    // via .get().unwrap_or_default(); fail loud instead.
+    if fields.len() < 16 {
         return Err(NativeError::Malformed(format!(
             "contractDetails fields={}", fields.len()
         )));
@@ -573,6 +586,55 @@ mod tests {
                 assert_eq!(o.order_id, 42);
                 assert_eq!(o.status, "Submitted");
                 assert_eq!(o.remaining, 1.0);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_tick_option_computation_basic() {
+        // Server >= 173 layout: [21, reqId, tickType, attrib, iv,
+        //   delta, optPrice, pvDividend, gamma, vega, theta, undPrice].
+        // Cross-checked against ib_insync's wrapper.tickOptionComputation
+        // decoder reference (no version field on this msg type).
+        let f = fields(&[
+            "21", "1001", "13", "0", "0.42", "-0.31", "0.0125",
+            "0.001", "0.012", "0.05", "-0.02", "6.05",
+        ]);
+        let m = parse_inbound(&f).unwrap();
+        match m {
+            InboundMsg::TickOptionComputation(t) => {
+                assert_eq!(t.req_id, 1001);
+                assert_eq!(t.tick_type, 13);
+                assert!((t.implied_vol - 0.42).abs() < 1e-9);
+                assert!((t.delta - -0.31).abs() < 1e-9);
+                assert!((t.gamma - 0.012).abs() < 1e-9);
+                assert!((t.vega - 0.05).abs() < 1e-9);
+                assert!((t.theta - -0.02).abs() < 1e-9);
+                assert!((t.und_price - 6.05).abs() < 1e-9);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parse_error_advanced_order_reject_json() {
+        // VERIFY: field offsets vs ib_insync — errMsg always carries
+        // a version field on all wire-protocol versions we speak (we
+        // hold MAX_CLIENT_VERSION at 176; ib_insync's errMsg decoder
+        // has not changed shape).
+        let f = fields(&[
+            "4", "2", "42", "201",
+            "Order rejected — insufficient margin",
+            "{\"reason\":\"margin\"}",
+        ]);
+        let m = parse_inbound(&f).unwrap();
+        match m {
+            InboundMsg::Error(e) => {
+                assert_eq!(e.req_id, 42);
+                assert_eq!(e.error_code, 201);
+                assert!(e.error_string.contains("rejected"));
+                assert!(e.advanced_order_reject_json.contains("margin"));
             }
             _ => panic!("wrong variant"),
         }

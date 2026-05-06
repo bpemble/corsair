@@ -7,13 +7,24 @@ use serde::{Deserialize, Serialize};
 pub enum KillType {
     /// Cancel resting quotes, no flatten. Default for halt-style kills.
     Halt,
-    /// Cancel quotes + flatten options + flatten hedge.
+    /// Cancel quotes + flatten options + flatten hedge. Audit T3-13:
+    /// not constructed in Rust today — operator overrides (CLAUDE.md
+    /// §7, §8) replaced flatten with halt for both margin and daily-
+    /// halt kills. Variant retained (a) for spec parity, (b) so
+    /// induced-kill sentinels can drive a flatten path without an
+    /// API break, and (c) for serialization forward-compat.
     Flatten,
     /// Cancel quotes + force hedge to 0 (no options flatten). Delta kill.
     HedgeFlat,
 }
 
 /// Source category — governs auto-clear rules.
+///
+/// Audit T3-12: `Reconciliation` and `ExceptionStorm` variants were
+/// inherited from the Python taxonomy but are never constructed in
+/// the Rust runtime — there's no exception-storm or reconcile-fail
+/// kill path on this side. Removed to keep `label()` and the
+/// snapshot's `source` field tied to actually-reachable states.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KillSource {
     /// Sticky risk-source kill. Requires manual review + restart.
@@ -22,10 +33,6 @@ pub enum KillSource {
     Disconnect,
     /// Auto-clears at next CME session rollover.
     DailyHalt,
-    /// Sticky.
-    Reconciliation,
-    /// Sticky.
-    ExceptionStorm,
     /// Sticky (SABR RMSE, latency, abnormal fill rate).
     Operational,
     /// Boot-self-test sentinel kill. Inner carries the underlying
@@ -52,8 +59,6 @@ impl KillSource {
             KillSource::Risk => "risk".into(),
             KillSource::Disconnect => "disconnect".into(),
             KillSource::DailyHalt => "daily_halt".into(),
-            KillSource::Reconciliation => "reconciliation".into(),
-            KillSource::ExceptionStorm => "exception_storm".into(),
             KillSource::Operational => "operational".into(),
             KillSource::Induced(inner) => format!("induced_{}", inner.label()),
         }

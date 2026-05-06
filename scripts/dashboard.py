@@ -32,10 +32,10 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 # Discover product snapshots via filename convention. Each product writes
-# data/<name>_chain_snapshot.json (see src/config.py:88). Dashboard shows
-# one tab per discovered file. ETH was wound down 2026-04-18; if re-enabled
-# later, update its snapshot_path override in corsair_v2_config.yaml so the
-# file matches the convention.
+# data/<name>_chain_snapshot.json (see the Rust snapshot publisher in
+# rust/corsair_snapshot/). Dashboard shows one tab per discovered file.
+# ETH was wound down 2026-04-18; if re-enabled later, ensure its snapshot
+# path follows the same convention.
 def _discover_products():
     """Return list of (name, snapshot_path) tuples for all products."""
     products = []

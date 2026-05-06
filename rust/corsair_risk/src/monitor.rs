@@ -5,12 +5,48 @@
 //! [`check_daily_pnl_only`] on every fill. The runtime acts on kill
 //! events emitted via the returned [`RiskCheckOutcome`].
 
+use corsair_hedge::{HedgeFanout, HedgeMode};
 use corsair_position::{MarketView, PortfolioState};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::kill::{KillEvent, KillSource, KillType};
 use crate::sentinel::{sentinel_dir, INDUCED_SENTINELS};
+
+/// Sum hedge MTM + realized across managers using the hedge contract's
+/// own mark when available, falling back to the options underlying.
+/// Mirrors `corsair_snapshot::publisher::resolve_hedge_mark` so the
+/// kill switch sees the same number the dashboard does.
+///
+/// This exists in `corsair_risk` because both the snapshot and the
+/// risk monitor need the same hedge-aware P&L formula; duplicating
+/// avoids a circular crate dep (snapshot depends on risk).
+fn hedge_pnl(hedge: &HedgeFanout, market: &dyn MarketView) -> (f64, f64) {
+    let mut mtm = 0.0;
+    let mut realized = 0.0;
+    for m in hedge.managers() {
+        let cfg = m.config();
+        // Audit T3-17: skip Observe-mode managers in the daily-halt
+        // hedge_pnl sum. Observe-mode optimistically updates
+        // hedge_qty + realized_pnl_usd as if trades filled at F, but
+        // no real order was sent — folding that synthetic P&L into
+        // the daily halt threshold means a "successful" observe-mode
+        // shadow could fire (or suppress) the kill on a number that
+        // doesn't reflect the real book. Execute-mode managers are
+        // included; their state is fed by `apply_broker_fill` from
+        // the broker's exec stream.
+        if cfg.mode == HedgeMode::Observe {
+            continue;
+        }
+        let f = market
+            .hedge_underlying_price(&cfg.product)
+            .or_else(|| market.underlying_price(&cfg.product))
+            .unwrap_or(0.0);
+        mtm += m.mtm_usd(f);
+        realized += m.state().realized_pnl_usd;
+    }
+    (mtm, realized)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskConfig {
@@ -38,6 +74,15 @@ impl RiskConfig {
     /// or absolute max_daily_loss. Mirrors
     /// `_resolve_daily_halt_threshold` in Python. Returns None if
     /// neither is configured.
+    ///
+    /// Sign convention: callers should pass `max_daily_loss` as a
+    /// NEGATIVE number (it represents a P&L floor). Audit T1-6: prior
+    /// behavior silently dropped positive values to None — config
+    /// typos that wrote "+2500" instead of "-2500" disabled the
+    /// PRIMARY v1.4 defense without any operator warning. Now
+    /// positives are accepted with a loud WARN and negated, matching
+    /// likely operator intent. If you genuinely want the halt
+    /// disabled, omit the field (pass None).
     pub fn resolve_daily_halt_threshold(
         daily_pnl_halt_pct: Option<f64>,
         max_daily_loss: Option<f64>,
@@ -52,6 +97,17 @@ impl RiskConfig {
             if abs < 0.0 {
                 return Some(abs);
             }
+            if abs > 0.0 {
+                log::warn!(
+                    "max_daily_loss configured as positive value ${abs:.0} — \
+                     interpreting as ${neg:.0} (P&L floor). Set explicitly negative \
+                     to silence this warning.",
+                    neg = -abs
+                );
+                return Some(-abs);
+            }
+            // abs == 0: leave halt disabled and let the `new()` path
+            // log the CRITICAL "halt disabled" message.
         }
         None
     }
@@ -121,6 +177,18 @@ impl RiskMonitor {
     /// PortfolioState aggregates + hedge_qty when effective gating
     /// is on). Pass options-only values when `effective_delta_gating`
     /// is false.
+    ///
+    /// `hedge_qty_in_worst_delta` is the hedge contract count that the
+    /// caller folded into `worst_delta`. When `hedge_fresh` is false,
+    /// this monitor SUBTRACTS that contribution before evaluating the
+    /// delta kill (CLAUDE.md §14 fail-closed). Set to 0.0 when the
+    /// caller already passed options-only worst_delta.
+    ///
+    /// `hedge` is the multi-product fanout. The daily P&L halt sums
+    /// `hedge_mtm + hedge_realized` into the kill threshold per
+    /// CLAUDE.md §8 — without this the halt is options-only and lags
+    /// reality whenever a hedge position is open. Pre-2026-05-05 the
+    /// Rust port omitted hedge from the kill calc; this restores it.
     pub fn check(
         &mut self,
         portfolio: &PortfolioState,
@@ -129,6 +197,9 @@ impl RiskMonitor {
         worst_theta: f64,
         worst_vega: f64,
         market: &dyn MarketView,
+        hedge: &HedgeFanout,
+        hedge_qty_in_worst_delta: f64,
+        hedge_fresh: bool,
     ) -> RiskCheckOutcome {
         if let Some(ref e) = self.killed {
             return RiskCheckOutcome::AlreadyKilled(e.clone());
@@ -156,12 +227,27 @@ impl RiskMonitor {
             return self.fire(ev);
         }
 
-        // Delta kill (CLAUDE.md §6.2)
-        if worst_delta.abs() > self.cfg.delta_kill {
+        // Delta kill (CLAUDE.md §6.2). If hedge state is STALE per
+        // CLAUDE.md §14, we don't trust hedge_qty as a delta offset:
+        // strip it back out and evaluate options-only. WARN is emitted
+        // by the caller (or the constraint checker) — the kill itself
+        // is a one-shot event, not an ongoing log target.
+        let effective_worst_delta = if !hedge_fresh && hedge_qty_in_worst_delta != 0.0 {
+            worst_delta - hedge_qty_in_worst_delta
+        } else {
+            worst_delta
+        };
+        if effective_worst_delta.abs() > self.cfg.delta_kill {
             let ev = KillEvent {
                 reason: format!(
-                    "DELTA KILL: {:+.2} > ±{:.1}",
-                    worst_delta, self.cfg.delta_kill
+                    "DELTA KILL: {:+.2} > ±{:.1}{}",
+                    effective_worst_delta,
+                    self.cfg.delta_kill,
+                    if !hedge_fresh && hedge_qty_in_worst_delta != 0.0 {
+                        " [hedge_stale: options-only]"
+                    } else {
+                        ""
+                    }
                 ),
                 source: KillSource::Risk,
                 kill_type: KillType::HedgeFlat,
@@ -200,15 +286,31 @@ impl RiskMonitor {
 
         // Daily P&L halt — primary v1.4 defense. Operator-override
         // kill_type=Halt (positions preserved).
+        //
+        // Components: realized_persisted (closed-leg accounting) +
+        // options open MTM + hedge open MTM + hedge realized. Matches
+        // the snapshot's daily_pnl emission so dashboard and kill
+        // operate on the same number.
         if let Some(threshold) = self.cfg.daily_halt_threshold {
-            let mtm = portfolio.compute_mtm_pnl(market);
-            let daily = portfolio.realized_pnl_persisted + mtm;
+            let options_mtm = portfolio.compute_mtm_pnl(market);
+            let (hedge_mtm, hedge_realized) = hedge_pnl(hedge, market);
+            let daily = portfolio.realized_pnl_persisted
+                + options_mtm
+                + hedge_mtm
+                + hedge_realized;
             if daily < threshold {
                 let pct = (threshold.abs() / cap) * 100.0;
                 let ev = KillEvent {
                     reason: format!(
-                        "DAILY P&L HALT: ${:.0} < ${:.0} (-{:.1}% cap)",
-                        daily, threshold, pct
+                        "DAILY P&L HALT: ${:.0} < ${:.0} (-{:.1}% cap) \
+                         [opts_mtm=${:.0} hedge_mtm=${:.0} hedge_real=${:.0} realized=${:.0}]",
+                        daily,
+                        threshold,
+                        pct,
+                        options_mtm,
+                        hedge_mtm,
+                        hedge_realized,
+                        portfolio.realized_pnl_persisted
                     ),
                     source: KillSource::DailyHalt,
                     kill_type: KillType::Halt,
@@ -238,6 +340,7 @@ impl RiskMonitor {
         &mut self,
         portfolio: &PortfolioState,
         market: &dyn MarketView,
+        hedge: &HedgeFanout,
     ) -> RiskCheckOutcome {
         if self.killed.is_some() {
             return RiskCheckOutcome::AlreadyKilled(self.killed.clone().unwrap());
@@ -246,14 +349,25 @@ impl RiskMonitor {
             Some(t) => t,
             None => return RiskCheckOutcome::Healthy,
         };
-        let mtm = portfolio.compute_mtm_pnl(market);
-        let daily = portfolio.realized_pnl_persisted + mtm;
+        let options_mtm = portfolio.compute_mtm_pnl(market);
+        let (hedge_mtm, hedge_realized) = hedge_pnl(hedge, market);
+        let daily = portfolio.realized_pnl_persisted
+            + options_mtm
+            + hedge_mtm
+            + hedge_realized;
         if daily < threshold {
             let pct = (threshold.abs() / self.cfg.capital) * 100.0;
             let ev = KillEvent {
                 reason: format!(
-                    "DAILY P&L HALT (fill-path): ${:.0} < ${:.0} (-{:.1}% cap)",
-                    daily, threshold, pct
+                    "DAILY P&L HALT (fill-path): ${:.0} < ${:.0} (-{:.1}% cap) \
+                     [opts_mtm=${:.0} hedge_mtm=${:.0} hedge_real=${:.0} realized=${:.0}]",
+                    daily,
+                    threshold,
+                    pct,
+                    options_mtm,
+                    hedge_mtm,
+                    hedge_realized,
+                    portfolio.realized_pnl_persisted
                 ),
                 source: KillSource::DailyHalt,
                 kill_type: KillType::Halt,
@@ -275,15 +389,37 @@ impl RiskMonitor {
     /// hedge_qty). Hedge state is read by the caller because the risk
     /// monitor doesn't own a HedgeFanout reference and we want the
     /// gate to operate on the same metric the trader self-blocks on.
-    pub fn check_per_fill_delta(&mut self, effective_delta: f64) -> RiskCheckOutcome {
+    ///
+    /// `hedge_qty_included` is the hedge contract count folded into
+    /// `effective_delta`. When `hedge_fresh` is false, this method
+    /// strips that contribution before testing the kill threshold
+    /// (CLAUDE.md §14 fail-closed). Pass 0.0/true for options-only
+    /// callers.
+    pub fn check_per_fill_delta(
+        &mut self,
+        effective_delta: f64,
+        hedge_qty_included: f64,
+        hedge_fresh: bool,
+    ) -> RiskCheckOutcome {
         if self.killed.is_some() {
             return RiskCheckOutcome::AlreadyKilled(self.killed.clone().unwrap());
         }
-        if effective_delta.abs() > self.cfg.delta_kill {
+        let evaluated = if !hedge_fresh && hedge_qty_included != 0.0 {
+            effective_delta - hedge_qty_included
+        } else {
+            effective_delta
+        };
+        if evaluated.abs() > self.cfg.delta_kill {
             let ev = KillEvent {
                 reason: format!(
-                    "DELTA KILL (fill-path): {:+.2} > ±{:.1}",
-                    effective_delta, self.cfg.delta_kill
+                    "DELTA KILL (fill-path): {:+.2} > ±{:.1}{}",
+                    evaluated,
+                    self.cfg.delta_kill,
+                    if !hedge_fresh && hedge_qty_included != 0.0 {
+                        " [hedge_stale: options-only]"
+                    } else {
+                        ""
+                    }
                 ),
                 source: KillSource::Risk,
                 kill_type: KillType::HedgeFlat,
@@ -402,7 +538,17 @@ mod tests {
     use std::env;
     use tempfile::TempDir;
 
+    fn empty_fanout() -> HedgeFanout {
+        HedgeFanout::new(vec![])
+    }
+
     fn cfg_for_test() -> RiskConfig {
+        // NOTE: vega_kill is enabled (1000.0) here so the vega-kill
+        // tests exercise the threshold path. Production runs with
+        // vega_kill=0 (DISABLED) per CLAUDE.md §13 — the Alabaster
+        // characterization showed vega is a choke not a tail backstop
+        // on HG. Don't copy 1000 into the live config without
+        // re-characterizing.
         RiskConfig {
             capital: 200_000.0,
             margin_kill_pct: 0.70,
@@ -459,13 +605,28 @@ mod tests {
         assert!(t.is_none());
     }
 
+    #[test]
+    fn resolve_threshold_negates_positive_max_daily_loss() {
+        // Audit T1-6: prior behavior silently dropped positive values.
+        // New behavior accepts and negates with WARN, so a typo'd
+        // "+2500" still arms the halt at -$2500.
+        let t = RiskConfig::resolve_daily_halt_threshold(None, Some(2_500.0), 200_000.0);
+        assert_eq!(t, Some(-2_500.0));
+    }
+
+    #[test]
+    fn resolve_threshold_zero_max_daily_loss_is_disabled() {
+        let t = RiskConfig::resolve_daily_halt_threshold(None, Some(0.0), 200_000.0);
+        assert!(t.is_none());
+    }
+
     // ── Kill firing ────────────────────────────────────────────
 
     #[test]
     fn margin_kill_fires_above_threshold() {
         let mut m = RiskMonitor::new(cfg_for_test());
         let p = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&p, 150_000.0, 0.0, 0.0, 0.0, &NoOpMarketView);
+        let outcome = m.check(&p, 150_000.0, 0.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
         match outcome {
             RiskCheckOutcome::Killed(ev) => {
                 assert!(ev.reason.contains("MARGIN KILL"));
@@ -480,7 +641,7 @@ mod tests {
     fn margin_kill_does_not_fire_below_threshold() {
         let mut m = RiskMonitor::new(cfg_for_test());
         let p = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&p, 100_000.0, 0.0, 0.0, 0.0, &NoOpMarketView);
+        let outcome = m.check(&p, 100_000.0, 0.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
         matches!(outcome, RiskCheckOutcome::Healthy);
     }
 
@@ -488,7 +649,7 @@ mod tests {
     fn delta_kill_fires() {
         let mut m = RiskMonitor::new(cfg_for_test());
         let p = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&p, 0.0, 5.5, 0.0, 0.0, &NoOpMarketView);
+        let outcome = m.check(&p, 0.0, 5.5, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
         match outcome {
             RiskCheckOutcome::Killed(ev) => {
                 assert!(ev.reason.contains("DELTA KILL"));
@@ -502,7 +663,7 @@ mod tests {
     fn vega_kill_fires_when_threshold_set() {
         let mut m = RiskMonitor::new(cfg_for_test());
         let p = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&p, 0.0, 0.0, 0.0, 1_500.0, &NoOpMarketView);
+        let outcome = m.check(&p, 0.0, 0.0, 0.0, 1_500.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
         matches!(outcome, RiskCheckOutcome::Killed(_));
     }
 
@@ -512,7 +673,7 @@ mod tests {
         cfg.vega_kill = 0.0;
         let mut m = RiskMonitor::new(cfg);
         let p = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&p, 0.0, 0.0, 0.0, 99_999.0, &NoOpMarketView);
+        let outcome = m.check(&p, 0.0, 0.0, 0.0, 99_999.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
         matches!(outcome, RiskCheckOutcome::Healthy);
     }
 
@@ -520,7 +681,7 @@ mod tests {
     fn theta_kill_fires() {
         let mut m = RiskMonitor::new(cfg_for_test());
         let p = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&p, 0.0, 0.0, -250.0, 0.0, &NoOpMarketView);
+        let outcome = m.check(&p, 0.0, 0.0, -250.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
         matches!(outcome, RiskCheckOutcome::Killed(_));
     }
 
@@ -530,7 +691,7 @@ mod tests {
     fn daily_halt_fires_on_realized_breach() {
         let mut m = RiskMonitor::new(cfg_for_test());
         let p = portfolio_with_pnl(-3_000.0, 0.0);
-        let outcome = m.check(&p, 0.0, 0.0, 0.0, 0.0, &NoOpMarketView);
+        let outcome = m.check(&p, 0.0, 0.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
         match outcome {
             RiskCheckOutcome::Killed(ev) => {
                 assert!(ev.reason.contains("DAILY P&L HALT"));
@@ -540,11 +701,54 @@ mod tests {
         }
     }
 
+    // ── Stale-hedge fail-closed (CLAUDE.md §14) ────────────────
+
+    #[test]
+    fn delta_kill_strips_hedge_when_stale() {
+        // Caller pre-combined options=4 + hedge=-3 → worst_delta=+1
+        // (within delta_kill 5.0). With hedge_fresh=false the monitor
+        // strips out the -3 hedge contribution → effective=+4 (still
+        // within delta_kill), so no kill.
+        let mut m = RiskMonitor::new(cfg_for_test());
+        let p = portfolio_with_pnl(0.0, 0.0);
+        let outcome = m.check(&p, 0.0, 1.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), -3.0, false);
+        matches!(outcome, RiskCheckOutcome::Healthy);
+    }
+
+    #[test]
+    fn delta_kill_fires_when_options_only_breaches_after_strip() {
+        // Caller pre-combined options=+8 + hedge=-4 → worst_delta=+4
+        // (under delta_kill 5.0). With hedge stale, strip → +8 →
+        // breach → kill.
+        let mut m = RiskMonitor::new(cfg_for_test());
+        let p = portfolio_with_pnl(0.0, 0.0);
+        let outcome = m.check(&p, 0.0, 4.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), -4.0, false);
+        match outcome {
+            RiskCheckOutcome::Killed(ev) => {
+                assert!(ev.reason.contains("DELTA KILL"));
+                assert!(ev.reason.contains("hedge_stale"));
+            }
+            other => panic!("expected delta kill on stripped delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_per_fill_delta_strips_hedge_when_stale() {
+        let mut m = RiskMonitor::new(cfg_for_test());
+        // effective=+1 (5.0 − 4 hedge); strip → +5 → still under 5.0,
+        // so no kill (boundary case).
+        let outcome = m.check_per_fill_delta(1.0, -4.0, false);
+        matches!(outcome, RiskCheckOutcome::Healthy);
+        // effective=+2 (6.5 − 4.5 hedge); strip → +6.5 → kill.
+        let outcome = m.check_per_fill_delta(2.0, -4.5, false);
+        matches!(outcome, RiskCheckOutcome::Killed(_));
+    }
+
     #[test]
     fn check_daily_pnl_only_fires_on_breach() {
         let mut m = RiskMonitor::new(cfg_for_test());
         let p = portfolio_with_pnl(-3_000.0, 0.0);
-        let outcome = m.check_daily_pnl_only(&p, &NoOpMarketView);
+        let outcome = m.check_daily_pnl_only(&p, &NoOpMarketView, &empty_fanout());
         matches!(outcome, RiskCheckOutcome::Killed(_));
         assert!(m.is_killed());
     }
@@ -556,7 +760,7 @@ mod tests {
         let mut m = RiskMonitor::new(cfg);
         let mut p = portfolio_with_pnl(-99_999_999.0, 0.0);
         p.realized_pnl_persisted = -99_999_999.0;
-        let outcome = m.check_daily_pnl_only(&p, &NoOpMarketView);
+        let outcome = m.check_daily_pnl_only(&p, &NoOpMarketView, &empty_fanout());
         matches!(outcome, RiskCheckOutcome::Healthy);
         assert!(!m.is_killed());
     }
@@ -567,8 +771,8 @@ mod tests {
     fn risk_kill_is_sticky() {
         let mut m = RiskMonitor::new(cfg_for_test());
         let p = portfolio_with_pnl(0.0, 0.0);
-        m.check(&p, 0.0, 5.5, 0.0, 0.0, &NoOpMarketView); // delta kill
-        let outcome = m.check(&p, 0.0, 0.0, 0.0, 0.0, &NoOpMarketView); // would be healthy
+        m.check(&p, 0.0, 5.5, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true); // delta kill
+        let outcome = m.check(&p, 0.0, 0.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true); // would be healthy
         matches!(outcome, RiskCheckOutcome::AlreadyKilled(_));
     }
 
@@ -637,7 +841,7 @@ mod tests {
         std::fs::write(&p, "test").unwrap();
         let mut m = RiskMonitor::new(cfg_for_test());
         let pf = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&pf, 0.0, 0.0, 0.0, 0.0, &NoOpMarketView);
+        let outcome = m.check(&pf, 0.0, 0.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
         match outcome {
             RiskCheckOutcome::Killed(ev) => {
                 assert!(ev.reason.contains("INDUCED TEST"));
@@ -679,7 +883,74 @@ mod tests {
         // Realized=0; MTM = (-0.075 - 0.025) * 1 * 25000 = -2500
         // → exactly at threshold (-2500). Need slightly below.
         p.realized_pnl_persisted = -100.0;
-        let outcome = m.check_daily_pnl_only(&p, &view);
+        let outcome = m.check_daily_pnl_only(&p, &view, &empty_fanout());
         matches!(outcome, RiskCheckOutcome::Killed(_));
+    }
+
+    // ── Hedge-aware daily P&L ────────────────────────────────────
+
+    #[test]
+    fn daily_halt_includes_hedge_mtm() {
+        // Options book is healthy (no realized, no open MTM), but a
+        // long hedge entered at 5.99 marks against 5.85 — −$3,500
+        // hedge MTM, well past the −$2,500 threshold. Pre-fix this
+        // would have been ignored (options-only daily P&L); post-fix
+        // the kill must fire.
+        use corsair_hedge::{HedgeConfig, HedgeManager, HedgeMode};
+        let mut m = RiskMonitor::new(cfg_for_test());
+        let p = portfolio_with_pnl(0.0, 0.0);
+        let mut hm = HedgeManager::new(HedgeConfig {
+            product: "HG".into(),
+            multiplier: 25_000.0,
+            mode: HedgeMode::Execute,
+            tolerance_deltas: 0.5,
+            rebalance_on_fill: true,
+            rebalance_cadence_sec: 30.0,
+            include_in_daily_pnl: true,
+            flatten_on_halt_enabled: true,
+            ioc_tick_offset: 2,
+            hedge_tick_size: 0.0005,
+            lockout_days: 30,
+        });
+        hm.reconcile_with_position(1, 5.99, false);
+        let h = HedgeFanout::new(vec![hm]);
+        let view = RecordingMarketView::new();
+        view.set_underlying("HG", 5.85);
+        view.set_hedge_underlying("HG", 5.85);
+        let outcome = m.check(&p, 0.0, 0.0, 0.0, 0.0, &view, &h, 0.0, true);
+        match outcome {
+            RiskCheckOutcome::Killed(ev) => {
+                assert!(ev.reason.contains("DAILY P&L HALT"));
+                assert!(ev.reason.contains("hedge_mtm"));
+            }
+            other => panic!("expected daily halt with hedge MTM, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daily_halt_fill_path_includes_hedge_mtm() {
+        use corsair_hedge::{HedgeConfig, HedgeManager, HedgeMode};
+        let mut m = RiskMonitor::new(cfg_for_test());
+        let p = portfolio_with_pnl(0.0, 0.0);
+        let mut hm = HedgeManager::new(HedgeConfig {
+            product: "HG".into(),
+            multiplier: 25_000.0,
+            mode: HedgeMode::Execute,
+            tolerance_deltas: 0.5,
+            rebalance_on_fill: true,
+            rebalance_cadence_sec: 30.0,
+            include_in_daily_pnl: true,
+            flatten_on_halt_enabled: true,
+            ioc_tick_offset: 2,
+            hedge_tick_size: 0.0005,
+            lockout_days: 30,
+        });
+        hm.reconcile_with_position(1, 5.99, false);
+        let h = HedgeFanout::new(vec![hm]);
+        let view = RecordingMarketView::new();
+        view.set_hedge_underlying("HG", 5.85);
+        let outcome = m.check_daily_pnl_only(&p, &view, &h);
+        matches!(outcome, RiskCheckOutcome::Killed(_));
+        assert!(m.is_killed());
     }
 }

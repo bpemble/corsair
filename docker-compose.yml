@@ -112,19 +112,17 @@ services:
     command: ["/usr/local/bin/corsair_trader_rust"]
     restart: unless-stopped
 
-  # ── corsair_broker shadow (v3 Phase 5A) ─────────────────────────────
-  # Rust broker daemon running ALONGSIDE the live Python broker for
-  # validation + latency measurement. Profile-gated so it only starts
-  # when explicitly requested:
-  #   docker compose --profile rust-broker up -d corsair-broker-rs
+  # ── corsair-broker-rs (production broker, post-Phase-6.7) ──────────
+  # The Rust broker daemon. After the Phase 6.7 cutover (2026-05-02),
+  # this is the live, only broker — the legacy Python broker was
+  # retired and its service deleted from compose 2026-05-05.
   #
-  # Connects to IBKR with clientId=10 (Python broker uses 0). Reads
-  # config/runtime_v3.yaml. Publishes its snapshot to
-  # data/snapshot_rust.json (separate from Python's hg_chain_snapshot).
+  # Connects to IBKR with clientId=0 (FA master, see CLAUDE.md §1).
+  # Reads config/runtime_v3.yaml. Publishes its snapshot to
+  # data/hg_chain_snapshot.json (consumed by the dashboard).
   #
-  # SHADOW mode (default): no orders placed. Set
-  # CORSAIR_BROKER_SHADOW=0 to flip to live (only after Phase 5B IPC
-  # work lands; otherwise the trader can't talk to it).
+  # CORSAIR_BROKER_SHADOW=0 (default) places live orders via the
+  # trader. Set =1 to run shadow (no orders) for offline experiments.
   corsair-broker-rs:
     # Owns the build for the shared `corsair-corsair` image (used by
     # both broker and trader). After the legacy `corsair` service was

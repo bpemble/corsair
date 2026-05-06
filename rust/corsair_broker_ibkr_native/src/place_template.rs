@@ -282,6 +282,7 @@ fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // parity test deliberately exercises the slow path.
 mod tests {
     use super::*;
     use crate::requests::{place_order, ContractRequest, PlaceOrderParams};

@@ -20,12 +20,15 @@
 //! - `Source::Risk` — sticky; manual review.
 //! - `Source::Disconnect` — cleared by watchdog after reconnect.
 //! - `Source::DailyHalt` — cleared at next CME session rollover.
-//! - `Source::Reconciliation` — sticky.
-//! - `Source::ExceptionStorm` — sticky.
 //! - `Source::Operational` — sticky (SABR RMSE, latency, etc.).
 //! - `Source::Induced(inner)` — boot self-test sentinels; inner
 //!   carries the source we'd be testing. induced_daily_halt
 //!   auto-clears at rollover; others are sticky.
+//!
+//! Audit T3-12: `Reconciliation` and `ExceptionStorm` variants from
+//! the Python taxonomy are not constructed in the Rust runtime and
+//! were removed to keep the source enum aligned with reachable
+//! states.
 
 pub mod kill;
 pub mod monitor;

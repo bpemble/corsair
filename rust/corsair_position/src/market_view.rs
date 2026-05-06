@@ -42,6 +42,20 @@ pub trait MarketView {
         expiry: NaiveDate,
         right: Right,
     ) -> Option<f64>;
+
+    /// Last-tick price for the resolved hedge contract for `product`.
+    /// Distinct from `underlying_price`: the options-engine underlying
+    /// (e.g. HGK6) is generally NOT the hedge contract (e.g. HGM6).
+    /// Returns `None` if no hedge subscription has been registered or
+    /// no tick has landed yet — callers performing hedge MTM should
+    /// fall through loudly (WARN), not silently substitute the options
+    /// underlying.
+    ///
+    /// Default impl returns `None` so existing stub `MarketView` impls
+    /// (test fixtures) compile unchanged.
+    fn hedge_underlying_price(&self, _product: &str) -> Option<f64> {
+        None
+    }
 }
 
 /// Test stub: every query returns `None`. Used for unit-testing
@@ -81,6 +95,7 @@ pub struct RecordingMarketView {
     pub underlying: RefCell<HashMap<String, f64>>,
     pub iv: RefCell<HashMap<(String, i64, NaiveDate, char), f64>>,
     pub price: RefCell<HashMap<(String, i64, NaiveDate, char), f64>>,
+    pub hedge_underlying: RefCell<HashMap<String, f64>>,
 }
 
 impl RecordingMarketView {
@@ -90,6 +105,12 @@ impl RecordingMarketView {
 
     pub fn set_underlying(&self, product: &str, price: f64) {
         self.underlying.borrow_mut().insert(product.into(), price);
+    }
+
+    pub fn set_hedge_underlying(&self, product: &str, price: f64) {
+        self.hedge_underlying
+            .borrow_mut()
+            .insert(product.into(), price);
     }
 
     pub fn set_iv(
@@ -146,6 +167,9 @@ impl MarketView for RecordingMarketView {
             .borrow()
             .get(&(product.into(), strike_key(strike), expiry, right.as_char()))
             .copied()
+    }
+    fn hedge_underlying_price(&self, product: &str) -> Option<f64> {
+        self.hedge_underlying.borrow().get(product).copied()
     }
 }
 

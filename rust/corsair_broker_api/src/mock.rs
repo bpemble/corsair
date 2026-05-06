@@ -366,7 +366,3 @@ impl Broker for MockBroker {
     }
 }
 
-// Suppress the "unused" warning on `id` in cancel_order — we record but
-// don't otherwise use it.
-#[allow(dead_code)]
-fn _ignore_unused() {}

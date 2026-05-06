@@ -1,25 +1,27 @@
 //! Market data subscription orchestration.
 //!
-//! Mirrors `src/market_data.py` boot path. Without this, the broker
-//! has no view of the market — no ticks, no IVs, no Greeks, no vol
-//! surface. Phase 5B.0 (renamed: should have been Phase 4.x but
-//! deferred) addresses the gap before cutover.
+//! Without this, the broker has no view of the market — no ticks,
+//! no IVs, no Greeks, no vol surface.
 //!
 //! Per product, on boot:
-//!   1. Resolve the front-month underlying future via `Broker::list_chain`
-//!      (filters to lockout-skip cutoff if configured).
+//!   1. Resolve the front-month underlying future via
+//!      `Broker::list_chain` (filters to lockout-skip cutoff if
+//!      configured).
 //!   2. Subscribe to its ticks → underlying_price.
-//!   3. Wait briefly for the first underlying tick (max 10s).
+//!   3. Wait briefly for the first underlying tick (max 10 s).
 //!   4. Pick ATM strike, generate strike list ATM ± N nickels per
-//!      product config quote_range_low/high × strike_increment.
+//!      product config `strike_range_*` (or `quote_range_*` fallback)
+//!      × `strike_increment`.
 //!   5. For each strike × {Call, Put}:
 //!      a. `qualify_option`
 //!      b. `subscribe_ticks`
 //!      c. `market_data.register_option`
 //!
-//! Static subscription for Phase 5B.0 — no ATM recentering. ATM
-//! drift handling is Phase 6 work; for HG with $0.35 window the
-//! intraday drift won't blow past the window in a single session.
+//! ATM-window recentering runs on a periodic task (`run_window_recenter`)
+//! and adds — never unsubscribes — strikes as parity F drifts. The
+//! depth rotator (`run_depth_rotator`) cycles L2 subscriptions across
+//! the in-scope strike set so wing legs get periodic external-best
+//! visibility.
 
 use chrono::NaiveDate;
 use corsair_broker_api::{
@@ -89,8 +91,8 @@ async fn subscribe_product(
     //     this, hedge MTM uses the wrong futures contract — calendar
     //     spread between (e.g.) HGM6 and HGK6 sign-flips a real gain
     //     into a reported loss of `multiplier × spread` per contract.
-    //     CLAUDE.md §10 had this for the Python broker; Phase 6.7
-    //     cutover lost it. Best-effort — failure logs and continues.
+    //     CLAUDE.md §10 details the rationale. Best-effort — failure
+    //     logs and continues.
     let hedge_contract: Option<Contract> = {
         let h = runtime.hedge.lock().unwrap();
         h.for_product(symbol)
@@ -228,10 +230,19 @@ pub async fn run_window_recenter(runtime: Arc<Runtime>) {
 
     const CADENCE_SEC: u64 = 30;
     let mut t = tokio::time::interval(Duration::from_secs(CADENCE_SEC));
+    t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Burn immediate tick + give vol_surface fitter a head start.
     t.tick().await;
     tokio::time::sleep(Duration::from_secs(15)).await;
     log::info!("window_recenter: cadence {CADENCE_SEC}s");
+    // Front-month expiry is fixed for the trading session — cache it
+    // so we don't recompute by scanning every option leg every 30 s.
+    // Reset on any session-rollover signal (which currently only
+    // surfaces via process restart, so this is effectively
+    // boot-static, but the cache structure leaves room to invalidate
+    // explicitly later).
+    let mut cached_front_expiry_by_product: std::collections::HashMap<String, NaiveDate> =
+        std::collections::HashMap::new();
     loop {
         t.tick().await;
         let products: Vec<ProductConfig> = runtime
@@ -246,8 +257,11 @@ pub async fn run_window_recenter(runtime: Arc<Runtime>) {
             // Read parity F from most recent fit for this product.
             // Fits are keyed (product, expiry, side); first match wins.
             let parity_f: Option<f64> = {
-                let cache = runtime.vol_surface_cache.lock().unwrap();
-                cache
+                let cache_arc = {
+                    let g = runtime.vol_surface_cache.lock().unwrap();
+                    std::sync::Arc::clone(&*g)
+                };
+                cache_arc
                     .iter()
                     .find(|((p, _, _), _)| p == symbol)
                     .map(|(_, e)| e.forward)
@@ -261,23 +275,27 @@ pub async fn run_window_recenter(runtime: Arc<Runtime>) {
             let desired = generate_strikes(atm, product);
             // Front-month expiry — pull from any already-subscribed
             // option (boot path established it).
+            // Build the already-subbed set every cycle (it grows as we
+            // subscribe), but only scan for `earliest` if we haven't
+            // cached it yet for this product.
+            let cached_front = cached_front_expiry_by_product.get(symbol).copied();
             let (front_expiry, already_subbed): (
                 Option<NaiveDate>,
                 std::collections::HashSet<(u64, NaiveDate, Right)>,
             ) = {
                 let md = runtime.market_data.lock().unwrap();
-                let mut earliest: Option<NaiveDate> = None;
+                let mut earliest: Option<NaiveDate> = cached_front;
                 let mut set = std::collections::HashSet::new();
                 for opt in md.options_for_product(symbol) {
                     set.insert((opt.strike.to_bits(), opt.expiry, opt.right));
-                    earliest = match earliest {
-                        Some(e) if e <= opt.expiry => Some(e),
-                        _ => Some(opt.expiry),
-                    };
+                    if cached_front.is_none() {
+                        earliest = Some(earliest.map_or(opt.expiry, |e| e.min(opt.expiry)));
+                    }
                 }
                 (earliest, set)
             };
             let Some(expiry) = front_expiry else { continue };
+            cached_front_expiry_by_product.insert(symbol.clone(), expiry);
             // Subscribe missing (strike, right) tuples.
             let mut added = 0usize;
             for strike in &desired {
@@ -309,17 +327,16 @@ pub async fn run_window_recenter(runtime: Arc<Runtime>) {
     }
 }
 
-/// Periodic depth-subscription rotator. Mirrors the Python broker's
-/// `rotate_depth_subscriptions` (CLAUDE.md note from market_data.py).
-/// Every CADENCE_SEC, picks the K options closest to ATM that have
-/// L1 data, cancels any active depth subs not in the set, and adds
-/// new ones. K is capped to MAX_ACTIVE so we never exceed IBKR's
-/// concurrent reqMktDepth limit (~3 free, more with quote booster).
+/// Periodic depth-subscription rotator. Every CADENCE_SEC, picks the
+/// K options closest to ATM that have L1 data, cancels any active
+/// depth subs not in the set, and adds new ones. K is capped to
+/// MAX_ACTIVE so we never exceed IBKR's concurrent reqMktDepth limit
+/// (~3 free, more with quote booster).
 ///
 /// Without L2 the trader can't see what's behind us when we're the
 /// BBO; quoting compresses to our own min-edge spread on those
-/// strikes. With L2 the trader's external_best_bid/ask call returns
-/// the next-best after subtracting our resting size, so tick-jumping
+/// strikes. With L2 the trader's `external_best_bid/ask` returns the
+/// next-best after subtracting our resting size, so tick-jumping
 /// targets external incumbents instead of self-quotes.
 pub async fn run_depth_rotator(runtime: Arc<Runtime>) {
     use std::collections::HashSet;
@@ -352,6 +369,7 @@ pub async fn run_depth_rotator(runtime: Arc<Runtime>) {
     // strike gets re-covered every ~3.5 minutes.
     let mut rotate_cursor: usize = 0;
     let mut t = tokio::time::interval(Duration::from_secs(CADENCE_SEC));
+    t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // First tick fires immediately — let market_data accumulate first.
     t.tick().await;
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -657,8 +675,8 @@ async fn qualify_and_subscribe(
 }
 
 /// HG copper options trade as "HXE" — option symbol differs from the
-/// underlying future's "HG". Phase 5B.0: hardcode this mapping. Phase
-/// 6 should drive it from product config.
+/// underlying future's "HG". Hardcoded for now; future work could
+/// drive this mapping from product config.
 fn option_symbol_for(product: &ProductConfig) -> String {
     match product.name.as_str() {
         "HG" => "HXE".into(),

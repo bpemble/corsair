@@ -175,9 +175,9 @@ F≈$4.80.
 **Penny-jump policy**: quote one tick inside the incumbent best
 quote, subject to min-edge constraint below.
 
-**Minimum edge**: `min_edge_points = 0.001` (10 ticks). Quote
-(theo − 0.001) on bid side, (theo + 0.001) on ask side. If the
-penny-jumped price would violate min-edge, skip that side.
+**Minimum edge**: `min_edge_points = 0.001` (2 ticks at HG's $0.0005
+tick). Quote (theo − 0.001) on bid side, (theo + 0.001) on ask side.
+If the penny-jumped price would violate min-edge, skip that side.
 
 **Skip wide market**: if half-spread > 4× min_edge (i.e., > 0.004),
 the market is considered too wide to quote into; skip both sides
@@ -205,8 +205,11 @@ where SABR_params are (a, b, rho, m, sigma) from the most recent
    strike; do not fall back further.
 
 **Theo refresh**: every quote cycle. SABR parameters update at
-≤30s cadence; theo recomputes on every param update or forward
-tick (whichever first).
+≤60s cadence; theo recomputes on every param update or forward
+tick (whichever first). The trader's safety contract is the
+staleness gate (skip quoting if no surface refresh in 120s) plus
+the forward-drift guard (skip if `|spot - fit_forward| > 200 ticks`)
+— cadence itself is not load-bearing, the gates are.
 
 ---
 

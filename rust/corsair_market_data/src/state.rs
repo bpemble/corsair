@@ -21,6 +21,18 @@ pub struct MarketDataState {
     /// Underlying instrument id → product (resolved via runtime
     /// at qualification time).
     underlying_instruments: HashMap<InstrumentId, String>,
+    /// Hedge contract last-tick price per product. Distinct from
+    /// `underlying` because the resolved hedge contract (e.g. HGM6)
+    /// is generally NOT the same future as the options-engine
+    /// underlying (e.g. HGK6) — calendar spread between them is non-
+    /// trivial. Marking the hedge MTM against the options underlying
+    /// produces sign-flipping errors of `multiplier × calendar_spread`
+    /// per contract (CLAUDE.md §10's 2026-04-27 Python fix; the
+    /// Phase 6.7 cutover did not carry it forward — see this audit).
+    hedge_underlying: HashMap<String, f64>,
+    /// Hedge instrument id → product (registered alongside the hedge
+    /// tick subscription at boot).
+    hedge_underlying_instruments: HashMap<InstrumentId, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -59,6 +71,8 @@ impl MarketDataState {
             options: HashMap::new(),
             by_instrument: HashMap::new(),
             underlying_instruments: HashMap::new(),
+            hedge_underlying: HashMap::new(),
+            hedge_underlying_instruments: HashMap::new(),
         }
     }
 
@@ -93,6 +107,17 @@ impl MarketDataState {
             .insert(instrument_id, product.to_string());
     }
 
+    /// Register the resolved hedge contract's instrument for a
+    /// product. Subsequent bid/ask/last ticks for this `instrument_id`
+    /// land in `hedge_underlying[product]` rather than (or in addition
+    /// to) the options-engine `underlying[product]`. Same product can
+    /// have a distinct hedge instrument from its options underlying —
+    /// e.g. HG options anchor on HGK6 but hedges trade in HGM6.
+    pub fn register_hedge_underlying(&mut self, product: &str, instrument_id: InstrumentId) {
+        self.hedge_underlying_instruments
+            .insert(instrument_id, product.to_string());
+    }
+
     /// Reverse lookup: which product (if any) does this instrument
     /// represent the underlying of? Used by the broker's tick fast-path
     /// to fork underlying ticks into a separate "underlying_tick"
@@ -101,8 +126,29 @@ impl MarketDataState {
         self.underlying_instruments.get(&iid).cloned()
     }
 
+    /// Reverse lookup for hedge contract instruments. Audit T4-19:
+    /// parallel to `product_for_underlying`. Returns the product whose
+    /// hedge contract is `iid`, or None if not registered. Provided
+    /// for symmetry; broker tick paths may want to publish hedge-tick
+    /// events distinct from underlying-tick events.
+    pub fn product_for_hedge_underlying(&self, iid: InstrumentId) -> Option<String> {
+        self.hedge_underlying_instruments.get(&iid).cloned()
+    }
+
     pub fn underlying_price(&self, product: &str) -> Option<f64> {
         self.underlying.get(product).copied().filter(|&p| p > 0.0)
+    }
+
+    /// Last-tick price for the resolved hedge contract. Returns None
+    /// when no hedge subscription has been registered or no tick has
+    /// landed yet — callers performing hedge MTM should fall through
+    /// loudly (WARN) rather than silently substituting the options
+    /// underlying, which is a different futures contract.
+    pub fn hedge_underlying_price(&self, product: &str) -> Option<f64> {
+        self.hedge_underlying
+            .get(product)
+            .copied()
+            .filter(|&p| p > 0.0)
     }
 
     pub fn set_underlying(&mut self, product: &str, price: f64) {
@@ -122,10 +168,20 @@ impl MarketDataState {
                 t.bid_size = size;
                 t.last_updated_ns = ts_ns;
             }
-        } else if let Some(product) = self.underlying_instruments.get(&iid).cloned() {
-            // Underlying tick.
+            return;
+        }
+        if let Some(product) = self.underlying_instruments.get(&iid).cloned() {
             if price > 0.0 {
                 self.underlying.insert(product, price);
+            }
+        }
+        // Hedge underlying is independent of options underlying —
+        // separate map, separate insert. Same iid may appear in both
+        // when hedge_contract == options_underlying (single-contract
+        // products); both inserts are idempotent.
+        if let Some(product) = self.hedge_underlying_instruments.get(&iid).cloned() {
+            if price > 0.0 {
+                self.hedge_underlying.insert(product, price);
             }
         }
     }
@@ -139,6 +195,23 @@ impl MarketDataState {
                 t.ask_size = size;
                 t.last_updated_ns = ts_ns;
             }
+            return;
+        }
+        // Audit T1-4: update_bid and update_last update the underlying
+        // and hedge_underlying maps when the iid is registered there;
+        // update_ask did not, so the hedge tick never refreshed when
+        // the only price change was on the ask side. That made
+        // hedge_underlying stale and the snapshot's calendar-spread
+        // mark drifted off-quote until a bid or last tick landed.
+        if let Some(product) = self.underlying_instruments.get(&iid).cloned() {
+            if price > 0.0 {
+                self.underlying.insert(product, price);
+            }
+        }
+        if let Some(product) = self.hedge_underlying_instruments.get(&iid).cloned() {
+            if price > 0.0 {
+                self.hedge_underlying.insert(product, price);
+            }
         }
     }
 
@@ -150,9 +223,16 @@ impl MarketDataState {
                 }
                 t.last_updated_ns = ts_ns;
             }
-        } else if let Some(product) = self.underlying_instruments.get(&iid).cloned() {
+            return;
+        }
+        if let Some(product) = self.underlying_instruments.get(&iid).cloned() {
             if price > 0.0 {
                 self.underlying.insert(product, price);
+            }
+        }
+        if let Some(product) = self.hedge_underlying_instruments.get(&iid).cloned() {
+            if price > 0.0 {
+                self.hedge_underlying.insert(product, price);
             }
         }
     }
@@ -312,6 +392,25 @@ mod tests {
         s.register_underlying("HG", InstrumentId(50));
         s.update_last(InstrumentId(50), 6.05, 1234);
         assert_eq!(s.underlying_price("HG"), Some(6.05));
+    }
+
+    #[test]
+    fn hedge_underlying_routes_independently_of_options_underlying() {
+        let mut s = MarketDataState::new();
+        // Options underlying = HGK6, hedge contract = HGM6 — distinct
+        // instrument ids, distinct prices.
+        s.register_underlying("HG", InstrumentId(50));
+        s.register_hedge_underlying("HG", InstrumentId(60));
+        s.update_last(InstrumentId(50), 5.96, 1);
+        s.update_bid(InstrumentId(60), 6.07, 1, 2);
+        assert_eq!(s.underlying_price("HG"), Some(5.96));
+        assert_eq!(s.hedge_underlying_price("HG"), Some(6.07));
+    }
+
+    #[test]
+    fn hedge_underlying_price_none_when_unregistered() {
+        let s = MarketDataState::new();
+        assert!(s.hedge_underlying_price("HG").is_none());
     }
 
     #[test]

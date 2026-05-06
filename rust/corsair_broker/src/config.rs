@@ -1,7 +1,7 @@
 //! Runtime config loader. Reads YAML at a configurable path.
 //!
-//! Schema is the v3 boundary contract per spec §4: Python research
-//! tools write the YAML, Rust runtime reads it. No hot reload —
+//! Schema is the v3 boundary contract per spec §4: research tools
+//! write the YAML, the Rust runtime reads it. No hot reload —
 //! restart is the unit of change.
 
 use serde::{Deserialize, Serialize};
@@ -86,14 +86,20 @@ pub struct ProductConfig {
     /// Default IV when MarketView has no value. 0.30 typical.
     #[serde(default = "default_iv")]
     pub default_iv: f64,
-    /// Strike QUOTING range, low/high in increments. Trader places
-    /// orders only on strikes within this window relative to ATM.
+    /// **Deprecated for quoting** (CLAUDE.md §12). The trader's quoting
+    /// window is now hardcoded in `corsair_trader/src/decision.rs`
+    /// (`MAX_STRIKE_OFFSET_USD` + OTM-only branches), not driven from
+    /// YAML. Retained ONLY as the fallback default for
+    /// `strike_range_low/high` — i.e., if `strike_range_*` is unset
+    /// the market-data subscription window falls back to these.
+    /// Older configs that set only `quote_range_*` continue working;
+    /// new configs should use `strike_range_*` directly.
     pub quote_range_low: i32,
     pub quote_range_high: i32,
     /// Strike SUBSCRIPTION range, low/high in increments. Wider than
-    /// quote_range so SABR has wing data for stable fits — CLAUDE.md
-    /// §12 specifies +2 buffer on each side. Defaults to quote_range
-    /// when unset (back-compat with older configs).
+    /// the trader's quoting window so SABR has wing data for stable
+    /// fits — CLAUDE.md §12. Defaults to `quote_range_*` when unset
+    /// (back-compat with older configs).
     #[serde(default)]
     pub strike_range_low: Option<i32>,
     #[serde(default)]
@@ -120,6 +126,11 @@ pub struct QuotingSection {
     pub dead_band_ticks: i32,
     #[serde(default = "default_min_send")]
     pub min_send_interval_ms: u64,
+    /// Spec §3.4: skip quoting both sides if half-spread > N × min_edge.
+    /// 4.0 = skip when half-spread > 4 × (min_edge_ticks × tick_size).
+    /// 0 disables the gate.
+    #[serde(default = "default_spread_over_edge")]
+    pub skip_if_spread_over_edge_mul: f64,
 }
 
 fn default_max_strike_offset() -> f64 {
@@ -136,6 +147,9 @@ fn default_dead_band() -> i32 {
 }
 fn default_min_send() -> u64 {
     250
+}
+fn default_spread_over_edge() -> f64 {
+    4.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,10 +169,6 @@ pub struct HedgingSection {
     pub include_in_daily_pnl: bool,
     #[serde(default = "default_true")]
     pub flatten_on_halt: bool,
-    #[serde(default = "default_ioc_offset")]
-    pub ioc_tick_offset: i32,
-    #[serde(default = "default_hedge_tick")]
-    pub hedge_tick_size: f64,
     /// Skip contracts within N days of expiry (CLAUDE.md §10).
     #[serde(default = "default_lockout")]
     pub hedge_lockout_days: i32,
@@ -172,12 +182,6 @@ fn default_tolerance() -> f64 {
 }
 fn default_hedge_cadence() -> f64 {
     30.0
-}
-fn default_ioc_offset() -> i32 {
-    2
-}
-fn default_hedge_tick() -> f64 {
-    0.0005
 }
 fn default_lockout() -> i32 {
     30
@@ -361,6 +365,7 @@ hedging:
         assert_eq!(cfg.snapshot.path, "/app/data/snapshot.json");
         assert_eq!(cfg.quoting.gtd_lifetime_s, 30.0);
         assert_eq!(cfg.quoting.dead_band_ticks, 1);
+        assert_eq!(cfg.quoting.skip_if_spread_over_edge_mul, 4.0);
     }
 
     #[test]

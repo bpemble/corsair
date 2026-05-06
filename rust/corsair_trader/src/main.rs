@@ -36,8 +36,13 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// parking_lot::Mutex for the hot-path ring locks. Faster uncontended
+// path than std::sync::Mutex, infallible lock() (no Result), and the
+// same poisoning-free semantics we already use for histograms/scalars.
+use parking_lot::Mutex;
 
 use crate::decision::{decide_on_tick, Decision};
 use crate::ipc::shm::{wait_for_rings, Ring, DEFAULT_RING_CAPACITY};
@@ -317,7 +322,7 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                 })
                 .collect();
             {
-                let mut ring = commands_ring_sd.lock().unwrap();
+                let mut ring = commands_ring_sd.lock();
                 for frame in &frames {
                     ring.write_frame(frame);
                 }
@@ -372,7 +377,7 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                     }
                 };
                 let frame = ipc::protocol::pack_frame(&body);
-                let mut ring = commands_ring.lock().unwrap();
+                let mut ring = commands_ring.lock();
                 ring.write_frame(&frame);
                 drop(ring);
                 log::info!(
@@ -409,7 +414,7 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
              (1 CPU core hot, lower latency)"
         );
         loop {
-            let chunk = events_ring.lock().unwrap().read_available();
+            let chunk = events_ring.lock().read_available();
             if !chunk.is_empty() {
                 buf.extend_from_slice(&chunk);
                 let frames = ipc::protocol::unpack_all_frames(&mut buf)?;
@@ -433,12 +438,12 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
         // when broker writes a notification byte. Lower CPU; ~50-100µs
         // worst-case wakeup latency from FIFO + scheduler.
         use tokio::io::unix::AsyncFd;
-        let evt_fifo_fd = events_ring.lock().unwrap().notify_r_fd().expect("events fifo");
+        let evt_fifo_fd = events_ring.lock().notify_r_fd().expect("events fifo");
         let evt_async_fd = AsyncFd::new(EvtFd(evt_fifo_fd))?;
 
         loop {
             // Drain ring.
-            let chunk = events_ring.lock().unwrap().read_available();
+            let chunk = events_ring.lock().read_available();
             if !chunk.is_empty() {
                 buf.extend_from_slice(&chunk);
                 let frames = ipc::protocol::unpack_all_frames(&mut buf)?;
@@ -451,7 +456,7 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                 }
                 continue;
             }
-            events_ring.lock().unwrap().drain_notify();
+            events_ring.lock().drain_notify();
             match tokio::time::timeout(
                 Duration::from_millis(100),
                 evt_async_fd.readable(),
@@ -474,6 +479,25 @@ struct EvtFd(std::os::fd::RawFd);
 impl std::os::fd::AsRawFd for EvtFd {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.0
+    }
+}
+
+/// Decode a typed msgpack body, bumping `dropped_parse_errors` on
+/// failure. Returns None on error so the caller can early-`return`
+/// without further matching. Centralises the
+/// `match rmp_serde::from_slice { Ok(_)=>... Err(_)=>{counter; return;} }`
+/// boilerplate that previously appeared at every typed dispatch arm.
+#[inline]
+fn decode_msg<T: serde::de::DeserializeOwned>(
+    body: &[u8],
+    counters: &DecisionCounters,
+) -> Option<T> {
+    match rmp_serde::from_slice::<T>(body) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
 }
 
@@ -553,22 +577,16 @@ fn process_event(
             );
         }
         "underlying_tick" => {
-            let ut: UnderlyingTickMsg = match rmp_serde::from_slice(&body) {
-                Ok(t) => t,
-                Err(_) => {
-                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
+            let ut: UnderlyingTickMsg = match decode_msg(&body, counters) {
+                Some(v) => v,
+                None => return,
             };
             state.scalars.lock().underlying_price = ut.price;
         }
         "vol_surface" => {
-            let vs: VolSurfaceMsg = match rmp_serde::from_slice(&body) {
-                Ok(t) => t,
-                Err(_) => {
-                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
+            let vs: VolSurfaceMsg = match decode_msg(&body, counters) {
+                Some(v) => v,
+                None => return,
             };
             // Side comes as "C", "P", or "BOTH" (current broker fits a
             // combined surface, see audit T4-10). The lookup tries
@@ -594,12 +612,9 @@ fn process_event(
             }
         }
         "risk_state" => {
-            let r: RiskStateMsg = match rmp_serde::from_slice(&body) {
-                Ok(t) => t,
-                Err(_) => {
-                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
+            let r: RiskStateMsg = match decode_msg(&body, counters) {
+                Some(v) => v,
+                None => return,
             };
             let mut sc = state.scalars.lock();
             sc.risk_effective_delta = Some(r.effective_delta);
@@ -610,14 +625,24 @@ fn process_event(
             sc.risk_state_age_monotonic_ns = now_ns_monotonic();
         }
         "place_ack" => {
-            let p: PlaceAckMsg = match rmp_serde::from_slice(&body) {
-                Ok(t) => t,
-                Err(_) => {
+            let p: PlaceAckMsg = match decode_msg(&body, counters) {
+                Some(v) => v,
+                None => return,
+            };
+            // place_ack arrives from the broker after IBKR ack; an
+            // empty or malformed `right` means we can't reliably build
+            // the (strike, expiry, right, side) key, and silently
+            // bucketing under 'C' would mis-route puts. Drop the
+            // message and bump dropped_parse_errors so operators see
+            // the schema drift signal.
+            let r_char = match p.right.chars().next() {
+                Some(c) => c.to_ascii_uppercase(),
+                None => {
                     counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("place_ack with empty `right`; dropping");
                     return;
                 }
             };
-            let r_char = p.right.chars().next().unwrap_or('C').to_ascii_uppercase();
             let s_char = match p.side.as_str() {
                 "BUY" => 'B',
                 "SELL" => 'S',
@@ -638,7 +663,6 @@ fn process_event(
                 .and_modify(|o| o.order_id = Some(p.order_id))
                 .or_insert_with(|| OurOrder {
                     price: p.price,
-                    send_ns: now_ns_wall(),
                     place_monotonic_ns: now_ns_monotonic(),
                     order_id: Some(p.order_id),
                 });
@@ -648,12 +672,9 @@ fn process_event(
         // legacy adapters may use "order_ack". Both routed to the same
         // terminal-state cleanup path.
         "order_status" | "order_ack" => {
-            let a: OrderAckMsg = match rmp_serde::from_slice(&body) {
-                Ok(t) => t,
-                Err(_) => {
-                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
+            let a: OrderAckMsg = match decode_msg(&body, counters) {
+                Some(v) => v,
+                None => return,
             };
             let oid = match a.order_id {
                 Some(o) => o,
@@ -676,14 +697,24 @@ fn process_event(
             }
         }
         "kill" => {
-            let k: KillMsg = match rmp_serde::from_slice(&body) {
-                Ok(t) => t,
-                Err(_) => {
+            let k: KillMsg = match decode_msg(&body, counters) {
+                Some(v) => v,
+                None => return,
+            };
+            // Reject kill messages without a usable `source` rather than
+            // bucketing them under "?"; an unparseable source means we
+            // can't reliably resume later (a `resume` for the real
+            // source would never match the "?" key, leaving the kill
+            // sticky). Bump dropped_parse_errors so operators see the
+            // signal rather than a silent indefinite halt.
+            let src = match k.source.as_deref() {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
                     counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("kill message missing/empty `source`; dropping");
                     return;
                 }
             };
-            let src = k.source.unwrap_or_else(|| "?".to_string());
             let reason = k.reason.unwrap_or_else(|| "?".to_string());
             // Increment kills_count only on a NEW source — duplicate
             // kill messages for an already-active source must not
@@ -694,35 +725,36 @@ fn process_event(
             }
         }
         "resume" => {
-            let k: KillMsg = match rmp_serde::from_slice(&body) {
-                Ok(t) => t,
-                Err(_) => {
+            let k: KillMsg = match decode_msg(&body, counters) {
+                Some(v) => v,
+                None => return,
+            };
+            // Same rule as `kill`: drop on missing/empty source. A
+            // resume with no source can't match any kill key — silently
+            // bucketing under "?" would never clear the sticky kill.
+            let src = match k.source.as_deref() {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => {
                     counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("resume message missing/empty `source`; dropping");
                     return;
                 }
             };
-            let src = k.source.unwrap_or_else(|| "?".to_string());
             if state.kills.remove(&src).is_some() {
                 state.kills_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
         "weekend_pause" => {
-            let wp: WeekendPauseMsg = match rmp_serde::from_slice(&body) {
-                Ok(t) => t,
-                Err(_) => {
-                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
+            let wp: WeekendPauseMsg = match decode_msg(&body, counters) {
+                Some(v) => v,
+                None => return,
             };
             state.scalars.lock().weekend_paused = wp.paused;
         }
         "hello" => {
-            let h: HelloMsg = match rmp_serde::from_slice(&body) {
-                Ok(t) => t,
-                Err(_) => {
-                    counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
+            let h: HelloMsg = match decode_msg(&body, counters) {
+                Some(v) => v,
+                None => return,
             };
             log::warn!("broker hello received");
             if let Some(cfg) = h.config {
@@ -800,7 +832,18 @@ fn on_tick(
     //      window).
     //   5. Apply incumbency updates (DashMap inserts/removes).
     //      Histogram TTT push uses its own parking_lot lock.
-    let r_char = tick.right.chars().next().unwrap_or('C').to_ascii_uppercase();
+    // Drop ticks with empty/malformed `right` instead of silently
+    // bucketing under 'C' — that would mis-route puts to call state
+    // and corrupt the OptionState cache. Counted as a parse error so
+    // schema drift surfaces in telemetry.
+    let r_char = match tick.right.chars().next() {
+        Some(c) => c.to_ascii_uppercase(),
+        None => {
+            counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
+            log::warn!("tick with empty `right`; dropping");
+            return;
+        }
+    };
     let expiry_arc = state.intern_expiry(&tick.expiry);
     // IBKR's L1 market data emits bid_changed and ask_changed as
     // separate updates, so an incoming tick often has only one of
@@ -822,13 +865,10 @@ fn on_tick(
     let merged_bid_size = tick.bid_size.or(cached.and_then(|c| c.bid_size));
     let merged_ask_size = tick.ask_size.or(cached.and_then(|c| c.ask_size));
     let opt_state = crate::state::OptionState {
-        strike: tick.strike,
         bid: merged_bid,
         ask: merged_ask,
         bid_size: merged_bid_size,
         ask_size: merged_ask_size,
-        ts_ns: tick.ts_ns,
-        broker_recv_ns: tick.broker_recv_ns,
     };
     state.options.insert(opt_key, opt_state);
     // Snapshot scalars once: forward feeds JSONL logging, gtd_lifetime_s
@@ -847,7 +887,17 @@ fn on_tick(
     tick.ask = merged_ask;
     tick.bid_size = merged_bid_size;
     tick.ask_size = merged_ask_size;
-    let decisions = decide_on_tick(state, counters, &tick, &expiry_arc, now_mono);
+    // `decide_ns_wall` was sampled at process_event entry; pass it
+    // through so decide_on_tick can compare vol_surface fit_ts_ns
+    // (CLOCK_REALTIME ns) against it without an extra SystemTime call.
+    let decisions = decide_on_tick(
+        state,
+        counters,
+        &tick,
+        &expiry_arc,
+        now_mono,
+        decide_ns_wall,
+    );
 
     // p50-2: log decisions to JSONL via typed payload.
     // The writer task formats ISO + serializes the JSON line.
@@ -907,6 +957,13 @@ fn on_tick(
         Vec::with_capacity(decisions.len());
     let mut modifies_to_track: Vec<(OurOrderKey, f64, i64, usize)> =
         Vec::with_capacity(decisions.len());
+    // For CancelAll: (order_id, frame_idx) pairs. After the ring write,
+    // only entries whose frame succeeded are removed from local
+    // our_orders/orderid_to_key — failed cancels mean the order is
+    // still resting at IBKR and our local view must continue to
+    // reflect that, so subsequent ticks can retry the cancel rather
+    // than leaving an unknown phantom there until GTD-expiry.
+    let mut cancels_to_track: Vec<(i64, usize)> = Vec::new();
     let mut cancel_all_fired = false;
 
     fn encode_frame<T: serde::Serialize>(
@@ -938,16 +995,24 @@ fn on_tick(
                     };
                     frame_ranges.push(encode_frame(&mut wire_buf, &cancel));
                 }
+                // Borrow expiry/right from `tick`; `side` is &'static
+                // from `Side::as_str()`. No String allocations on the
+                // hot path for any of these — saves ~3 heap ops per
+                // Place. expiry_arc.as_ref() would also work but
+                // tick.expiry is already a String we own and is
+                // identical content; using it keeps the borrow tied
+                // to the outer `tick` whose lifetime spans the
+                // encode_frame call.
                 let p = PlaceOrder {
                     msg_type: "place_order",
                     ts_ns: decide_ns_wall,
                     strike: tick.strike,
-                    expiry: tick.expiry.clone(),
-                    right: tick.right.clone(),
-                    side: side.as_str().to_string(),
+                    expiry: tick.expiry.as_str(),
+                    right: tick.right.as_str(),
+                    side: side.as_str(),
                     qty: 1,
                     price,
-                    order_ref: "corsair_trader_rust".into(),
+                    order_ref: "corsair_trader_rust",
                     triggering_tick_broker_recv_ns: tick.broker_recv_ns,
                 };
                 let place_frame_idx = frame_ranges.len();
@@ -962,7 +1027,6 @@ fn on_tick(
                     okey,
                     OurOrder {
                         price,
-                        send_ns: decide_ns_wall,
                         place_monotonic_ns: now_mono,
                         order_id: None,
                     },
@@ -1003,7 +1067,9 @@ fn on_tick(
                         ts_ns: decide_ns_wall,
                         order_id: *oid,
                     };
+                    let cancel_frame_idx = frame_ranges.len();
                     frame_ranges.push(encode_frame(&mut wire_buf, &cancel));
+                    cancels_to_track.push((*oid, cancel_frame_idx));
                 }
                 log::warn!(
                     "trader: CancelAll fired ({} orders) — risk self-block",
@@ -1013,7 +1079,6 @@ fn on_tick(
                 places_to_track.clear();
                 cancel_all_fired = true;
             }
-            Decision::Skip => {}
         }
     }
 
@@ -1028,7 +1093,7 @@ fn on_tick(
     // that the broker never received).
     let mut frame_ok: Vec<bool> = vec![true; frame_ranges.len()];
     {
-        let mut ring = commands_ring.lock().unwrap();
+        let mut ring = commands_ring.lock();
         for (i, r) in frame_ranges.iter().enumerate() {
             if !ring.write_frame(&wire_buf[r.clone()]) {
                 counters.place_dropped.fetch_add(1, Ordering::Relaxed);
@@ -1060,14 +1125,20 @@ fn on_tick(
     }
 
     if cancel_all_fired {
-        // Wipe local incumbents — broker-side cancel will land
-        // shortly, but our_orders should already reflect "no
-        // longer want resting". Avoids re-firing CancelAll on
-        // subsequent ticks during the in-flight cancel window
-        // and prevents the next tick from trying to amend
-        // orders we just cancelled.
-        state.our_orders.clear();
-        state.orderid_to_key.clear();
+        // Per-frame cleanup: remove only the orders whose cancel frame
+        // actually made it onto the ring. A dropped cancel frame means
+        // the broker never received it; the order is still resting at
+        // IBKR, so we must keep our local view consistent (otherwise
+        // we'd think the cancel succeeded, fall through to placing new
+        // orders, and end up with double inventory).
+        for (oid, frame_idx) in &cancels_to_track {
+            if !frame_ok[*frame_idx] {
+                continue;
+            }
+            if let Some((_, key)) = state.orderid_to_key.remove(oid) {
+                state.our_orders.remove(&key);
+            }
+        }
     }
     for (key, order, cancel_old_oid, place_idx) in places_to_track {
         // If the place frame was rejected by the SHM ring, the broker
@@ -1095,7 +1166,6 @@ fn on_tick(
         }
         if let Some(mut o) = state.our_orders.get_mut(&key) {
             o.price = new_price;
-            o.send_ns = send_ns_wall_after_write;
             o.place_monotonic_ns = now_mono;
             debug_assert_eq!(o.order_id, Some(order_id));
         }
@@ -1153,30 +1223,15 @@ fn staleness_check(
             Some(o) => o,
             None => continue, // unack'd; can't cancel yet
         };
-        let strike = f64::from_bits(key.0);
+        // Inverse of `SharedState::strike_key`: i64 quantum / 10_000.
+        let strike = (key.0 as f64) / 10_000.0;
         let expiry = &key.1;
         let r_char = key.2;
         let s_char = key.3;
 
-        // Look up vol surface for this option. Arc::clone bumps,
-        // not allocates. DashMap get returns a Ref guard; clone
-        // out the value to a stack local so the guard drops.
-        let vp = state
-            .vol_surfaces
-            .get(&(Arc::clone(expiry), r_char))
-            .map(|r| r.value().clone())
-            .or_else(|| {
-                state
-                    .vol_surfaces
-                    .get(&(Arc::clone(expiry), 'C'))
-                    .map(|r| r.value().clone())
-            })
-            .or_else(|| {
-                state
-                    .vol_surfaces
-                    .get(&(Arc::clone(expiry), 'P'))
-                    .map(|r| r.value().clone())
-            });
+        // Look up vol surface for this option (right + 'C' / 'P'
+        // fallback chain — see SharedState::lookup_vol_surface).
+        let vp = state.lookup_vol_surface(expiry, r_char);
         let vp = match vp {
             Some(v) => v,
             None => continue,
@@ -1268,7 +1323,7 @@ fn staleness_check(
                 };
                 if let Ok(body) = rmp_serde::to_vec_named(&modify) {
                     let frame = ipc::protocol::pack_frame(&body);
-                    if !commands_ring.lock().unwrap().write_frame(&frame) {
+                    if !commands_ring.lock().write_frame(&frame) {
                         counters.place_dropped.fetch_add(1, Ordering::Relaxed);
                         // Frame dropped — leave our_orders entry as-is.
                         // Next staleness pass will retry.
@@ -1277,7 +1332,6 @@ fn staleness_check(
                 }
                 if let Some(mut o) = state.our_orders.get_mut(&key) {
                     o.price = new_price;
-                    o.send_ns = now_w;
                     o.place_monotonic_ns = now_m;
                 }
                 counters.staleness_modify.fetch_add(1, Ordering::Relaxed);
@@ -1295,7 +1349,7 @@ fn staleness_check(
                 };
                 if let Ok(body) = rmp_serde::to_vec_named(&cancel) {
                     let frame = ipc::protocol::pack_frame(&body);
-                    if !commands_ring.lock().unwrap().write_frame(&frame) {
+                    if !commands_ring.lock().write_frame(&frame) {
                         counters.place_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -1342,7 +1396,7 @@ fn build_telemetry(
         let sc = state.scalars.lock();
         (sc.weekend_paused, sc.risk_hedge_delta)
     };
-    let commands_frames_dropped = commands_ring.lock().unwrap().frames_dropped;
+    let commands_frames_dropped = commands_ring.lock().frames_dropped;
     (
         Telemetry {
             msg_type: "telemetry",

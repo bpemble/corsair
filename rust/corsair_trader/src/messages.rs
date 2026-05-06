@@ -39,7 +39,11 @@ pub struct KillMsg {
 
 #[derive(Debug, Deserialize)]
 pub struct WeekendPauseMsg {
-    #[serde(default)]
+    // No `#[serde(default)]` — a missing `paused` field must surface
+    // as a parse error so the caller drops the message rather than
+    // silently un-pausing (default bool = false). A weekend_pause
+    // event with an absent `paused` field is structurally malformed;
+    // safer to drop + count than guess.
     pub paused: bool,
 }
 
@@ -174,33 +178,28 @@ pub struct VolParams {
     pub nu: Option<f64>,
 }
 
-/// Underlying-tick wire message. `ts_ns` is parsed but not read by
-/// hot-path code (trader uses its own monotonic clock for timing);
-/// kept on the struct so deserialization stays canonical.
-#[allow(dead_code)]
+/// Underlying-tick wire message. Only `price` is consumed; the wire
+/// format also carries `ts_ns` but the trader uses its own monotonic
+/// clock for timing so we don't bother decoding it (rmp_serde silently
+/// skips unknown fields).
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnderlyingTickMsg {
     pub price: f64,
-    #[serde(default)]
-    pub ts_ns: Option<u64>,
 }
 
 /// Risk state from broker. Hot path reads only the gating-relevant
-/// subset (effective_delta, margin_pct); the others are parsed for
-/// telemetry / future use.
-#[allow(dead_code)]
+/// subset (effective_delta, margin_pct, theta, vega) plus hedge_delta
+/// for telemetry. Other broker-emitted fields (margin_usd,
+/// options_delta, gamma, total_contracts, n_positions) are present on
+/// the wire but ignored — rmp_serde silently skips unknown fields, so
+/// the struct only declares what we read.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskStateMsg {
-    pub margin_usd: f64,
     pub margin_pct: f64,
-    pub options_delta: f64,
     pub hedge_delta: i64,
     pub effective_delta: f64,
     pub theta: f64,
     pub vega: f64,
-    pub gamma: f64,
-    pub total_contracts: i64,
-    pub n_positions: i64,
 }
 
 /// Order status update from broker. Trader uses this to clear
@@ -209,19 +208,15 @@ pub struct RiskStateMsg {
 /// order. Broker emits `"order_status"` events with snake_case
 /// `order_id`; the alias accepts the legacy `orderId` form too in
 /// case the field name diverges between adapters.
-#[allow(dead_code)]
+///
+/// Other broker-emitted fields (side, lmtPrice, orderRef) are not
+/// consumed by the trader and are silently skipped by rmp_serde.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderAckMsg {
     #[serde(alias = "orderId", default)]
     pub order_id: Option<i64>,
     #[serde(default)]
     pub status: Option<String>,
-    #[serde(default)]
-    pub side: Option<String>,
-    #[serde(alias = "lmtPrice", default)]
-    pub lmt_price: Option<f64>,
-    #[serde(alias = "orderRef", default)]
-    pub order_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -236,19 +231,25 @@ pub struct PlaceAckMsg {
 }
 
 /// Outbound: place_order command sent to broker.
+///
+/// Hot-path build: `expiry` and `right` are borrowed from the trader's
+/// current `TickMsg`/`expiry_arc` for the lifetime of the encode call,
+/// avoiding two `String` allocations per Place. `side` is `&'static str`
+/// (from `Side::as_str`). `order_ref` stays a `&'static str` literal at
+/// construction since the trader uses one fixed value.
 #[derive(Debug, Clone, Serialize)]
-pub struct PlaceOrder {
+pub struct PlaceOrder<'a> {
     #[serde(rename = "type")]
     pub msg_type: &'static str,
     pub ts_ns: u64,
     pub strike: f64,
-    pub expiry: String,
-    pub right: String,
-    pub side: String,
+    pub expiry: &'a str,
+    pub right: &'a str,
+    pub side: &'static str,
     pub qty: i32,
     pub price: f64,
     #[serde(rename = "orderRef")]
-    pub order_ref: String,
+    pub order_ref: &'static str,
     /// v2 wire-timing: TickMsg.broker_recv_ns of the tick that drove
     /// this decision (latest tick the trader had cached for this key
     /// at decide_quote time). Skipped on the wire when None.

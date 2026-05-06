@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use corsair_hedge::{HedgeFanout, HedgeMode};
 use corsair_position::{PortfolioState, MarketView};
-use corsair_risk::{KillSource, RiskMonitor};
+use corsair_risk::RiskMonitor;
 
 use crate::payload::{
     AccountSnapshot, ChainExpirySnapshot, HedgeSnapshot, KillSnapshot,
@@ -98,8 +98,35 @@ impl SnapshotPublisher {
             })
             .collect();
 
-        let mtm_pnl = portfolio.compute_mtm_pnl(market);
-        let daily_pnl = portfolio.realized_pnl_persisted + mtm_pnl;
+        // Sum hedge MTM + realized P&L across managers. Without this,
+        // the snapshot's mtm_pnl / daily_pnl is options-only — the
+        // dashboard then shows a misleading headline that ignores
+        // hedge exposure. 2026-05-05 incident: operator saw
+        // "+60 daily P&L" with hedge sitting at -$1,948 MTM.
+        // CLAUDE.md §10 + risk monitor's daily-halt check both treat
+        // hedge MTM as part of P&L; the snapshot must too.
+        //
+        // Mark source: hedge_underlying_price (the resolved hedge
+        // contract's own tick), NOT underlying_price (the options-
+        // engine underlying). These are generally different futures
+        // — using the latter mismarks the hedge by `multiplier ×
+        // calendar_spread` per contract.
+        let (hedge_mtm_total, hedge_realized_total): (f64, f64) = {
+            let mut mtm = 0.0;
+            let mut realized = 0.0;
+            for m in hedge.managers() {
+                let cfg = m.config();
+                let f = resolve_hedge_mark(market, &cfg.product, m.hedge_qty());
+                mtm += m.mtm_usd(f);
+                realized += m.state().realized_pnl_usd;
+            }
+            (mtm, realized)
+        };
+
+        let options_mtm = portfolio.compute_mtm_pnl(market);
+        let mtm_pnl = options_mtm + hedge_mtm_total;
+        let daily_pnl =
+            portfolio.realized_pnl_persisted + hedge_realized_total + mtm_pnl;
 
         // MED-002: surface options_delta / hedge_delta / effective_delta
         // separately so the dashboard's net-delta tile can show the
@@ -148,7 +175,7 @@ impl SnapshotPublisher {
             .iter()
             .map(|m| {
                 let cfg = m.config();
-                let f = market.underlying_price(&cfg.product).unwrap_or(0.0);
+                let f = resolve_hedge_mark(market, &cfg.product, m.hedge_qty());
                 let (expiry, forward) = match m.hedge_contract() {
                     Some(c) => (c.expiry.format("%Y%m%d").to_string(), f),
                     None => (String::new(), f),
@@ -176,7 +203,6 @@ impl SnapshotPublisher {
             }
         }
 
-        let _ = KillSource::Risk; // suppress unused warning
         Snapshot {
             schema_version: SCHEMA_VERSION,
             timestamp_ns: now_ns(),
@@ -221,6 +247,35 @@ fn now_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// Resolve the mark to use for hedge MTM / snapshot `forward`.
+/// Prefer the hedge contract's own tick (`hedge_underlying_price`).
+/// If unavailable, fall back to the options-engine underlying with a
+/// WARN — but only when the hedge is non-flat, since with `hedge_qty
+/// == 0` MTM is zero regardless of mark and the warn would otherwise
+/// spam every snapshot tick (4Hz) at boot before the hedge stream
+/// settles. Returns 0.0 when neither source is populated; callers'
+/// `mtm_usd(0.0)` produces a sentinel value distinguishable from a
+/// real mark.
+fn resolve_hedge_mark(
+    market: &dyn MarketView,
+    product: &str,
+    hedge_qty: i32,
+) -> f64 {
+    if let Some(p) = market.hedge_underlying_price(product) {
+        return p;
+    }
+    let fallback = market.underlying_price(product).unwrap_or(0.0);
+    if hedge_qty != 0 {
+        log::warn!(
+            "hedge[{product}]: no hedge_underlying tick — falling back to options \
+             underlying ${:.4} for MTM. Calendar-spread error possible. Check the \
+             hedge subscription log line at boot.",
+            fallback
+        );
+    }
+    fallback
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -337,7 +392,7 @@ mod tests {
         // Force a kill via check_daily_pnl_only.
         let mut p_with_pnl = portfolio_empty();
         p_with_pnl.realized_pnl_persisted = -3_000.0;
-        let _ = r.check_daily_pnl_only(&p_with_pnl, &NoOpMarketView);
+        let _ = r.check_daily_pnl_only(&p_with_pnl, &NoOpMarketView, &fanout_empty());
         assert!(r.is_killed());
         let h = fanout_empty();
         let pub_ = SnapshotPublisher::new(SnapshotConfig {
@@ -373,5 +428,110 @@ mod tests {
         assert_eq!(snap.hedges.len(), 1);
         assert_eq!(snap.hedges[0].product, "HG");
         assert_eq!(snap.hedges[0].mode, "execute");
+    }
+
+    #[test]
+    fn hedge_mtm_uses_hedge_underlying_not_options_underlying() {
+        // Reproduces the 2026-05-05 calendar-spread bug: options
+        // underlying (HGK6) ticks at 5.96; hedge contract (HGM6) ticks
+        // at 6.07. Hedge state: long 1 contract entered at 5.9875.
+        // True MTM: (6.07 - 5.9875) × 25000 = +$2,062.50.
+        // Pre-fix (using underlying): (5.96 - 5.9875) × 25000 = -$687.50.
+        let p = portfolio_empty();
+        let r = risk_healthy();
+        let mut m = HedgeManager::new(HedgeConfig {
+            product: "HG".into(),
+            multiplier: 25_000.0,
+            mode: HedgeMode::Execute,
+            tolerance_deltas: 0.5,
+            rebalance_on_fill: true,
+            rebalance_cadence_sec: 30.0,
+            include_in_daily_pnl: true,
+            flatten_on_halt_enabled: true,
+            ioc_tick_offset: 2,
+            hedge_tick_size: 0.0005,
+            lockout_days: 30,
+        });
+        // Seed hedge state: +1 contract at 5.9875.
+        m.reconcile_with_position(1, 5.9875, false);
+        let h = HedgeFanout::new(vec![m]);
+
+        let view = corsair_position::RecordingMarketView::new();
+        view.set_underlying("HG", 5.96);
+        view.set_hedge_underlying("HG", 6.07);
+
+        let pub_ = SnapshotPublisher::new(SnapshotConfig {
+            snapshot_path: "/tmp/_hedge_mark_test.json".into(),
+        });
+        let snap = pub_.build(
+            &p,
+            &r,
+            &h,
+            &view,
+            AccountSnapshot::default(),
+            ChainBuild::default(),
+            None,
+        );
+        // hedge.mtm_usd must be marked against the hedge tick (6.07),
+        // producing a positive value, not the options tick (5.96).
+        let mtm = snap.hedges[0].mtm_usd;
+        assert!(
+            (mtm - 2062.5).abs() < 1e-6,
+            "expected mtm_usd ≈ +$2,062.50 (hedge mark), got {mtm}"
+        );
+        assert!(
+            (snap.hedges[0].forward - 6.07).abs() < 1e-6,
+            "expected forward = 6.07 (hedge mark), got {}",
+            snap.hedges[0].forward
+        );
+        // Combined daily_pnl should reflect the hedge gain.
+        assert!(
+            (snap.portfolio.daily_pnl - 2062.5).abs() < 1e-6,
+            "expected daily_pnl ≈ +$2,062.50, got {}",
+            snap.portfolio.daily_pnl
+        );
+    }
+
+    #[test]
+    fn hedge_mark_falls_back_to_options_underlying_when_unset() {
+        // Boot race: hedge subscription not yet ticking. With
+        // hedge_qty == 0 the fallback is silent (no warn-spam).
+        let p = portfolio_empty();
+        let r = risk_healthy();
+        let m = HedgeManager::new(HedgeConfig {
+            product: "HG".into(),
+            multiplier: 25_000.0,
+            mode: HedgeMode::Execute,
+            tolerance_deltas: 0.5,
+            rebalance_on_fill: true,
+            rebalance_cadence_sec: 30.0,
+            include_in_daily_pnl: true,
+            flatten_on_halt_enabled: true,
+            ioc_tick_offset: 2,
+            hedge_tick_size: 0.0005,
+            lockout_days: 30,
+        });
+        let h = HedgeFanout::new(vec![m]);
+
+        let view = corsair_position::RecordingMarketView::new();
+        view.set_underlying("HG", 5.96);
+        // No set_hedge_underlying — fallback path.
+
+        let pub_ = SnapshotPublisher::new(SnapshotConfig {
+            snapshot_path: "/tmp/_hedge_fallback_test.json".into(),
+        });
+        let snap = pub_.build(
+            &p,
+            &r,
+            &h,
+            &view,
+            AccountSnapshot::default(),
+            ChainBuild::default(),
+            None,
+        );
+        // hedge_qty == 0 → mtm = 0 regardless of mark.
+        assert_eq!(snap.hedges[0].mtm_usd, 0.0);
+        // forward shows the fallback options price (no warn fired because qty==0).
+        assert!((snap.hedges[0].forward - 5.96).abs() < 1e-6);
     }
 }

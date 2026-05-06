@@ -12,6 +12,7 @@ members = [
     "corsair_pricing",
     "corsair_risk",
     "corsair_snapshot",
+    "corsair_tick_replay",
     "corsair_trader",
 ]
 resolver = "2"

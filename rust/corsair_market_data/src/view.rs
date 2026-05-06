@@ -45,6 +45,10 @@ impl MarketView for MarketDataState {
         let p = t.current_price();
         if p > 0.0 { Some(p) } else { None }
     }
+
+    fn hedge_underlying_price(&self, product: &str) -> Option<f64> {
+        MarketDataState::hedge_underlying_price(self, product)
+    }
 }
 
 /// Wraps an `Rc<RefCell<MarketDataState>>` for legacy callers that
@@ -83,6 +87,10 @@ impl MarketView for MarketDataView {
         right: Right,
     ) -> Option<f64> {
         MarketView::current_price(&*self.state.borrow(), product, strike, expiry, right)
+    }
+
+    fn hedge_underlying_price(&self, product: &str) -> Option<f64> {
+        MarketView::hedge_underlying_price(&*self.state.borrow(), product)
     }
 }
 

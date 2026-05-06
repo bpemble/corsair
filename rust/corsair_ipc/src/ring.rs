@@ -7,13 +7,57 @@
 //!     file. Used by [`SHMClient`](crate::SHMClient) and currently
 //!     by `corsair_trader/src/ipc/shm.rs` (will migrate to this
 //!     crate in Phase 5B.5).
+//!
+//! # Memory model (cross-process SPSC, 2026-05-05)
+//!
+//! The ring is a single-producer / single-consumer queue mapped into
+//! both the broker and the trader. The two participants synchronize
+//! exclusively through the 16-byte header at offset 0:
+//!
+//! ```text
+//!   bytes  0..8 : write_offset (u64 LE) — producer-owned
+//!   bytes  8..16: read_offset  (u64 LE) — consumer-owned
+//! ```
+//!
+//! Both fields are accessed via `AtomicU64` ops with explicit
+//! `Acquire`/`Release` ordering on the **same address** in both
+//! processes, so the kernel's mmap aliasing makes those ops act as a
+//! cross-process synchronizes-with edge:
+//!
+//!   * **Producer (`write_frame`)**:
+//!       1. Acquire-load `read_offset` to determine free space.
+//!       2. Plain copy the frame bytes into the data region.
+//!       3. Release-store `write_offset` — this PUBLISHES every byte
+//!          written in step 2 to the consumer's subsequent
+//!          Acquire-load of `write_offset`.
+//!
+//!   * **Consumer (`read_available`)**:
+//!       1. Acquire-load `write_offset` — pairs with the producer's
+//!          Release in step 3 above; bytes up to that offset are now
+//!          guaranteed visible.
+//!       2. Plain copy the frame bytes out.
+//!       3. Release-store `read_offset` — publishes "I'm done with
+//!          those bytes, you may overwrite them" to the producer.
+//!
+//! This is the standard SPSC dance. WITHOUT real Acquire/Release on
+//! the offsets, x86 happens to behave correctly per its strong memory
+//! model on a single core but the COMPILER is free to reorder the
+//! data-region copies past the offset writes — silent corruption
+//! under load. The `from_le_bytes`/`copy_from_slice` path that lived
+//! here pre-fix had no compiler fences, so frames could be observed
+//! by the consumer before their bytes were committed. Fixed by
+//! moving the offset reads/writes onto `AtomicU64` with the ordering
+//! pairings documented above.
+//!
+//! Layout assumption: header is 16-byte aligned (mmap base is page-
+//! aligned), so the two `AtomicU64`s land on natural 8-byte
+//! boundaries — the cast to `*const AtomicU64` is sound.
 
 use memmap2::{MmapMut, MmapOptions};
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{IntoRawFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,6 +70,10 @@ pub struct Ring {
     capacity: usize,
     notify_w_fd: Option<RawFd>,
     notify_r_fd: Option<RawFd>,
+    /// Counter of frames the producer dropped because the ring was
+    /// full or the frame oversize. Public field for back-compat with
+    /// trader's main.rs telemetry; prefer the [`Ring::frames_dropped`]
+    /// getter for new callers.
     pub frames_dropped: u64,
 }
 
@@ -51,18 +99,19 @@ impl Ring {
             .open(path)?;
         file.set_len(total as u64)?;
         let mmap = unsafe { MmapOptions::new().len(total).map_mut(&file)? };
-        let mut ring = Self {
+        let ring = Self {
             mmap,
             capacity,
             notify_w_fd: None,
             notify_r_fd: None,
             frames_dropped: 0,
         };
-        // Zero the header explicitly. set_len above zero-fills new
-        // bytes but if the file existed at the same size, it might
-        // not — be safe.
-        ring.set_write(0);
-        ring.set_read(0);
+        // Zero the header explicitly via the same atomic-store path
+        // the hot loops use, so even if the file existed at the same
+        // size and had stale offset bytes, the consumer/producer see
+        // a clean (0, 0) state when they map us.
+        ring.store_write(0, Ordering::Release);
+        ring.store_read(0, Ordering::Release);
         Ok(ring)
     }
 
@@ -112,12 +161,15 @@ impl Ring {
     /// `O_RDWR | O_NONBLOCK`. `as_writer=true` registers as the
     /// notify-source; `false` registers as the wake-target.
     pub fn open_notify(&mut self, path: &Path, as_writer: bool) -> io::Result<()> {
+        // `IntoRawFd::into_raw_fd` consumes the File without closing
+        // the underlying fd — exactly what the previous custom
+        // `IntoRawFdKeep` shim was reinventing.
         let fd = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(path)?
-            .into_raw_fd_keep();
+            .into_raw_fd();
         if as_writer {
             self.notify_w_fd = Some(fd);
         } else {
@@ -155,19 +207,50 @@ impl Ring {
         }
     }
 
-    fn read_offsets(&self) -> (u64, u64) {
-        let bytes = &self.mmap[..HDR_SIZE];
-        let w = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let r = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        (w, r)
+    /// Snapshot of total frames dropped by this ring's producer
+    /// since construction.
+    pub fn frames_dropped(&self) -> u64 {
+        self.frames_dropped
     }
 
-    fn set_write(&mut self, w: u64) {
-        self.mmap[0..8].copy_from_slice(&w.to_le_bytes());
+    /// Pointer to the write-offset atomic in the shared header.
+    /// Header is 16-byte aligned (mmap base is page-aligned), so the
+    /// cast to `*const AtomicU64` is sound on x86_64 / aarch64.
+    #[inline]
+    fn write_atomic(&self) -> &AtomicU64 {
+        unsafe {
+            let ptr = self.mmap.as_ptr() as *const AtomicU64;
+            &*ptr
+        }
     }
 
-    fn set_read(&mut self, r: u64) {
-        self.mmap[8..16].copy_from_slice(&r.to_le_bytes());
+    /// Pointer to the read-offset atomic.
+    #[inline]
+    fn read_atomic(&self) -> &AtomicU64 {
+        unsafe {
+            let ptr = self.mmap.as_ptr().add(8) as *const AtomicU64;
+            &*ptr
+        }
+    }
+
+    #[inline]
+    fn load_write(&self, ord: Ordering) -> u64 {
+        self.write_atomic().load(ord)
+    }
+
+    #[inline]
+    fn load_read(&self, ord: Ordering) -> u64 {
+        self.read_atomic().load(ord)
+    }
+
+    #[inline]
+    fn store_write(&self, v: u64, ord: Ordering) {
+        self.write_atomic().store(v, ord);
+    }
+
+    #[inline]
+    fn store_read(&self, v: u64, ord: Ordering) {
+        self.read_atomic().store(v, ord);
     }
 
     /// Producer side: write a complete frame. Returns false on
@@ -178,7 +261,14 @@ impl Ring {
             self.frames_dropped += 1;
             return false;
         }
-        let (w, r) = self.read_offsets();
+        // Producer owns `write_offset` (Relaxed read of our own write
+        // is fine), but `read_offset` is published by the consumer's
+        // Release-store in `read_available`. Acquire-load it so we
+        // synchronize-with that release: any byte the consumer
+        // committed to "free for reuse" before its store is visible
+        // to us before we begin overwriting that region.
+        let w = self.load_write(Ordering::Relaxed);
+        let r = self.load_read(Ordering::Acquire);
         let free = self.capacity as u64 - (w - r);
         if (free as usize) < n {
             self.frames_dropped += 1;
@@ -195,19 +285,26 @@ impl Ring {
             self.mmap[HDR_SIZE..HDR_SIZE + (n - tail)]
                 .copy_from_slice(&frame[tail..]);
         }
-        // Publish offset with release ordering.
+        // Release-store: publishes the bytes copied above to any
+        // consumer that subsequently Acquire-loads write_offset and
+        // observes >= new_w. Without Release here, a weaker
+        // architecture (or the COMPILER on x86 — reordering across
+        // the offset write) could let the consumer's read see the
+        // header advance before the data bytes are visible.
         let new_w = w + n as u64;
-        unsafe {
-            let ptr = self.mmap.as_mut_ptr() as *mut AtomicU64;
-            (*ptr).store(new_w, Ordering::Release);
-        }
+        self.store_write(new_w, Ordering::Release);
         self.notify();
         true
     }
 
     /// Consumer side: read everything available since last bump.
     pub fn read_available(&mut self) -> Vec<u8> {
-        let (w, r) = self.read_offsets();
+        // Acquire-load `write_offset` — pairs with the producer's
+        // Release-store in `write_frame`. Bytes up through `w` are
+        // guaranteed visible after this load returns.
+        let w = self.load_write(Ordering::Acquire);
+        // Our own offset; Relaxed.
+        let r = self.load_read(Ordering::Relaxed);
         let avail = w.saturating_sub(r) as usize;
         if avail == 0 {
             return Vec::new();
@@ -223,7 +320,12 @@ impl Ring {
             data.extend_from_slice(&self.mmap[HDR_SIZE + pos..HDR_SIZE + self.capacity]);
             data.extend_from_slice(&self.mmap[HDR_SIZE..HDR_SIZE + head_len]);
         }
-        self.set_read(r + avail as u64);
+        // Release-store `read_offset`: publishes "I'm done reading
+        // those bytes; producer may reclaim the region" so the
+        // producer's next Acquire-load of read_offset sees the new
+        // value AND all our consumption-side activity is ordered
+        // before any byte the producer subsequently writes there.
+        self.store_read(r + avail as u64, Ordering::Release);
         data
     }
 }
@@ -237,18 +339,6 @@ impl Drop for Ring {
                 }
             }
         }
-    }
-}
-
-trait IntoRawFdKeep {
-    fn into_raw_fd_keep(self) -> RawFd;
-}
-
-impl IntoRawFdKeep for std::fs::File {
-    fn into_raw_fd_keep(self) -> RawFd {
-        let fd = self.as_raw_fd();
-        std::mem::forget(self);
-        fd
     }
 }
 
@@ -301,6 +391,27 @@ mod tests {
         // Frame > capacity/2 fails immediately.
         let big = vec![0u8; 40];
         assert!(!ring.write_frame(&big));
-        assert_eq!(ring.frames_dropped, 1);
+        assert_eq!(ring.frames_dropped(), 1);
+    }
+
+    /// Spec test — establish that the offset-store-after-data ordering
+    /// is preserved end-to-end. Smoke test only; the real proof is
+    /// the documented Acquire/Release pairing on the AtomicU64s and
+    /// the absence of pre-fix behavior under loom-style reordering.
+    #[test]
+    fn write_then_read_preserves_byte_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ring.events");
+        let mut server = Ring::create_owner(&path, 4096).unwrap();
+        let frames: Vec<Vec<u8>> =
+            (0..16).map(|i| vec![i as u8; 32]).collect();
+        for f in &frames {
+            assert!(server.write_frame(f));
+        }
+        let mut client = Ring::open_client(&path, 4096).unwrap();
+        let bytes = client.read_available();
+        // Concatenated frames in order.
+        let expected: Vec<u8> = frames.iter().flatten().copied().collect();
+        assert_eq!(bytes, expected);
     }
 }

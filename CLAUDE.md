@@ -33,29 +33,39 @@ bypass). The lessons are preserved as context for postmortems
 but should not guide live debugging.
 
 Active config for the Rust runtime: `config/runtime_v3.yaml`.
-The legacy `config/hg_v1_4_paper.yaml` is preserved for documentation
-of the v1.4 spec mapping but is no longer read by any running
-service.
+The legacy `config/hg_v1_4_paper.yaml` and `config/corsair_v2_config.yaml`
+were deleted in the 2026-05-05 cleanup pass — they had been dead since
+the cutover. The v1.4 spec mapping lives in `docs/hg_spec_v1.4.md`.
+
+**Operational scripts**: `scripts/flatten_persistent.py` (the
+"sanctioned way to clear positions" referenced in §15) currently
+imports `ib_insync` and is **broken** since `requirements.txt` no
+longer ships it. The committed flatten script `scripts/flatten.py`
+was deleted alongside the other broken `ib_insync` consumers. A Rust-
+IPC-based replacement is needed before any flatten runbook is run.
 
 ## Current spec: v1.4 (HG front-only)
 
 Active strategy spec: `docs/hg_spec_v1.4.md` (APPROVED 2026-04-19). Active
-config: `config/hg_v1_4_paper.yaml` (selected via `CORSAIR_CONFIG` env var
-in docker-compose.yml; defaults to v1.4). v1.3 config is preserved for
-rollback at `config/corsair_v2_config.yaml`.
+config: `config/runtime_v3.yaml` (the legacy `hg_v1_4_paper.yaml` and
+`corsair_v2_config.yaml` were retired 2026-05-05 — they were no longer
+loaded by any running service).
 
-Key v1.4 differences from v1.3 (see §9 below for details):
+Key v1.4 differences from v1.3:
 - Strike scope per spec: **symmetric ATM ± 5 nickels** (sym_5). Active
   config deviates — **asymmetric OTM-only**: calls ATM→ATM+5, puts ATM−5→ATM.
   See §12 for rationale and measurement. v1.3 was asymmetric NEAR-OTM+ATM.
-- **Daily P&L halt at −5% capital (−$3,750)** is the PRIMARY defense — not
-  just cancels quotes, FLATTENS options + hedge, session-level halt.
-- Capital: $200K → $75K (Stage 1). Kill switches rescaled accordingly.
-- NEW hedging subsystem via HG futures (`src/hedge_manager.py`).
-  Mode **execute** as of 2026-04-26 (Phase 0 fix `b598c7b` skips
-  near-expiry contracts). See §10 for current state.
-- NEW operational kills (`src/operational_kills.py`): SABR RMSE sustained
-  >0.05, quote latency median >2s for 60s, abnormal fill rate >10× baseline.
+- **Daily P&L halt at −5% capital** is the PRIMARY defense — kills
+  cancel quotes + session-level halt (operator override 2026-04-22 keeps
+  positions in place; see §8).
+- Capital: $200K → $75K (Stage 1) → $500K live (operator override; §7).
+- Hedging subsystem in Rust (`corsair_hedge`); mode **execute** as of
+  2026-04-26 (skips near-expiry contracts via runtime contract resolver).
+  See §10.
+- **Operational kills (SABR RMSE / quote latency / abnormal fill rate)
+  are NOT implemented in the Rust runtime.** Spec §7 lists them; the
+  Python runtime had `src/operational_kills.py`; the cutover dropped
+  the module and never re-implemented in Rust. Tracked in §15 deviations.
 - 8 JSONL streams in `logs-paper/` per spec §9.5.
 
 ## Spec deviations summary (current state vs v1.4 spec)
@@ -71,33 +81,40 @@ current operational config.
 | Daily P&L halt action | flatten + halt | halt only (positions preserved) | §8 |
 | Margin kill action | flatten | halt only | §7 |
 | vega_kill | $500 | 0 (disabled) | §13 |
-| Effective-delta gating | unspecified | combined options+hedge | §14 |
+| Effective-delta gating | unspecified | combined options+hedge w/ §14 fail-closed staleness | §14 |
 | Architecture | single Python process | Rust broker + Rust trader (Phase 6.7 cutover 2026-05-02) | §15 |
 | Hedge near-expiry lockout | 7 days (shared with options engine) | 30 days (hedge-specific knob added 2026-05-01) | §10 |
+| Operational kills (RMSE/latency/fill-rate) | required (§7) | not implemented in Rust runtime | §15 |
+| `quoting.dead_band_ticks` | unspecified | 2 ticks ($0.001 on HG); 20× tighter than legacy paper config | §16 |
+| `hedging.ioc_tick_offset` | unspecified | 4 (bumped 2→4 on 2026-05-04) | §10 |
 
 ETH is tabled (config products list is HG-only) but the multi-product
 architecture is preserved — re-enabling ETH is a matter of un-commenting
 its product block and wiring market data.
 
-## 0. Source is BAKED INTO the corsair image — `restart` ≠ `up --build`
+## 0. Source is BAKED INTO the corsair-corsair image — `restart` ≠ `up --build`
 
 Both Rust binaries (`corsair_broker_rust`, `corsair_trader_rust`) and
-the corsair_pricing wheel are compiled into the corsair image at
-build time. The compose services do NOT volume-mount Rust source.
-Code edits do NOT take effect on `docker compose restart` — that just
-bounces the existing container running the cached image.
+the corsair_pricing wheel are compiled into the `corsair-corsair`
+image at build time. Both `corsair-broker-rs` and `trader` services
+reference that image. The compose services do NOT volume-mount Rust
+source. Code edits do NOT take effect on `docker compose restart` —
+that just bounces the existing container running the cached image.
 
-To deploy code changes:
+The `build:` directive lives on `corsair-broker-rs` (canonical build
+site since the legacy Python `corsair` service was removed
+2026-05-05). To deploy code changes:
 
 ```bash
-docker compose up -d --build corsair
-docker compose up -d --force-recreate corsair-broker-rs trader
+docker compose up -d --build corsair-broker-rs
+docker compose up -d --force-recreate trader
 ```
 
-The first line rebuilds the image; the second recreates the running
-containers using the new image. **`docker compose build corsair` alone
-will NOT redeploy** — running containers continue using the old image
-until they're recreated.
+The first line rebuilds the image and recreates the broker; the
+second recreates the trader so it picks up the new image. **`docker
+compose build corsair-broker-rs` alone will NOT redeploy the
+trader** — its running container continues using the old image until
+explicitly recreated.
 
 Burned ~20 minutes on 2026-04-09 testing "fixes" against an old image
 because `restart` reported success and the new log lines never appeared.
@@ -423,16 +440,29 @@ Streamlit is request/response. Currently:
 If you need true push, you have to escape Streamlit (FastAPI + SSE / WebSocket
 sidecar). Several hours of work; deferred indefinitely.
 
-## 12. Strike scope deviation: asymmetric, not sym_5
+## 12. Strike scope deviation: asymmetric ATM+OTM, not sym_5
 
 **Operator override 2026-04-20** (commit `bde574b`): deviates from v1.4
 §3.2 which specified symmetric sym_5 (11 strikes × 2 rights = 22
-instruments, 44 resting orders). Active config is asymmetric OTM-only:
+instruments, 44 resting orders). Effective behavior is asymmetric
+ATM+OTM only — calls quoted ATM and OTM (above F), puts quoted ATM and
+OTM (below F). Result: ~12 instruments, ~24 max resting orders (ATM
+strike shared C+P).
 
-- Calls: `quote_range_low: 0, high: 5` → ATM to ATM+$0.25 (OTM + ATM)
-- Puts:  `quote_range_low: -5, high: 0` → ATM−$0.25 to ATM (OTM + ATM)
+**Where this is enforced (post v3 cutover)**: in the Rust trader, NOT
+the YAML. `runtime_v3.yaml` sets `quote_range_low/high: -5..5` per
+product, but that knob is no longer load-bearing for quoting — it's
+only consumed as a fallback for `strike_range_low/high` (the
+market-data subscription window) at `corsair_broker/src/subscriptions.rs:337-338`.
+The asymmetric ATM+OTM filter actually lives in
+`corsair_trader/src/decision.rs:155-164`:
 
-Result: ~12 instruments, ~24 max resting orders (ATM strike shared C+P).
+- ATM-window: skip if `|strike - forward| > MAX_STRIKE_OFFSET_USD` (0.30)
+- OTM-only: skip ITM calls (K < F − 0.025) and ITM puts (K > F + 0.025)
+
+The Python-era `quote_range_low/high` per-right split is gone with the
+Python broker. The trader's hardcoded constants (`MAX_STRIKE_OFFSET_USD`,
+`ATM_TOL_USD`) are the canonical knobs now.
 
 **Measurement that justified the deviation**: per-refresh gateway JVM
 serialization latency was the dominant bottleneck (see
@@ -441,22 +471,17 @@ serialization time. ITM strikes had thin flow and wide spreads — quoting
 them consumed the order budget without generating fill volume.
 
 **Risk being monitored**: short-C vs short-P inventory imbalance on
-persistent underlying drift. If skew sustains >30%, re-enable the
-`inventory_balance` gate (removed when v1.4 symmetric scope made it
-redundant; re-needs code in quote_engine). Delta kill at 5.0 is the
-backstop.
+persistent underlying drift. If skew sustains >30%, re-enable an
+`inventory_balance` gate. Delta kill at 5.0 is the backstop.
 
-**Subscription vs quote scope are separate**: `strike_range_low/high`
-governs market-data subscription (±7 strikes = $0.35 window for SABR
-wing stability), while `quote_range_low/high` governs where we rest
-orders. The subscription window is rolled on ATM drift by
-`market_data.recenter_strike_window` (added 2026-04-22) so the boot-ATM
-anchor no longer goes stale — prior behavior froze subs at boot ATM,
-leaving the window lopsided after a few strikes of drift.
+**Subscription window**: `strike_range_low/high` governs market-data
+subscription (±7 strikes = $0.35 window for SABR wing stability). The
+subscription window is rolled on ATM drift by `corsair_market_data/src/atm.rs`
+so the boot-ATM anchor no longer goes stale.
 
-**To revert to sym_5**: set `quote_range_low: -5, high: 5` on both calls
-and puts. Expect ~2× per-refresh serialization cost unless FIX/colo has
-shipped by then.
+**To revert to sym_5**: change `MAX_STRIKE_OFFSET_USD` to 0.25 and
+delete the OTM-only branches in `decision.rs:155-164`. Expect ~2×
+per-refresh order traffic unless FIX/colo has shipped by then.
 
 ## 13. vega_kill disabled 2026-04-23 (Alabaster characterization)
 
@@ -482,7 +507,18 @@ so 0 is a no-op — no code change needed.
 Evidence: `docs/findings/vega_kill_characterization_2026-04-23.md`.
 HG-specific; re-characterize before any ETH capital bump.
 
-## 14. Effective-delta gating (2026-04-27 paper, 2026-05-02 live-ready)
+## 14. Effective-delta gating (2026-04-27 paper, 2026-05-02 live-ready, fail-closed shipped 2026-05-05)
+
+**Status update 2026-05-05**: hedge-state staleness now fails closed in
+both `RiskMonitor::check` / `check_per_fill_delta` (corsair_risk) and
+`ConstraintChecker::check` (corsair_constraint). When any HedgeManager's
+last reconcile/fill is older than `HEDGE_FRESHNESS_MAX_AGE_NS` (5 min,
+2.5× the periodic reconcile cadence), the gate strips `hedge_qty` back
+out of effective delta and evaluates options-only, with an operator-
+visible WARN. Wired in `corsair_broker/src/tasks.rs:213-242` (per-fill)
+and `~530` (periodic) — the broker pre-fetches `hedge_fresh = ALL fresh`
+and the per-product `hedge_qty_in_worst_delta`, then passes through.
+Closes the §14 "live-blocked" gap.
 
 **Status update 2026-05-02**: the §10 reconciliation prerequisite is now
 satisfied in the Rust runtime — boot reconcile, periodic reconcile
@@ -617,31 +653,35 @@ swapped (FIX/iLink) without touching the trader.
 - **TTT histogram**: trader's per-event TTT is logged every 10s in
   the trader's container logs as `ttt_p50_us`/`ttt_p99_us`. Empty
   (`None`) means no events processed (markets closed or no ticks).
-- **`legacy-python-broker` profile**: the old `corsair` (Python
-  broker) service is preserved as `--profile legacy-python-broker`
-  for emergency rollback ONLY. Bringing it up requires stopping
-  `corsair-broker-rs` first to avoid clientId=0 conflict; the rollback
-  path is git-revert + image rebuild rather than runtime config flip.
+- **Legacy `corsair` service removed 2026-05-05.** The pre-cutover
+  Python broker service was kept as `--profile legacy-python-broker`
+  for a few days post-cutover, but its CMD was already running the
+  Rust broker (with the wrong config path) so the "rollback profile"
+  never actually rolled back. It was deleted from docker-compose.yml.
+  Real rollback path: `git revert` the Phase 6.7+ commits and rebuild
+  the image; no in-place runtime fallback exists.
 
 ### Standard command-line workflow
 
 ```bash
-# Default — brings up the live Rust stack
+# Default — brings up the live Rust stack (4 services:
+# ib-gateway, corsair-broker-rs, trader, dashboard)
 docker compose up -d
 
 # Rebuild + redeploy after code changes
-docker compose up -d --build corsair
-docker compose up -d --force-recreate corsair-broker-rs trader
+# (corsair-broker-rs owns the build for the corsair-corsair image
+#  shared with trader)
+docker compose up -d --build corsair-broker-rs
+docker compose up -d --force-recreate trader
 
 # Stop everything (gateway + dashboard stay up)
 docker compose stop corsair-broker-rs trader
 
-# Emergency rollback to Python broker (very last resort —
-# requires git-revert of Phase 6.7+; the legacy profile alone
-# is insufficient since the Python source was deleted in 6.8a)
+# Emergency rollback to Python broker — requires git revert of
+# Phase 6.7..6.11 + image rebuild. There is no runtime-only path
+# (Python source was deleted in Phase 6.8a).
 git revert --no-commit <Phase 6.7..6.11 SHAs>
-docker compose up -d --build corsair
-docker compose --profile legacy-python-broker up -d corsair
+docker compose up -d --build corsair-broker-rs
 ```
 
 ## 16. Cut-over safety stack (cleanup passes 3-6, 2026-05-01)
@@ -749,7 +789,6 @@ for tuning:
 | `skip_itm` | OTM-only restriction |
 | `skip_in_band` | dead-band gate (price hasn't moved enough) |
 | `skip_cooldown` | per-key cooldown floor |
-| `skip_dark_at_place` | dark-book guard at place time |
 | `staleness_cancel` | resting order cancelled — too far from theo |
 | `staleness_cancel_dark` | resting order cancelled — market went dark |
 | `replace_cancel` | cancel-before-replace fired |
@@ -826,10 +865,20 @@ scheduler interactions rather than Python orchestration.
   (tested 2026-05-01: uvloop INCREASED trader's TTT p50 because
   libuv's scheduler gives more time to non-hot-path tasks; default
   asyncio's tighter `sleep(0)` semantics happens to be optimal here).
-- `state::TraderState` behind a single `std::sync::Mutex`. The hot
-  path holds the lock for ~10 μs per tick. Background tasks
-  (staleness, telemetry) take it briefly. No deadlocks possible —
-  lock order is consistently state → ring (no reverse).
+- `state::SharedState` is lock-sharded (Priority 1, 2026-05-04).
+  Heavy maps (`options`, `our_orders`, `orderid_to_key`,
+  `vol_surfaces`, `theo_cache`, `expiry_intern`, `kills`) live in
+  `dashmap::DashMap` so the 10 Hz staleness sweep iterates one
+  shard while the hot loop inserts to others without blocking.
+  Histograms (`ipc_us`, `ttt_us`) and scalars (config + risk +
+  underlying + weekend_paused) each live behind their own
+  `parking_lot::Mutex`; the hot path snapshots scalars once per
+  tick into a stack-local `ScalarSnapshot`. `DecisionCounters`
+  fields are `AtomicU64` — counter bumps are wait-free. `kills`
+  also has a parallel `kills_count: AtomicUsize` so the per-tick
+  "any kills?" gate is one Relaxed load instead of an
+  `is_empty()` that touches every DashMap shard. No deadlocks —
+  the hot path holds at most one state lock at a time.
 - `tte_cache` module memoizes parsed expiry datetimes per-thread
   (production has ~4 unique expiries; cache is essentially immortal
   after warmup).
@@ -854,20 +903,108 @@ scheduler interactions rather than Python orchestration.
 
 ### Rollback
 
-Either:
-1. `unset CORSAIR_TRADER_LANG` and restart trader (uses Python).
-2. Stop the trader entirely; broker continues quoting via its own
-   quote engine when `CORSAIR_TRADER_PLACES_ORDERS=` is unset.
-
-The Rust binary doesn't deploy any feature the Python trader
-doesn't already have. Functional rollback is safe at any point.
+There is no in-place runtime fallback. The Python trader was deleted
+in Phase 6.8a (no `CORSAIR_TRADER_LANG=python` path remains) and the
+Python-vs-Rust parity scripts were removed in the 2026-05-05 cleanup.
+To roll back: `git revert` the Phase 6.7+ commits and rebuild the
+image. To temporarily stop quoting: stop the trader container — the
+broker stays connected and snapshot/risk continue.
 
 ### Known limitations
 
 - No partial-fill handling. Production places `qty=1` orders so
   partial fills are impossible; if that ever changes, the
   order_ack handler needs updating.
-- The Rust trader doesn't implement the parity-comparison harness
-  yet (Python `scripts/rust_trader_parity.py` does the comparison
-  via the shared corsair_pricing crate; full Rust-binary-CLI
-  parity is a future v2 of that harness).
+
+## 18. Code-quality cleanup pass (2026-05-05)
+
+A full audit + cleanup pass landed 2026-05-05 (one commit per group).
+Highlights worth knowing about when debugging:
+
+### Correctness fixes
+- **IPC ring memory ordering** (`corsair_ipc/src/ring.rs`): producer/
+  consumer offsets now use `AtomicU64` with explicit `Acquire`/`Release`
+  pairs. The prior plain `from_le_bytes`/`copy_from_slice` allowed the
+  compiler to reorder data writes past the offset publish — silent
+  cross-process data race under load.
+- **Hedge-staleness fail-closed** in RiskMonitor + ConstraintChecker
+  per §14 above. This was the long-standing live-deployment hard
+  prerequisite from the 2026-04-27 effective-delta-gating change.
+- **Realized P&L VWAP** (`corsair_position/src/portfolio.rs`):
+  `add_fill` now blends same-direction fills via running absolute-qty
+  VWAP. Previously each open overwrote `avg_fill_price` with the most
+  recent fill, miscalculating realized P&L between IBKR reconciles.
+- **`update_ask` updates `hedge_underlying`** (`corsair_market_data`):
+  was bid/last only, leaving hedge mark unset on ask-first sequences.
+- **Improving-delta sign-flip** (`corsair_constraint`): the "improving"
+  exception used to fire when post-fill delta crossed zero with smaller
+  abs(); now requires `sign(post) == sign(cur)` for the bypass.
+- **NaN guards in pricing**: SABR `(1−2ρz+z²).max(0).sqrt()` clamp,
+  finite-result fallback to alpha; SVI surfaces a counter on negative-
+  variance floor; Brent returns `None` on non-convergence (was masking
+  with last `b`).
+- **Trader risk-gate margin None**: previously fail-closed only on
+  `effective_delta = None`; now also on `margin_pct = None`.
+- **`KillMsg.source` defaulting to `"?"`**: removed; unparseable kill/
+  resume messages are now dropped + counted (was masking errors via a
+  self-cancelling `"?"` kill/resume cycle).
+- **MissedTickBehavior::Skip** on every broker `tokio::time::interval`
+  (was default Burst — could fire several risk checks back-to-back on
+  worker recovery).
+- **`cancel_all_resting` join_all**: previously sequential await per
+  cancel — O(N) RTT on the kill path; now concurrent.
+
+### Performance
+- **SVI fit `spawn_blocking`** (`vol_surface.rs`): the 5-50ms LM solve
+  no longer blocks the runtime worker.
+- **Vol-surface cache Arc-swap**: `vol_surface_cache` is now
+  `Mutex<Arc<HashMap>>` — readers Arc-clone instead of cloning the full
+  map every 250 ms snapshot tick.
+- **Trader `PlaceOrder<'a>`**: borrows `expiry`/`right`; `side` is
+  `&'static str`. Eliminates 3-4 String allocations per place.
+- **Trader rings → `parking_lot::Mutex`** (was `std::sync::Mutex`).
+- **`numerical_jacobian` pre-alloc** in calibrate.rs (was allocating
+  `vec![vec![0.0; n]; m]` per LM iter).
+- **`reqwest::Client` reused via `OnceLock`** in notify.rs.
+- **`open_orders` snapshot cache** with 1s TTL on the snapshot path.
+
+### Dead code purged
+- Python: `src/sabr.py`, `src/pricing.py`, `src/trader/` deleted (broken
+  imports — `backmonth_surface`/`utils` modules didn't exist).
+- Scripts: `scripts/flatten.py`, `reconcile_positions.py`,
+  `capture_place_order_bytes.py`, `parity_compare.py`,
+  `rust_trader_parity.py` deleted (broken `ib_insync` imports).
+  **`scripts/flatten_persistent.py` is broken too (untracked WIP) —
+  the §15 runbook step needs replacement before being relied on.**
+- Tests: `test_sabr.py`, `test_calibrate_parity.py`, `test_pricing_parity.py`,
+  `test_decide_quote.py` — all unimportable. Only `test_ipc_protocol.py`
+  remains.
+- Configs: `config/hg_v1_4_paper.yaml`, `config/corsair_v2_config.yaml` —
+  no longer loaded by any service.
+- `requirements.txt`: `docker>=7.0` dropped (no Python imports it).
+- Dockerfile: `COPY src/ tests/` removed (Rust services don't need them).
+- Rust: `corsair_oms` shrunk from ~330 LOC of orphaned abstractions to
+  ~70 (only `OrderBook::new` and `apply_status` are used). Trader
+  `Decision::Skip`, `replace_cancel` counter, vestigial `OurOrder.send_ns`
+  / `OptionState.{strike,ts_ns,broker_recv_ns}` all removed. Broker
+  `pub type AsyncMutex<T>`, `with_market_view`, dead `ioc_tick_offset` /
+  `hedge_tick_size` config knobs deleted.
+- Cargo deps dropped: `smallvec`, `dashmap` from corsair_broker_ibkr_native;
+  `log` and `chrono` from corsair_oms; `sync` feature from corsair_tick_replay.
+- IBKR client `recvmsg_with_kernel_ts` (and the `SO_TIMESTAMPNS`
+  enable) deleted. `requests::place_order` slow path marked
+  `#[deprecated]` (production goes through `place_template::place_order_fast`).
+
+### Cleanups
+- `now_ns()` hoisted to `corsair_broker/src/time.rs` (was duplicated
+  in 3 modules).
+- Trader vol-surface lookup chain extracted to `state.lookup_vol_surface()`.
+- Trader msgpack-decode parse-error pattern collapsed into a `decode_msg<T>`
+  helper (was 9 sites).
+- Trader `strike_key` switched from `f64::to_bits()` → quantized `i64`
+  (`(s*10_000).round() as i64`) — fixes a latent bug where
+  `6.025` and `6.0250000001` would hash to different bins.
+- Default broker mode is now `Live` (was `Shadow`); flip
+  `CORSAIR_BROKER_SHADOW=1` to opt-in.
+- Stale Phase / ib_insync / PyO3 / "Mirrors X.py" comments removed
+  throughout the broker and broker_api crates.

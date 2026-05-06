@@ -89,8 +89,8 @@ pub struct ModifyOrderReq {
     pub gtd_until_utc: Option<DateTime<Utc>>,
 }
 
-/// Lifecycle states. Reflects ib_insync's `OrderStatus.status` and
-/// FIX's tag 39 (OrdStatus) one-to-one.
+/// Lifecycle states. Reflects IBKR's order status set and FIX's
+/// tag 39 (OrdStatus) one-to-one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderStatus {
     /// Sent to gateway, not yet acknowledged at the exchange.

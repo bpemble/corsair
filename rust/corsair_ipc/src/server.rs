@@ -15,8 +15,9 @@
 //!   4. On shutdown, drop the server — files remain on disk for the
 //!      next broker instance.
 
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::ring::{Ring, DEFAULT_RING_CAPACITY};
@@ -143,14 +144,14 @@ impl SHMServer {
     /// ring is full (frame dropped — caller may want to log).
     pub fn publish(&self, msgpack_body: &[u8]) -> bool {
         let frame = crate::protocol::pack_frame(msgpack_body);
-        let mut r = self.events_ring.lock().unwrap();
+        let mut r = self.events_ring.lock();
         r.write_frame(&frame)
     }
 
     /// Snapshot of dropped-frame counters for telemetry.
     pub fn frames_dropped(&self) -> (u64, u64) {
-        let e = self.events_ring.lock().unwrap().frames_dropped;
-        let c = self.commands_ring.lock().unwrap().frames_dropped;
+        let e = self.events_ring.lock().frames_dropped();
+        let c = self.commands_ring.lock().frames_dropped();
         (e, c)
     }
 }
@@ -177,7 +178,7 @@ async fn command_pump(
     loop {
         tick.tick().await;
         let bytes = {
-            let mut r = cmd_ring.lock().unwrap();
+            let mut r = cmd_ring.lock();
             r.drain_notify();
             r.read_available()
         };
@@ -257,7 +258,7 @@ fn command_pump_blocking(
     //    has no co-tenant tasks to yield to.
     loop {
         let bytes = {
-            let mut r = cmd_ring.lock().unwrap();
+            let mut r = cmd_ring.lock();
             r.read_available()
         };
         if bytes.is_empty() {

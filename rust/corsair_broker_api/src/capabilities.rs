@@ -12,7 +12,7 @@ use crate::orders::TimeInForce;
 /// the specific [`BrokerCapabilities`] field instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrokerKind {
-    /// IBKR API V100+ (with or without ib_insync bridge).
+    /// IBKR API V100+ (native Rust wire client).
     Ibkr,
     /// CME iLink / FIX 4.2 with FCM drop-copy.
     Ilink,

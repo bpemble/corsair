@@ -46,7 +46,12 @@ pub struct HedgeConfig {
     pub ioc_tick_offset: i32,
     pub hedge_tick_size: f64,
     /// Phase 0 lockout: skip contracts within N days of expiry.
-    /// 0 disables. The runtime's contract resolver enforces this.
+    /// 0 disables. Audit T4-23 (verified): the runtime's contract
+    /// resolver in `corsair_broker::runtime::resolve_hedge_contracts`
+    /// reads this via `m.config().lockout_days` and filters
+    /// `list_chain` results to expiries past `now + lockout_days`,
+    /// so a near-expiry contract (e.g. HGJ6 in its final week) is
+    /// never set on a HedgeManager. CLAUDE.md §10.
     pub lockout_days: i32,
 }
 
@@ -253,12 +258,13 @@ impl HedgeManager {
         // applying delta = (target - hedge_qty) brings effective to 0.
         let target_qty = -(effective - (self.state.hedge_qty as f64)).round() as i32;
         let desired_change = target_qty - self.state.hedge_qty;
-        if tolerance_override.is_none() && desired_change.abs() < 1 {
-            return HedgeAction::Idle;
-        }
+        // Audit T3-18: the prior `desired_change.abs() < 1` branch is
+        // unreachable — `desired_change` is i32, so |x|<1 ⇔ x==0,
+        // already handled below. Removed the dead branch.
         if desired_change == 0 {
             return HedgeAction::Idle;
         }
+        let _ = tolerance_override; // gate semantics live in maybe_rebalance
         let is_buy = desired_change > 0;
         let qty = desired_change.unsigned_abs();
         match self.cfg.mode {

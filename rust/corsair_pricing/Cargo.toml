@@ -18,6 +18,7 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 pyo3 = { version = "0.22" }
 statrs = "0.17"
+log = "0.4"
 
 # [profile.release] removed — workspace root owns release profile.
 # (Per-crate profile.release is silently ignored by cargo and emits

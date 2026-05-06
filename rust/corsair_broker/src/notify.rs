@@ -1,28 +1,50 @@
-//! Discord webhook notifications on kill events.
+//! Discord webhook notifications on kill events and (optionally) fills.
 //!
 //! Reads `DISCORD_WEBHOOK_URL` from env at startup. If unset, all
-//! `notify_kill` calls are no-ops (silent — useful in test/dev where
+//! `notify_*` calls are no-ops (silent — useful in test/dev where
 //! we don't want spurious external requests).
 //!
 //! Design choices:
-//! - Fire-and-forget: kill code path must never block on a webhook
-//!   round-trip. `notify_kill` spawns a tokio task and returns
-//!   immediately.
+//! - Fire-and-forget: kill/fill code path must never block on a
+//!   webhook round-trip. Spawn a tokio task and return immediately.
 //! - Best-effort: if the POST fails (Discord 5xx, network glitch,
-//!   timeout), we log a warning and move on. The kill itself has
-//!   already been logged via `log::error!` and persisted in the kill
-//!   switch JSONL — Discord is for operator visibility, not the audit
-//!   trail.
-//! - Bounded latency: 5s timeout on the POST. Discord webhook
-//!   normally responds in <500ms; a longer wait suggests rate limit
-//!   or outage and should be abandoned.
+//!   timeout), we log a warning and move on. Kills are already
+//!   persisted in the kill_switch JSONL; fills in the fills JSONL.
+//!   Discord is for operator visibility, not the audit trail.
+//! - Bounded latency: 5s timeout on the POST.
+//! - Rate-limited: Discord webhook free tier allows ~30 req/min.
+//!   `notify_fill` enforces a 6s minimum gap between fill posts to
+//!   stay well under the limit. Excess fills are silently dropped
+//!   (with a counter logged at INFO every minute) — operators can
+//!   read the JSONL stream for the complete record.
 
 use corsair_risk::KillEvent;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Cached webhook URL — None if env var unset. Resolved once at
 /// runtime startup; subsequent reads are atomic.
 static DISCORD_WEBHOOK_URL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Process-wide reqwest client for Discord webhook calls. Built once
+/// on first use (after `init_from_env`) and reused. Each kill/fill
+/// notification was previously rebuilding `reqwest::Client` from
+/// scratch — that lazily initializes a tokio runtime resource pool +
+/// rustls cert store on every call (~hundreds of µs of unnecessary
+/// work for a fire-and-forget webhook).
+static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|e| {
+                log::warn!("notify: reqwest build failed, using default client: {e}");
+                reqwest::Client::new()
+            })
+    })
+}
 
 pub fn init_from_env() {
     let url = std::env::var("DISCORD_WEBHOOK_URL").ok().filter(|s| !s.is_empty());
@@ -67,16 +89,7 @@ pub fn notify_kill(ev: KillEvent) {
     };
     let payload = format_kill_payload(&ev);
     tokio::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("notify: reqwest build failed: {e}");
-                return;
-            }
-        };
+        let client = http_client();
         match client.post(&url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 log::info!("notify: kill posted to Discord ({})", resp.status());
@@ -89,4 +102,201 @@ pub fn notify_kill(ev: KillEvent) {
             }
         }
     });
+}
+
+// ─── Fill notifications ──────────────────────────────────────────────
+
+/// Minimum nanoseconds between consecutive fill notifications. Discord
+/// free-tier allows ~30 req/min; 6s = 10 req/min, leaves headroom for
+/// kill events to also pass through. Excess fills are dropped (the
+/// fills JSONL has the complete record).
+const FILL_NOTIFY_MIN_GAP_NS: u64 = 6_000_000_000;
+
+/// Last-fill-notify wall-clock ns. Updated atomically. New fills check
+/// `now_ns - last >= FILL_NOTIFY_MIN_GAP_NS` before posting.
+static LAST_FILL_NS: AtomicU64 = AtomicU64::new(0);
+/// Counter of fills dropped due to rate limit. Logged + reset every
+/// minute by the periodic_fill_summary task (or read on shutdown).
+static DROPPED_FILL_NOTIFIES: AtomicU64 = AtomicU64::new(0);
+
+fn fill_color(side: corsair_broker_api::Side) -> u64 {
+    match side {
+        // Green for sells (we got hit on our offer / closed a long).
+        corsair_broker_api::Side::Sell => 0x2ECC71,
+        // Blue for buys.
+        corsair_broker_api::Side::Buy => 0x3498DB,
+    }
+}
+
+/// Optional decoration fields collected by the caller. Any field left
+/// `None` is omitted from the embed, so this struct degrades gracefully
+/// when the broker hasn't yet observed enough state to populate it
+/// (boot before the first SABR fit, hedge fills on the underlying that
+/// don't have an option label, etc.).
+#[derive(Default, Debug, Clone)]
+pub struct FillNotifyContext {
+    pub instrument_label: String,
+    /// Strike + right portion of the title, e.g. "5.85P". Falls back
+    /// to instrument_label when None.
+    pub leg_label: Option<String>,
+    /// Expiry formatted as MM/DD.
+    pub expiry_mmdd: Option<String>,
+    pub underlying: Option<f64>,
+    pub theo: Option<f64>,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub delta: Option<f64>,
+    /// Per-contract theta in dollars/day.
+    pub theta: Option<f64>,
+    /// Signed edge captured at fill in dollars (positive = we beat
+    /// theo on the right side).
+    pub edge_usd: Option<f64>,
+    pub margin_used: Option<f64>,
+    /// Effective portfolio delta (options + hedge), per CLAUDE.md §14.
+    pub portfolio_delta: Option<f64>,
+    pub portfolio_theta: Option<f64>,
+    pub fills_today: Option<u32>,
+}
+
+fn comma_usd(v: f64) -> String {
+    let neg = v < 0.0;
+    let n = v.abs() as u64;
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    if neg { format!("-{out}") } else { out }
+}
+
+/// Format a fill into a Discord embed: title with side emoji, then
+/// 11 inline fields (Expiry / Underlying / Theo / BBO / Delta /
+/// Theta / Edge / Margin / Portfolio Δ / Portfolio θ / Fills Today).
+/// Fields the caller couldn't compute are rendered as "—" so the
+/// embed shape stays stable.
+fn format_fill_payload(
+    fill: &corsair_broker_api::events::Fill,
+    ctx: &FillNotifyContext,
+) -> serde_json::Value {
+    let (side_word, emoji) = match fill.side {
+        corsair_broker_api::Side::Buy => ("BOUGHT", "🟢"),
+        corsair_broker_api::Side::Sell => ("SOLD", "🔴"),
+    };
+    let leg = ctx
+        .leg_label
+        .clone()
+        .unwrap_or_else(|| ctx.instrument_label.clone());
+    let title = format!(
+        "{emoji} {side_word} {qty} × {leg} @ {price:.4}",
+        qty = fill.qty,
+        price = fill.price,
+    );
+
+    let dash = || "—".to_string();
+    let exp_v = ctx.expiry_mmdd.clone().unwrap_or_else(dash);
+    let und_v = ctx.underlying.map(|v| format!("{v:.2}")).unwrap_or_else(dash);
+    let theo_v = ctx.theo.map(|v| format!("{v:.4}")).unwrap_or_else(dash);
+    let bbo_v = match (ctx.bid, ctx.ask) {
+        (Some(b), Some(a)) if b > 0.0 && a > 0.0 => format!("{b:.4} / {a:.4}"),
+        _ => dash(),
+    };
+    let delta_v = ctx.delta.map(|v| format!("{v:.3}")).unwrap_or_else(dash);
+    let theta_v = ctx.theta.map(|v| format!("${v:.1}")).unwrap_or_else(dash);
+    let edge_v = ctx.edge_usd.map(|v| format!("${v:+.0}")).unwrap_or_else(dash);
+    let margin_v = ctx
+        .margin_used
+        .map(|v| format!("${}", comma_usd(v)))
+        .unwrap_or_else(dash);
+    let pdelta_v = ctx
+        .portfolio_delta
+        .map(|v| format!("{v:+.2}"))
+        .unwrap_or_else(dash);
+    let ptheta_v = ctx
+        .portfolio_theta
+        .map(|v| format!("${}", comma_usd(v)))
+        .unwrap_or_else(dash);
+    let fills_v = ctx
+        .fills_today
+        .map(|v| v.to_string())
+        .unwrap_or_else(dash);
+
+    serde_json::json!({
+        "embeds": [{
+            "title": title,
+            "color": fill_color(fill.side),
+            "fields": [
+                {"name": "Expiry",       "value": exp_v,    "inline": true},
+                {"name": "Underlying",   "value": und_v,    "inline": true},
+                {"name": "Theo",         "value": theo_v,   "inline": true},
+                {"name": "BBO",          "value": bbo_v,    "inline": true},
+                {"name": "Delta",        "value": delta_v,  "inline": true},
+                {"name": "Theta",        "value": theta_v,  "inline": true},
+                {"name": "Edge",         "value": edge_v,   "inline": true},
+                {"name": "Margin",       "value": margin_v, "inline": true},
+                {"name": "Portfolio Δ",  "value": pdelta_v, "inline": true},
+                {"name": "Portfolio θ",  "value": ptheta_v, "inline": true},
+                {"name": "Fills Today",  "value": fills_v,  "inline": true},
+            ],
+            "footer": { "text": format!("corsair_broker · exec={}", &fill.exec_id) },
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }]
+    })
+}
+
+/// Fire-and-forget fill notification. Rate-limited (one post per
+/// `FILL_NOTIFY_MIN_GAP_NS`). Drops excess fills and counts them.
+/// Caller passes a `FillNotifyContext` with whatever decoration fields
+/// it could resolve from broker state — missing fields render as "—".
+pub fn notify_fill(fill: corsair_broker_api::events::Fill, ctx: FillNotifyContext) {
+    let url = match webhook_url() {
+        Some(u) => u,
+        None => return,
+    };
+    // Rate-limit check (atomic CAS).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let last = LAST_FILL_NS.load(Ordering::Acquire);
+    if now.saturating_sub(last) < FILL_NOTIFY_MIN_GAP_NS {
+        DROPPED_FILL_NOTIFIES.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if LAST_FILL_NS
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Lost the race to another fill — that one wins, this one drops.
+        DROPPED_FILL_NOTIFIES.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let payload = format_fill_payload(&fill, &ctx);
+    tokio::spawn(async move {
+        let client = http_client();
+        match client.post(&url).json(&payload).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                log::debug!("notify: fill posted to Discord ({})", resp.status());
+            }
+            Ok(resp) => {
+                log::warn!("notify: Discord (fill) returned {}", resp.status());
+            }
+            Err(e) => {
+                log::warn!("notify: Discord (fill) POST failed: {e}");
+            }
+        }
+    });
+}
+
+/// Drain + log the dropped-fill counter. Called periodically by the
+/// broker so operators see a one-line reminder if many fills were
+/// rate-limited.
+pub fn log_and_reset_dropped_fills() {
+    let dropped = DROPPED_FILL_NOTIFIES.swap(0, Ordering::AcqRel);
+    if dropped > 0 {
+        log::info!("notify: rate-limited {dropped} fill notifications in last interval (full record in fills JSONL)");
+    }
 }

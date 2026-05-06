@@ -33,21 +33,18 @@ use std::sync::Arc;
 /// the key tuple); avoids one heap allocation per tick. Also avoids
 /// pulling the message-type string into the hot path.
 ///
-/// `strike` and `ts_ns` are read by `staleness_check` (in main.rs)
-/// and the JSONL writers; the warning about them being "never read"
-/// is a false positive when the struct is matched generically.
-#[allow(dead_code)]
+/// `strike` was previously stored here for log fidelity but is fully
+/// recoverable from `OptionKey.0` (the integer-quantized key inverse-
+/// converts back to f64 via `key.0 as f64 / 10_000.0`). Likewise
+/// `ts_ns`/`broker_recv_ns` were set but never read elsewhere — the
+/// only consumer of broker_recv_ns reads it off the live `TickMsg`.
+/// Both removed; the cache is now strictly the L1 BBO snapshot.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OptionState {
-    pub strike: f64,
     pub bid: Option<f64>,
     pub ask: Option<f64>,
     pub bid_size: Option<i32>,
     pub ask_size: Option<i32>,
-    pub ts_ns: Option<u64>,
-    /// v2 wire-timing: broker_recv_ns from the latest TickMsg. Echoed
-    /// back on PlaceOrder so the broker can compute tick→ack latency.
-    pub broker_recv_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,23 +62,27 @@ pub struct VolSurfaceEntry {
 }
 
 /// Per-resting-order metadata; keyed by (strike, expiry, right, side).
-/// `send_ns` is for log fidelity only; the hot path uses
-/// `place_monotonic_ns` for cooldown / GTD tracking.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OurOrder {
     pub price: f64,
-    pub send_ns: u64,             // wall-clock at send (for logs)
     pub place_monotonic_ns: u64,  // monotonic at last place (cooldown / GTD)
     pub order_id: Option<i64>,    // populated on place_ack
 }
 
 /// HashMap key types. Aliased so the verbose tuple shape lives in one
 /// place; refactors that change the shape touch one line.
-pub type OptionKey = (u64, Arc<str>, char);
+///
+/// The strike component is a quantized integer (`strike_key()` returns
+/// `(strike * 10_000).round() as i64`) — using `f64::to_bits()`
+/// previously meant any rounding drift between producers (e.g. broker
+/// emitting 6.025000000000001 vs trader cache showing 6.025) produced
+/// distinct keys and silent cache misses. The integer form rounds to
+/// the nearest 1/10_000 (well below the 0.0005 tick grid) so two
+/// representations of the same strike collide deterministically.
+pub type OptionKey = (i64, Arc<str>, char);
 pub type VolSurfaceKey = (Arc<str>, char);
-pub type TheoCacheKey = (u64, Arc<str>, char, u64);
-pub type OurOrderKey = (u64, Arc<str>, char, char);
+pub type TheoCacheKey = (i64, Arc<str>, char, u64);
+pub type OurOrderKey = (i64, Arc<str>, char, char);
 
 /// Histograms behind their own mutex. Hot path pushes one sample;
 /// telemetry sorts a snapshot every 10s.
@@ -315,12 +316,15 @@ impl SharedState {
         }
     }
 
-    /// Convert a strike to the bit-pattern key we use in maps.
-    /// (HashMap on f64 is annoying; the strike grid is fixed 0.05 increments
-    /// so the bit pattern is stable.)
+    /// Convert a strike to the integer key we use in maps. Quantizes
+    /// to 1/10_000 — the strike grid is 0.0005, so this resolution is
+    /// 5× finer than any valid strike spacing. Using `to_bits()`
+    /// previously caused silent cache misses whenever two producers
+    /// generated bit-different f64s for the same nominal strike (e.g.
+    /// 6.025 vs 6.025000000000001 from float-arithmetic round-trip).
     #[inline(always)]
-    pub fn strike_key(strike: f64) -> u64 {
-        strike.to_bits()
+    pub fn strike_key(strike: f64) -> i64 {
+        (strike * 10_000.0).round() as i64
     }
 
     /// Return the interned `Arc<str>` for `expiry`; allocate on first
@@ -342,6 +346,34 @@ impl SharedState {
     #[inline]
     pub fn scalar_snapshot(&self) -> ScalarSnapshot {
         self.scalars.lock().snapshot()
+    }
+
+    /// Look up a vol surface for `(expiry, right)`, falling back to
+    /// `(expiry, 'C')` then `(expiry, 'P')`. Older brokers fit a
+    /// per-side surface; newer brokers emit `side="BOTH"` which the
+    /// dispatcher splits into both 'C' and 'P' entries. The fallback
+    /// chain handles back-compat with surfaces that only have one side
+    /// populated. Returns the cloned `VolSurfaceEntry` (or None) so
+    /// the DashMap read guard drops before the caller does any work.
+    #[inline]
+    pub fn lookup_vol_surface(
+        &self,
+        expiry: &Arc<str>,
+        right: char,
+    ) -> Option<VolSurfaceEntry> {
+        self.vol_surfaces
+            .get(&(Arc::clone(expiry), right))
+            .map(|r| r.value().clone())
+            .or_else(|| {
+                self.vol_surfaces
+                    .get(&(Arc::clone(expiry), 'C'))
+                    .map(|r| r.value().clone())
+            })
+            .or_else(|| {
+                self.vol_surfaces
+                    .get(&(Arc::clone(expiry), 'P'))
+                    .map(|r| r.value().clone())
+            })
     }
 }
 
@@ -394,11 +426,11 @@ pub struct DecisionCounters {
     /// uses cancel since we don't want to be in a dark market at any
     /// price. Increment counts drift-only refreshes.
     pub staleness_modify: AtomicU64,
-    pub replace_cancel: AtomicU64,
     /// Quote update fired as a single modify_order (amend) instead of
-    /// cancel + place. Replaces most replace_cancel events: a known
-    /// live order_id at the key + price-update path goes through
-    /// modify in one round trip.
+    /// cancel + place. The `cancel + place` path was retired in favor
+    /// of single-round-trip modify when a known live order_id is
+    /// present at the key (the previous `replace_cancel` counter was
+    /// never incremented and has been removed).
     pub modify: AtomicU64,
     /// Hot-path / staleness commands_ring write_frame returned false
     /// (ring full → frame silently dropped before this counter shipped).
@@ -443,7 +475,6 @@ impl DecisionCounters {
             staleness_cancel: AtomicU64::new(0),
             staleness_cancel_dark: AtomicU64::new(0),
             staleness_modify: AtomicU64::new(0),
-            replace_cancel: AtomicU64::new(0),
             modify: AtomicU64::new(0),
             place_dropped: AtomicU64::new(0),
         }
@@ -479,7 +510,6 @@ impl DecisionCounters {
             ("staleness_cancel", &self.staleness_cancel),
             ("staleness_cancel_dark", &self.staleness_cancel_dark),
             ("staleness_modify", &self.staleness_modify),
-            ("replace_cancel", &self.replace_cancel),
             ("modify", &self.modify),
             ("place_dropped", &self.place_dropped),
         ];

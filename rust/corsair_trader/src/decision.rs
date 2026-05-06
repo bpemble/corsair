@@ -29,10 +29,6 @@ use crate::state::{DecisionCounters, ScalarSnapshot, SharedState};
 /// when F crosses the bin boundary. CLAUDE.md §12 documents 0.30 as
 /// the historical / intended value.
 pub const MAX_STRIKE_OFFSET_USD: f64 = 0.30;
-// STALENESS_INTERVAL_SECS used to gate the staleness loop cadence;
-// the loop now uses tokio::sleep(100ms) directly so the constant is
-// retired. Kept commented for reference if we re-introduce config.
-// pub const STALENESS_INTERVAL_SECS: f64 = 0.10;
 pub const STALENESS_TICKS: i32 = 1;
 pub const COOLDOWN_NS: u64 = 250_000_000; // 250ms
 /// Maximum time to wait for a place_ack before assuming it was lost
@@ -46,11 +42,6 @@ pub const COOLDOWN_NS: u64 = 250_000_000; // 250ms
 /// (one new order every 250ms × 4 strikes × 2 sides = ~32/sec) and
 /// every market cross filled the entire stack.
 pub const UNACK_INFLIGHT_NS: u64 = 2_000_000_000; // 2s
-// DEAD_BAND_TICKS / GTD_LIFETIME_S / GTD_REFRESH_LEAD_S now live on
-// the broker (config/runtime_v3.yaml `quoting:` block), shipped to the
-// trader on the `hello` IPC event. Hot-path values come from
-// ScalarSnapshot. Defaults match the YAML's documented values; if the
-// hello event hasn't arrived, those defaults run instead.
 pub const RISK_STATE_STALE_S: f64 = 5.0;
 pub const MIN_BBO_SIZE: i32 = 1;
 /// Skip quoting when |spot - fit_forward| exceeds this. Reverted to
@@ -68,12 +59,6 @@ pub const ATM_TOL_USD: f64 = 0.025; // half-strike tolerance for OTM-only
 
 #[derive(Debug)]
 pub enum Decision {
-    /// No action; reason already counted in DecisionCounters.
-    /// Today decide_on_tick early-returns by incrementing counters
-    /// and falling through; this variant exists for API symmetry
-    /// (callers can match on the full enum) but isn't constructed.
-    #[allow(dead_code)]
-    Skip,
     /// Send place_order at this price for this side. If `cancel_old_oid`
     /// is Some, send a cancel_order first. Used for fresh placements +
     /// the rare fallback case (no live order_id at this key).
@@ -140,6 +125,7 @@ pub fn decide_on_tick(
     tick: &TickMsg,
     expiry_arc: &Arc<str>,
     now_monotonic_ns: u64,
+    now_wall_ns: u64,
 ) -> Vec<Decision> {
     let mut out = Vec::with_capacity(2);
 
@@ -156,16 +142,19 @@ pub fn decide_on_tick(
     }
     let strike = tick.strike;
     // Single canonical right-as-char for the rest of the function.
-    // 'C' / 'P' uppercased; defaults to 'C' on a malformed tick to
-    // match the historical Python fallback. Used as the OTM gate
-    // discriminator AND as the HashMap key for vol_surfaces /
-    // theo_cache / our_orders.
-    let r_char = tick
-        .right
-        .chars()
-        .next()
-        .unwrap_or('C')
-        .to_ascii_uppercase();
+    // 'C' / 'P' uppercased. Caller (`on_tick`) already drops ticks
+    // with an empty `right`, but defend in depth here: a malformed
+    // right would mis-route puts into the call vol surface lookup
+    // and produce wildly wrong theos, so on the off chance one slips
+    // through (e.g. a future caller bypasses on_tick), we count it
+    // and skip rather than default to 'C'.
+    let r_char = match tick.right.chars().next() {
+        Some(c) => c.to_ascii_uppercase(),
+        None => {
+            counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
+            return out;
+        }
+    };
 
     // Don't quote into a halt. Atomic mirror of `kills.len()` —
     // DashMap::is_empty() would touch every shard, measurable cost
@@ -183,22 +172,7 @@ pub fn decide_on_tick(
     // than spot. With HG carry the two differ ~$0.05 (≈100 ticks);
     // gating on spot rejected strikes that ARE inside the option's
     // pricing window. Per quant advisor 2026-05-05 spec Rec 3.
-    let vp_msg = state
-        .vol_surfaces
-        .get(&(Arc::clone(expiry_arc), r_char))
-        .map(|r| r.value().clone())
-        .or_else(|| {
-            state
-                .vol_surfaces
-                .get(&(Arc::clone(expiry_arc), 'C'))
-                .map(|r| r.value().clone())
-        })
-        .or_else(|| {
-            state
-                .vol_surfaces
-                .get(&(Arc::clone(expiry_arc), 'P'))
-                .map(|r| r.value().clone())
-        });
+    let vp_msg = state.lookup_vol_surface(expiry_arc, r_char);
     let vp_msg = match vp_msg {
         Some(v) => v,
         None => {
@@ -257,17 +231,19 @@ pub fn decide_on_tick(
     // if we haven't seen a refresh in 120s the SVI extrapolation
     // anchor is stale (forward has likely drifted, market regime
     // could have shifted). Fail-safe.
-    if vp_msg.fit_ts_ns > 0 {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        if now_ns.saturating_sub(vp_msg.fit_ts_ns) > 120_000_000_000 {
-            counters
-                .skip_vol_surface_stale
-                .fetch_add(1, Ordering::Relaxed);
-            return out;
-        }
+    //
+    // `vp_msg.fit_ts_ns` is broker CLOCK_REALTIME ns, so we compare
+    // against `now_wall_ns` (passed in by the caller, sampled once at
+    // process_event entry). The previous version sampled SystemTime
+    // here on every tick — a vDSO syscall in the hot path. Reusing
+    // the caller's wall-ns reading saves ~80-150 ns per tick.
+    if vp_msg.fit_ts_ns > 0
+        && now_wall_ns.saturating_sub(vp_msg.fit_ts_ns) > 120_000_000_000
+    {
+        counters
+            .skip_vol_surface_stale
+            .fetch_add(1, Ordering::Relaxed);
+        return out;
     }
 
     // is_strike_calibrated (spec §3.3, audit item 6). Refuse to quote
@@ -556,12 +532,12 @@ pub fn decide_on_tick(
             // is presumed lost and we proceed (phantom orphan at
             // IBKR, but bounded by GTD-5s).
             if ex.order_id.is_none()
-                && (now_monotonic_ns - ex.place_monotonic_ns) < UNACK_INFLIGHT_NS
+                && now_monotonic_ns.saturating_sub(ex.place_monotonic_ns) < UNACK_INFLIGHT_NS
             {
                 counters.skip_unack_inflight.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            let age_s = (now_monotonic_ns - ex.place_monotonic_ns) as f64 / 1e9;
+            let age_s = now_monotonic_ns.saturating_sub(ex.place_monotonic_ns) as f64 / 1e9;
             let in_band =
                 (target_q - ex.price).abs() < snap.dead_band_ticks as f64 * snap.tick_size;
             let needs_gtd_refresh =
@@ -571,7 +547,7 @@ pub fn decide_on_tick(
                 continue;
             }
             // Cooldown floor.
-            if (now_monotonic_ns - ex.place_monotonic_ns) < COOLDOWN_NS {
+            if now_monotonic_ns.saturating_sub(ex.place_monotonic_ns) < COOLDOWN_NS {
                 counters.skip_cooldown.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -622,11 +598,17 @@ pub fn decide_on_tick(
 pub fn compute_risk_gates(snap: &ScalarSnapshot, now_monotonic_ns: u64) -> (bool, bool, bool) {
     let eff = snap.risk_effective_delta;
     let age_s = if snap.risk_state_age_monotonic_ns > 0 {
-        (now_monotonic_ns - snap.risk_state_age_monotonic_ns) as f64 / 1e9
+        (now_monotonic_ns.saturating_sub(snap.risk_state_age_monotonic_ns)) as f64 / 1e9
     } else {
         f64::INFINITY
     };
-    if eff.is_none() || age_s > RISK_STATE_STALE_S {
+    // Fail-closed if either gating-relevant field has not yet arrived
+    // OR the snapshot is stale. Margin-None gets the same treatment as
+    // delta-None: without a margin reading we can't enforce
+    // margin_ceiling_pct, so we must not place. (Prior version only
+    // fail-closed on delta-None — a broker that briefly published
+    // effective_delta without margin_pct could open a placement window.)
+    if eff.is_none() || snap.risk_margin_pct.is_none() || age_s > RISK_STATE_STALE_S {
         return (false, false, true); // risk_all
     }
     let eff = eff.unwrap();
@@ -818,7 +800,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert!(counters.skip_no_vol_surface.load(Ordering::Relaxed) > 0);
     }
@@ -830,7 +812,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(7.0, "20260526", "C", 0.01, 0.02);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_off_atm.load(Ordering::Relaxed), 1);
     }
@@ -842,7 +824,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(5.85, "20260526", "C", 0.20, 0.22);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_itm.load(Ordering::Relaxed), 1);
     }
@@ -854,7 +836,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.15, "20260526", "P", 0.20, 0.22);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_itm.load(Ordering::Relaxed), 1);
     }
@@ -867,7 +849,7 @@ mod tests {
         let mut tick = make_tick(6.0, "20260526", "C", 0.0, 0.10);
         tick.bid = Some(0.0);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_one_sided_or_dark.load(Ordering::Relaxed), 2);
     }
@@ -880,7 +862,7 @@ mod tests {
         let mut tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         tick.bid_size = Some(0);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_thin_book.load(Ordering::Relaxed), 2);
     }
@@ -902,7 +884,7 @@ mod tests {
         // but still inside ATM-window (6.10 - 6.0 = 0.10 < 0.30).
         let tick = make_tick(6.10, "20260526", "C", 0.10, 0.105);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_uncalibrated_strike.load(Ordering::Relaxed), 1);
     }
@@ -916,7 +898,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.20);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_wide_spread.load(Ordering::Relaxed), 2);
     }
@@ -931,7 +913,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.20);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert_eq!(counters.skip_wide_spread.load(Ordering::Relaxed), 0);
     }
 
@@ -947,7 +929,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
     }
@@ -964,7 +946,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
     }
@@ -983,7 +965,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
     }
@@ -1004,7 +986,7 @@ mod tests {
         let expiry_arc = state.intern_expiry(&tick.expiry);
         // Should NOT block on theta. (May skip for other reasons, e.g.
         // wide spread, but risk_block from theta should be 0.)
-        let _ = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let _ = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         // The risk_block counter increments by 2 only when ALL is set.
         // With only theta_kill=0 and no other gate trips, ALL won't fire
         // from the theta path.
@@ -1023,7 +1005,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
     }
@@ -1036,7 +1018,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
     }
 
@@ -1055,7 +1037,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000);
+        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
     }
 }

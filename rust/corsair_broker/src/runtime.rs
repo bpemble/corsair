@@ -1,6 +1,7 @@
 //! `Runtime` — the central state hub for the broker daemon.
 //!
-//! Owns one instance of every Phase 2-3 component. Tasks (in
+//! Owns one instance of every stateful component (broker, portfolio,
+//! risk, hedge, OMS, market data, snapshot publisher). Tasks (in
 //! `tasks.rs`) hold `Arc<Runtime>` and acquire the relevant
 //! `Mutex<...>` to read or mutate state.
 
@@ -18,9 +19,6 @@ use corsair_risk::{RiskConfig, RiskMonitor};
 use corsair_snapshot::{SnapshotConfig, SnapshotPublisher};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-
-/// Async-friendly Mutex for the broker (held across .await).
-pub type AsyncMutex<T> = tokio::sync::Mutex<T>;
 
 use crate::config::BrokerDaemonConfig;
 
@@ -42,14 +40,16 @@ pub enum RuntimeMode {
 }
 
 impl RuntimeMode {
+    /// Default is `Live` since the Phase 6.7 cutover (2026-05-02).
+    /// Setting `CORSAIR_BROKER_SHADOW=1` (or `true`) opts into shadow
+    /// mode for debugging; any other value (or unset) yields live.
     pub fn from_env() -> Self {
         match std::env::var("CORSAIR_BROKER_SHADOW")
             .unwrap_or_default()
             .as_str()
         {
-            "0" | "false" | "FALSE" => Self::Live,
-            // Default during Phase 4 development is shadow.
-            _ => Self::Shadow,
+            "1" | "true" | "TRUE" => Self::Shadow,
+            _ => Self::Live,
         }
     }
 }
@@ -57,18 +57,13 @@ impl RuntimeMode {
 /// Central state. Each component is wrapped in a `Mutex` so tokio
 /// tasks can acquire just the slice they need.
 ///
-/// `market_data` is `Rc<RefCell<...>>` because [`MarketDataView`] uses
-/// the single-threaded interior-mutability pattern (it implements
-/// the `MarketView` trait via `&self`). The runtime ensures all
-/// access to `market_data` happens on a single tokio task at a time
-/// by routing through [`tasks::pump_ticks`] — this is enforced by
-/// having `MarketDataView` be `!Send`.
+/// Lock-order convention (used throughout `tasks.rs`):
+///   account → hedge → portfolio → market_data → risk → constraint
 ///
-/// Wait — that's not quite right for tokio's multi-thread runtime
-/// where tasks can move across threads. We use `Mutex<MarketDataState>`
-/// instead and construct `MarketDataView` on-demand from a clone of
-/// the Arc when read access is needed. The clone is cheap (Arc
-/// bump). See [`with_market_view`].
+/// All hot paths take at most one lock at a time, or strictly in this
+/// order. Holding portfolio across an `await` is forbidden — see
+/// `periodic_risk_check` for the canonical pattern (snapshot under
+/// locks, drop, then `await` cancel/notify outside).
 pub struct Runtime {
     pub mode: RuntimeMode,
     pub config: BrokerDaemonConfig,
@@ -97,6 +92,20 @@ pub struct Runtime {
     pub qualified_contracts:
         Mutex<std::collections::HashMap<corsair_broker_api::InstrumentId, corsair_broker_api::Contract>>,
 
+    /// Fast-path contract lookup for `handle_place` / `handle_modify`,
+    /// keyed by (strike-bits, expiry-YYYYMMDD, right-char).
+    ///
+    /// Replaces the O(N×M) scan over `MarketDataState::options_for_
+    /// product` that handle_place used to do — that scan included a
+    /// `format!("%Y%m%d")` allocation per option per call, costing
+    /// ~10–15 µs of broker dispatch latency on every place command.
+    /// This map is populated in `subscribe_strike` (alongside
+    /// `qualified_contracts`) so the hot path can resolve a contract
+    /// in a single `HashMap::get`. Bounded by quoted strikes
+    /// (~30 in production) so memory is trivial.
+    pub contract_by_key:
+        Mutex<std::collections::HashMap<(u64, String, char), corsair_broker_api::Contract>>,
+
     /// Cached account snapshot from `Broker::account_values()`. Updated
     /// every ~5min by `periodic_account_poll`. Read by
     /// `periodic_risk_check` so margin_kill has a real number to gate
@@ -114,10 +123,21 @@ pub struct Runtime {
     /// read by `periodic_snapshot` to compute p50/p99 every tick.
     pub latency_samples: Mutex<crate::latency::LatencySamples>,
 
-    /// Most recent SABR fit per (product, expiry_str). Populated by
-    /// the vol_surface fitter; consumed by build_chain_payload to
-    /// compute per-leg theo prices for the dashboard.
-    pub vol_surface_cache: Mutex<std::collections::HashMap<(String, String), VolSurfaceCacheEntry>>,
+    /// Most recent SABR fit per (product, expiry_str, side_char).
+    /// Populated by the vol_surface fitter; consumed by
+    /// build_chain_payload to compute per-leg theo prices.
+    /// 2026-05-05 evening change: keyed by side ('C' or 'P') so that
+    /// per-side fits land in distinct cache slots — the combined fit
+    /// was smearing C/P smile asymmetries during one-sided flow,
+    /// producing 1-2 tick per-strike theo bias on the busy side.
+    /// Stored as `Mutex<Arc<HashMap<...>>>` so readers clone only the
+    /// Arc (`vol_surface_cache.lock().unwrap().clone()` is cheap)
+    /// instead of deep-cloning the inner map. The fitter mutates by
+    /// building a new HashMap from the previous Arc's contents and
+    /// publishing it via `Mutex::lock`. Readers and the fitter never
+    /// race because the Arc is swapped, not mutated in place.
+    pub vol_surface_cache:
+        Mutex<Arc<std::collections::HashMap<(String, String, char), VolSurfaceCacheEntry>>>,
 
     /// IPC events server handle. Held so handle_place can publish
     /// place_ack events directly (without threading the server arc
@@ -178,11 +198,11 @@ impl Runtime {
         };
         let risk = RiskMonitor::new(risk_cfg);
 
-        // Constraint checker: Phase 4 wires one per ENABLED product.
-        // Multi-product scope drives one checker per product
-        // ("delta_for_product" is per-product). For now we pick the
-        // first enabled product as the primary; further products would
-        // need a fanout layer (Phase 4.x follow-up).
+        // Constraint checker: one per ENABLED product. Multi-product
+        // scope drives one checker per product ("delta_for_product"
+        // is per-product). For now we pick the first enabled product
+        // as the primary; further products would need a fanout
+        // layer.
         let primary_product = cfg
             .products
             .iter()
@@ -226,8 +246,9 @@ impl Runtime {
             market_data: Mutex::new(market_data),
             snapshot: Mutex::new(snapshot),
             qualified_contracts: Mutex::new(std::collections::HashMap::new()),
+            contract_by_key: Mutex::new(std::collections::HashMap::new()),
             latency_samples: Mutex::new(crate::latency::LatencySamples::new()),
-            vol_surface_cache: Mutex::new(std::collections::HashMap::new()),
+            vol_surface_cache: Mutex::new(Arc::new(std::collections::HashMap::new())),
             ipc_server: Mutex::new(None),
             account: Mutex::new(corsair_broker_api::AccountSnapshot {
                 net_liquidation: 0.0,
@@ -351,10 +372,10 @@ impl Runtime {
     }
 
     /// Wait for the broker's initial state snapshot (positions / open
-    /// orders / account values). Calls `Broker::wait_for_initial_snapshot`
-    /// which is a no-op for synchronously-bootstrapping adapters (PyO3
-    /// IbkrAdapter) and gates on PositionEnd / OpenOrderEnd /
-    /// AccountDownloadEnd for NativeBroker.
+    /// orders / account values). Calls `Broker::wait_for_initial_snapshot`,
+    /// which on `NativeBroker` gates on PositionEnd / OpenOrderEnd /
+    /// AccountDownloadEnd. The default trait impl is a no-op for
+    /// adapters that bootstrap synchronously inside `connect()`.
     async fn wait_for_native_seeding(self: &Arc<Self>) {
         let timeout = std::time::Duration::from_secs(15);
         log::info!(
@@ -368,10 +389,10 @@ impl Runtime {
     }
 
     /// Read positions from the broker, seed PortfolioState (options) and
-    /// HedgeManager (futures). Mirrors `seed_from_ibkr` in Python AND
-    /// the boot reconcile step CLAUDE.md §10 names as a hard live
-    /// prerequisite. Skipping the hedge reconcile leaves hedge_qty=0
-    /// locally on every restart and triggers spurious delta_kill.
+    /// HedgeManager (futures). Implements the boot reconcile step
+    /// CLAUDE.md §10 names as a hard live prerequisite. Skipping the
+    /// hedge reconcile leaves hedge_qty=0 locally on every restart and
+    /// triggers spurious delta_kill.
     async fn seed_positions_from_broker(self: &Arc<Self>) -> Result<(), RuntimeError> {
         let positions = {
             let b = self.broker.clone();
@@ -418,6 +439,14 @@ impl Runtime {
                         );
                         continue;
                     };
+                    // Greeks/current_price seeded to 0 here; the
+                    // 5-second `periodic_greek_refresh` task in
+                    // `tasks.rs` populates them from market_data once
+                    // ticks are flowing. The 6-second boot-burn in
+                    // `periodic_risk_check` (also tasks.rs) is keyed
+                    // off this 5 s cadence — it ensures we don't run
+                    // a delta_kill check before the first refresh has
+                    // populated greeks.
                     to_insert.push(corsair_position::Position {
                         product: pos.contract.symbol.clone(),
                         strike,
@@ -610,17 +639,6 @@ impl Runtime {
         changes
     }
 
-    /// Run a closure with a `&dyn MarketView` borrowed from
-    /// MarketDataState. The closure runs while the mutex is held;
-    /// keep it short.
-    pub fn with_market_view<R>(
-        &self,
-        f: impl FnOnce(&dyn corsair_position::MarketView) -> R,
-    ) -> R {
-        let s = self.market_data.lock().unwrap();
-        f(&*s)
-    }
-
     /// Disconnect cleanly. Called from the shutdown handler.
     pub async fn shutdown(self: &Arc<Self>) -> Result<(), RuntimeError> {
         log::warn!("corsair_broker daemon shutting down");
@@ -632,10 +650,10 @@ impl Runtime {
 
 fn build_broker(cfg: &BrokerDaemonConfig) -> Result<Arc<dyn Broker + Send + Sync>, RuntimeError> {
     match cfg.broker.kind.as_str() {
-        // Native Rust IBKR client. Phase 6.7 cutover retired the
-        // PyO3+ib_insync bridge; Phase 6.11 deleted the bridge crate
-        // entirely. To roll back to ib_insync the rollback path is
-        // git revert + rebuild, not a runtime config flip.
+        // Native Rust IBKR client. The legacy PyO3+ib_insync bridge
+        // was retired in the Phase 6.7 cutover and deleted in Phase
+        // 6.11. There is no in-place rollback path — reverting to
+        // ib_insync requires git revert + rebuild.
         "ibkr" | "ibkr_native" => {
             let ibkr = cfg
                 .broker
@@ -687,8 +705,12 @@ fn build_hedge_fanout(cfg: &BrokerDaemonConfig) -> HedgeFanout {
             rebalance_cadence_sec: cfg.hedging.rebalance_cadence_sec,
             include_in_daily_pnl: cfg.hedging.include_in_daily_pnl,
             flatten_on_halt_enabled: cfg.hedging.flatten_on_halt,
-            ioc_tick_offset: cfg.hedging.ioc_tick_offset,
-            hedge_tick_size: cfg.hedging.hedge_tick_size,
+            // Dead — hedge orders are MARKET-IOC since 2026-05-04
+            // (CLAUDE.md §10). The corsair_hedge::HedgeConfig struct
+            // still carries these fields for back-compat; we pass
+            // arbitrary placeholders.
+            ioc_tick_offset: 0,
+            hedge_tick_size: 0.0,
             lockout_days: cfg.hedging.hedge_lockout_days,
         }));
     }
@@ -760,15 +782,15 @@ hedging:
     }
 
     #[test]
-    fn shadow_mode_default_when_unset() {
+    fn live_mode_default_when_unset() {
         std::env::remove_var("CORSAIR_BROKER_SHADOW");
-        assert_eq!(RuntimeMode::from_env(), RuntimeMode::Shadow);
+        assert_eq!(RuntimeMode::from_env(), RuntimeMode::Live);
     }
 
     #[test]
-    fn live_mode_when_zero() {
-        std::env::set_var("CORSAIR_BROKER_SHADOW", "0");
-        assert_eq!(RuntimeMode::from_env(), RuntimeMode::Live);
+    fn shadow_mode_when_one() {
+        std::env::set_var("CORSAIR_BROKER_SHADOW", "1");
+        assert_eq!(RuntimeMode::from_env(), RuntimeMode::Shadow);
         std::env::remove_var("CORSAIR_BROKER_SHADOW");
     }
 

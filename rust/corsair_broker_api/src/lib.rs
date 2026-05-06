@@ -74,16 +74,12 @@ pub const STREAM_CAPACITY: usize = 4096;
 ///
 /// # Implementations
 ///
-/// - `corsair_broker_ibkr` — IBKR API V100+. Phase 2-5: bridged through
-///   Python `ib_insync` via PyO3. Phase 6+: native Rust wire client.
+/// - `corsair_broker_ibkr_native` — native Rust IBKR API V100+ wire
+///   client. The PyO3+`ib_insync` bridge that previously implemented
+///   this trait was retired in the Phase 6.7 cutover (2026-05-02) and
+///   the bridge crate was deleted in Phase 6.11.
 /// - `corsair_broker_ilink` (future) — CME iLink (FIX 4.2) + MDP3 +
-///   FCM drop-copy. Phase 7.
-///
-/// # Cross-reference to current Python (Phase 0)
-///
-/// Each method below maps to a specific operation in today's
-/// `src/*.py`. The mapping is given as a comment so reviewers can verify
-/// the surface covers every IBKR call we currently make.
+///   FCM drop-copy.
 #[async_trait]
 pub trait Broker: Send + Sync + 'static {
     // ── Lifecycle ───────────────────────────────────────────────────
@@ -130,6 +126,17 @@ pub trait Broker: Send + Sync + 'static {
     /// overrides. Removes ~30 µs of place_order setup overhead from
     /// the wire_timing histogram vs the call-boundary "marker" times.
     fn drain_wire_timing(&self, _order_id: u64) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Honest amend RTT timestamp. Returns wall-clock ns when the
+    /// broker observed IBKR confirming the new price (i.e. an
+    /// OpenOrder whose lmt_price matches what we asked for).
+    /// Distinct from the resolution path which is permissive (it
+    /// accepts the IB Gateway's PreSubmitted echo so the trader
+    /// never timeouts on amends). Default impl returns None for
+    /// adapters that don't instrument; NativeBroker overrides.
+    fn drain_strict_amend_ack_ns(&self, _order_id: u64) -> Option<u64> {
         None
     }
 
@@ -282,7 +289,8 @@ pub trait Broker: Send + Sync + 'static {
     /// active subscriptions land here. Filter by
     /// [`Tick::instrument_id`].
     ///
-    /// Maps to: `Ticker.updateEvent` in ib_insync.
+    /// Wire equivalent: a stream of IBKR `tickPrice` / `tickSize`
+    /// (and friends) consolidated into the [`Tick`] envelope.
     fn subscribe_ticks_stream(&self) -> broadcast::Receiver<Tick>;
 
     /// Subscribe to broker errors (Error 320, 10197, blackouts, etc.).
@@ -310,13 +318,11 @@ pub trait Broker: Send + Sync + 'static {
 
     /// Wait until the adapter's initial state snapshot has finished
     /// streaming (positions, open orders, account values). Adapters
-    /// that bootstrap synchronously inside `connect()` (PyO3 IbkrAdapter
-    /// is one — ib_insync awaits all the bootstrap futures before
-    /// connect returns) can leave this as the default no-op. Adapters
-    /// that stream asynchronously after connect (NativeBroker's
-    /// reqPositions / reqOpenOrders / reqAccountUpdates) MUST override
-    /// to gate the runtime on PositionEnd / OpenOrderEnd /
-    /// AccountDownloadEnd.
+    /// that bootstrap synchronously inside `connect()` can leave this
+    /// as the default no-op. Adapters that stream asynchronously
+    /// after connect (NativeBroker's reqPositions / reqOpenOrders /
+    /// reqAccountUpdates) MUST override to gate the runtime on
+    /// PositionEnd / OpenOrderEnd / AccountDownloadEnd.
     ///
     /// CLAUDE.md §10 names live-deployment position reconciliation as
     /// a hard prerequisite — this method is the trait-level surface

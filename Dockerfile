@@ -41,9 +41,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/build/rust/target \
     maturin build --release --features extension-module --out /wheels --interpreter python3
 
-# Build the corsair_trader binary (Rust port of src/trader/main.py).
-# Cleanup pass 11, 2026-05-01: replaces the Python trader binary;
-# selectable at runtime via env var (see compose).
+# Build the corsair_trader binary (Rust hot-path trader). Replaced the
+# original Python trader during Phase 6.7+ cleanup; the Python source
+# was deleted in the dead-code purge. This is now the only trader.
 WORKDIR /build/rust
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/build/rust/target \
@@ -66,25 +66,33 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cargo build --release --package corsair_ipc --example inject_place_order \
     && cp target/release/examples/inject_place_order /usr/local/bin/corsair_inject_place_order
 
+# Synthetic tick replay harness — drives the trader from a JSONL
+# recording for offline latency regression A/B testing. Stands in for
+# corsair_broker_rs so a stopped broker frees the SHM ring path.
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/build/rust/target \
+    cargo build --release --bin corsair_tick_replay \
+    && cp target/release/corsair_tick_replay /usr/local/bin/corsair_tick_replay
+
 # ── Stage 2: runtime image ────────────────────────────────────────────
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# tzdata + tzdata-legacy: needed by chrono-tz (US/Central rollover) and
-# (legacy) ib_insync — kept legacy DB even after ib_insync was retired
-# in Phase 6.7 because some Python parity tools still parse old aliases.
+# tzdata: needed by chrono-tz (US/Central session rollover). The
+# tzdata-legacy package was dropped along with the Python parity tools
+# in the Phase 6.7+ cleanup — no remaining consumer of the legacy alias DB.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        tzdata tzdata-legacy \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install the Rust hot-path wheel built in stage 1.
-# Production runtime is now the Rust broker + Rust trader binaries;
-# the Python wheel is here for parity tests and offline tools (e.g.
-# scripts/simulate_latency.py uses corsair_pricing.compute_greeks).
+# Production runtime is the Rust broker + Rust trader binaries; the
+# Python wheel is here for offline ops/latency tools that import
+# corsair_pricing (e.g. scripts/simulate_latency.py).
 COPY --from=rust-build /wheels/*.whl /wheels/
 RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 
@@ -98,9 +106,10 @@ COPY --from=rust-build /usr/local/bin/corsair_broker_rust /usr/local/bin/corsair
 # Synthetic place_order injector for v2 wire-timing smoke tests.
 COPY --from=rust-build /usr/local/bin/corsair_inject_place_order /usr/local/bin/corsair_inject_place_order
 
+# Synthetic tick replay harness for offline latency regression testing.
+COPY --from=rust-build /usr/local/bin/corsair_tick_replay /usr/local/bin/corsair_tick_replay
+
 COPY config/ config/
-COPY src/ src/
-COPY tests/ tests/
 
 RUN mkdir -p logs data span_data
 

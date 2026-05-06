@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(4);
-    let (workers, pinner) =
+    let (workers, _pins, pinner) =
         corsair_ipc::cpu_affinity::build_pinner("corsair_broker", desired);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
@@ -73,7 +73,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(mode, RuntimeMode::Shadow) {
         log::warn!(
             "SHADOW MODE: state ingestion only. No orders will be placed. \
-             Set CORSAIR_BROKER_SHADOW=0 to enable live operation."
+             Unset CORSAIR_BROKER_SHADOW (or set to 0) to enable live operation."
         );
     }
 
@@ -86,8 +86,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         log::error!("market data subscription failed: {e}");
     }
 
-    // IPC server — gated by env so we don't accidentally clobber the
-    // Python broker's IPC files during shadow validation.
+    // IPC server — gated by env so the broker daemon can be spun up
+    // for diagnostics without exposing IPC rings.
     if std::env::var("CORSAIR_BROKER_IPC_ENABLED")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)

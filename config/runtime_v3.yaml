@@ -68,6 +68,10 @@ quoting:
   gtd_refresh_lead_s: 3.5
   dead_band_ticks: 2
   min_send_interval_ms: 250
+  # Spec §3.4: skip both sides if half_spread > N × min_edge.
+  # 4.0 = skip when half_spread > 4 × (min_edge_ticks × tick_size) = $0.004.
+  # 0 disables the gate.
+  skip_if_spread_over_edge_mul: 4.0   # spec §3.4. Restored 2026-05-05 after empirical review: 8 ATM fills accounted for ~$144K of $152K total negative edge today; all would have been skipped at 4.0. See docs/research/improvement_spec_2026-05-05.md Rec 4.
 
 hedging:
   enabled: true
