@@ -45,7 +45,7 @@ pub fn allowed_cpus() -> Vec<usize> {
 /// physical core has only itself as sibling). The lowest-numbered
 /// CPU in the sibling pair is the "physical core id" we use for
 /// uniqueness checks in build_pinner.
-fn physical_core_id(cpu: usize) -> usize {
+pub fn physical_core_id(cpu: usize) -> usize {
     let path = format!(
         "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list",
         cpu

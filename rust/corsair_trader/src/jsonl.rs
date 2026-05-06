@@ -73,13 +73,23 @@ pub struct JsonlWriter {
 
 impl JsonlWriter {
     /// Spawn the background writer thread and return a handle.
-    pub fn start(log_dir: PathBuf, prefix: &'static str) -> Self {
+    /// `pin_cpu`, when set, pins the writer to that CPU — used so the
+    /// disk-IO writer doesn't drift onto the hot std::thread's SMT
+    /// sibling (cpu 9 on production cpuset 8-11). 2026-05-06 fix:
+    /// without pinning, the kernel scheduler placed jsonl-trader_de
+    /// on cpu 9 right next to the hot path, causing 6 ms TTT p99
+    /// outliers from SMT execution-unit contention.
+    pub fn start(log_dir: PathBuf, prefix: &'static str, pin_cpu: Option<usize>) -> Self {
         let (tx, rx) = sync_channel::<LogPayload>(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let dropped_clone = Arc::clone(&dropped);
         std::thread::Builder::new()
             .name(format!("jsonl-{}", prefix))
             .spawn(move || {
+                if let Some(cpu) = pin_cpu {
+                    corsair_ipc::cpu_affinity::pin_thread_to_cpu(cpu);
+                    log::info!("jsonl-{}: pinned to cpu {}", prefix, cpu);
+                }
                 writer_task(log_dir, prefix, rx, dropped_clone);
             })
             .expect("jsonl writer thread spawn");

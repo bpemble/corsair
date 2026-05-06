@@ -124,21 +124,39 @@ fn main() -> std::io::Result<()> {
     let allowed_cpus_main = corsair_ipc::cpu_affinity::allowed_cpus();
     let main_rt = if busy_poll_main {
         let hot_cpu = allowed_cpus_main.first().copied().unwrap_or(0);
+        // Tokio worker MUST land on a different physical core than the
+        // hot std::thread — otherwise it shares execution units with
+        // the SMT sibling. Bug 2026-05-06: previously picked "first cpu
+        // != hot_cpu" which selected cpu 9 (SMT sibling of cpu 8) on
+        // hybrid Intel parts, causing 6 ms TTT p99 outliers from
+        // pipeline contention. Skip cpus that share a physical core
+        // with hot_cpu.
+        let hot_core = corsair_ipc::cpu_affinity::physical_core_id(hot_cpu);
         let tokio_cpu = allowed_cpus_main
             .iter()
-            .find(|&&c| c != hot_cpu)
+            .find(|&&c| {
+                c != hot_cpu
+                    && corsair_ipc::cpu_affinity::physical_core_id(c) != hot_core
+            })
             .copied()
-            .unwrap_or(hot_cpu);
+            .unwrap_or_else(|| {
+                allowed_cpus_main
+                    .iter()
+                    .find(|&&c| c != hot_cpu)
+                    .copied()
+                    .unwrap_or(hot_cpu)
+            });
         let workers = std::env::var("CORSAIR_TRADER_WORKERS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(1);
         log::warn!(
             "busy_poll: tokio main_rt — {} worker(s) pinned to cpu {} \
-             (hot std::thread reserves cpu {})",
+             (hot std::thread reserves cpu {} on physical core {})",
             workers,
             tokio_cpu,
-            hot_cpu
+            hot_cpu,
+            hot_core
         );
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
@@ -264,16 +282,28 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
     commands_ring.open_notify(&commands_notify_path, /* as_writer */ true)?;
     log::warn!("SHM client connected to {} (notify-fifo enabled)", base);
 
-    // JSONL writers — background tasks, hot path enqueues only.
+    // JSONL writers — background threads, hot path enqueues only.
+    // Pin them to the bg cpu (cpu 11 on production) so they share a
+    // physical core with the bg runtime rather than drifting onto
+    // cpu 9 (SMT sibling of hot cpu 8). Disk-IO + JSON serialization
+    // have rare bursts of activity that would steal pipeline cycles
+    // from the hot thread if co-located on the same physical core.
     let log_dir = std::env::var("CORSAIR_LOGS_DIR")
         .unwrap_or_else(|_| "/app/logs-paper".into());
+    let jsonl_pin = corsair_ipc::cpu_affinity::allowed_cpus()
+        .iter()
+        .rev()
+        .next()
+        .copied();
     let events_log = jsonl::JsonlWriter::start(
         std::path::PathBuf::from(&log_dir),
         "trader_events",
+        jsonl_pin,
     );
     let decisions_log = jsonl::JsonlWriter::start(
         std::path::PathBuf::from(&log_dir),
         "trader_decisions",
+        jsonl_pin,
     );
     let events_log = Arc::new(events_log);
     let decisions_log = Arc::new(decisions_log);
