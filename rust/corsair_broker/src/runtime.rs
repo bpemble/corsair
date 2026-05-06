@@ -126,10 +126,18 @@ pub struct Runtime {
     /// Most recent SABR fit per (product, expiry_str, side_char).
     /// Populated by the vol_surface fitter; consumed by
     /// build_chain_payload to compute per-leg theo prices.
-    /// 2026-05-05 evening change: keyed by side ('C' or 'P') so that
-    /// per-side fits land in distinct cache slots — the combined fit
-    /// was smearing C/P smile asymmetries during one-sided flow,
-    /// producing 1-2 tick per-strike theo bias on the busy side.
+    ///
+    /// 2026-05-06 change: the fitter now produces ONE combined fit
+    /// per (product, expiry) on OTM-only data and writes the same
+    /// `VolSurfaceCacheEntry` under both side keys ('C' and 'P').
+    /// The (expiry, side_char) shape is preserved so per-side
+    /// readers (build_chain_payload, ipc.rs theo enrichment, trader
+    /// `vol_surfaces`) keep working unchanged — they just see
+    /// matching params on both sides instead of independent fits.
+    /// See `vol_surface.rs` for the rationale (per-side fits were
+    /// pinning C-side ρ at +0.999 ~30% of cycles on noisy deep-ITM
+    /// data despite identical underlying smile).
+    ///
     /// Stored as `Mutex<Arc<HashMap<...>>>` so readers clone only the
     /// Arc (`vol_surface_cache.lock().unwrap().clone()` is cheap)
     /// instead of deep-cloning the inner map. The fitter mutates by
