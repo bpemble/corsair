@@ -271,6 +271,20 @@ pub fn decide_on_tick(
     // when this drift exceeds 50 ticks, so seeing it here means
     // either spot has moved between fits or the broker accepted a
     // borderline fit.
+    //
+    // DO NOT "fix" this to use vp_msg.spot_at_fit thinking it
+    // aligns with §19. The §19 fix is about the Taylor anchor at
+    // line 341 below. THIS gate intentionally compares against the
+    // fit-time forward (= pricing_forward = vp_msg.forward), because
+    // its job is precisely to detect when current spot has drifted
+    // far from the fit's view of the world — the carry between
+    // front-month spot and the option's pricing forward is part of
+    // what this gate is sized to absorb (200 ticks ≈ $0.10 covers
+    // the HG K6→M6 carry of ~100 ticks plus ~100 ticks of post-fit
+    // drift). Substituting spot_at_fit removes the carry component
+    // from the comparison and changes the gate's semantics in a
+    // direction-asymmetric way that can mask stale-fit conditions.
+    // See audits/sections-16-19-audit.md §1.4.
     let drift = (spot - pricing_forward).abs();
     let max_drift = MAX_FORWARD_DRIFT_TICKS as f64 * snap.tick_size;
     if drift > max_drift {
