@@ -19,3 +19,6 @@ tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Used by the `flatten` example to read positions from the JSON
+# chain_snapshot. Not pulled into the lib build.
+serde_json = "1"

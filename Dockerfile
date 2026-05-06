@@ -74,6 +74,15 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cargo build --release --bin corsair_tick_replay \
     && cp target/release/corsair_tick_replay /usr/local/bin/corsair_tick_replay
 
+# Position flattener — replaces broken scripts/flatten_persistent.py.
+# Reads chain_snapshot.json, sends one closing order per non-zero
+# position into the broker's IPC commands ring. Bypasses trader risk
+# gates so it works while the trader is killed.
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/build/rust/target \
+    cargo build --release --package corsair_ipc --example flatten \
+    && cp target/release/examples/flatten /usr/local/bin/corsair_flatten
+
 # ── Stage 2: runtime image ────────────────────────────────────────────
 FROM python:3.11-slim
 
@@ -108,6 +117,9 @@ COPY --from=rust-build /usr/local/bin/corsair_inject_place_order /usr/local/bin/
 
 # Synthetic tick replay harness for offline latency regression testing.
 COPY --from=rust-build /usr/local/bin/corsair_tick_replay /usr/local/bin/corsair_tick_replay
+
+# Position flattener (replaces broken scripts/flatten_persistent.py).
+COPY --from=rust-build /usr/local/bin/corsair_flatten /usr/local/bin/corsair_flatten
 
 COPY config/ config/
 

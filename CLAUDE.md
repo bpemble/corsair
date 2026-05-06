@@ -37,12 +37,17 @@ The legacy `config/hg_v1_4_paper.yaml` and `config/corsair_v2_config.yaml`
 were deleted in the 2026-05-05 cleanup pass — they had been dead since
 the cutover. The v1.4 spec mapping lives in `docs/hg_spec_v1.4.md`.
 
-**Operational scripts**: `scripts/flatten_persistent.py` (the
-"sanctioned way to clear positions" referenced in §15) currently
-imports `ib_insync` and is **broken** since `requirements.txt` no
-longer ships it. The committed flatten script `scripts/flatten.py`
-was deleted alongside the other broken `ib_insync` consumers. A Rust-
-IPC-based replacement is needed before any flatten runbook is run.
+**Operational scripts**: `scripts/flatten_persistent.py` and
+`scripts/flatten.py` were both broken (ib_insync) and have been
+deleted. The replacement is the Rust-IPC `corsair_flatten` binary
+(baked into the corsair-corsair image at `/usr/local/bin/corsair_flatten`,
+source: `rust/corsair_ipc/examples/flatten.rs`). It reads
+`hg_chain_snapshot.json`, computes one closing limit order per
+non-zero position, and writes them to the broker's IPC commands ring
+— bypassing the trader's risk gates so it works while the trader is
+killed. Default behavior is aggressive (cross opposite-side BBO);
+`--passive` rests at same-side BBO instead. See its `--help` for
+flags. Single-shot, not a retry loop — re-run after partial fills.
 
 ## Current spec: v1.4 (HG front-only)
 
@@ -974,8 +979,9 @@ Highlights worth knowing about when debugging:
 - Scripts: `scripts/flatten.py`, `reconcile_positions.py`,
   `capture_place_order_bytes.py`, `parity_compare.py`,
   `rust_trader_parity.py` deleted (broken `ib_insync` imports).
-  **`scripts/flatten_persistent.py` is broken too (untracked WIP) —
-  the §15 runbook step needs replacement before being relied on.**
+  `scripts/flatten_persistent.py` was also broken (ib_insync) and
+  was deleted on 2026-05-06; replaced by the `corsair_flatten` Rust
+  binary (`rust/corsair_ipc/examples/flatten.rs`).
 - Tests: `test_sabr.py`, `test_calibrate_parity.py`, `test_pricing_parity.py`,
   `test_decide_quote.py` — all unimportable. Only `test_ipc_protocol.py`
   remains.
@@ -1008,3 +1014,85 @@ Highlights worth knowing about when debugging:
   `CORSAIR_BROKER_SHADOW=1` to opt-in.
 - Stale Phase / ib_insync / PyO3 / "Mirrors X.py" comments removed
   throughout the broker and broker_api crates.
+
+## 19. Taylor reprice — anchor on `spot_at_fit`, NOT `forward` (2026-05-06)
+
+The trader applies a first-order Taylor adjustment to keep theos
+tracking spot between SABR fits (~60s cadence):
+
+```
+theo ≈ theo_at_fit + delta_at_fit × (current_spot − spot_at_fit)
+```
+
+Both `theo_at_fit` and `delta_at_fit` are cached at fit time
+(`theo_cache: DashMap<TheoCacheKey, (f64, f64)>`). The same formula
+runs in both `decision::decide_on_tick` and `main::staleness_check`
+so the staleness loop's drift comparison is against current-spot
+theo, not fit-frozen theo.
+
+### THE BUG WE LIVED THROUGH
+
+Initial Rust port (2026-05-06 morning) used `(spot − pricing_forward)`
+as the anchor. **This is wrong on HG.**
+
+`spot` = HGK6 front-month tick stream we subscribe to.
+`pricing_forward` = HGM6 parity-implied F (the option's actual
+underlying month). They differ by structural calendar carry of
+~$0.04–0.05 (80–100 ticks).
+
+Treating that carry as "drift" shifted every theo by `delta × carry`
+≈ `delta × $0.05` ≈ $0.025 per option. Direction:
+- **Calls** (delta > 0, spot < forward → drift < 0) → theo dropped
+  → BUYs landed below market mid (good if you want passive bids)
+  → **SELLs would have been below the bid → cross-protect skipped
+    every SELL → no two-sided quotes anywhere on the call side.**
+- **Puts** (delta < 0) → mirror image, no two-sided BUY-side puts.
+
+Live symptom: dashboard shows call BIDs only (no asks), put ASKs only
+(no bids). `skip_would_cross_bid` and `skip_would_cross_ask` counters
+spike. Verified live on 2026-05-06 between 12:35 and 12:45 UTC.
+
+### THE FIX (current state)
+
+Broker captures `und_spot` at fit time and ships it as `spot_at_fit`
+in every `vol_surface` event:
+- `corsair_broker/src/vol_surface.rs::snapshot_chain` returns
+  `(forward, und_spot, …)` instead of `(forward, …)`.
+- `VolSurfaceEvent` adds `spot_at_fit: f64`.
+
+Trader stores it on `VolSurfaceEntry` and uses it as the Taylor
+anchor:
+- `corsair_trader/src/messages.rs::VolSurfaceMsg::spot_at_fit:
+   Option<f64>` (Option for back-compat with older brokers).
+- `corsair_trader/src/state.rs::VolSurfaceEntry::spot_at_fit: f64`.
+- Decision flow: `(spot − vp_msg.spot_at_fit)`. Staleness loop:
+  same.
+
+### How to verify it's working
+
+1. Pull a recent `vol_surface` event from `trader_events-*.jsonl` —
+   it must contain BOTH `forward` AND `spot_at_fit`. They typically
+   differ by $0.04–0.05 (the K6→M6 carry).
+2. Check `decision.rs` — the formula MUST read `vp_msg.spot_at_fit`,
+   never `vp_msg.forward` (or `pricing_forward`) for the Taylor term.
+3. Live chain check: on a calm market with the trader running,
+   most ATM-window strikes should be **two-sided** (`bid_live=True
+   AND ask_live=True`). One-sided coverage is the canary for the
+   carry bug recurring.
+
+### Why this is independent of §16's e6486f6 fix
+
+§16's root-cause was passing CURRENT spot to SVI's `compute_theo` —
+breaking the SVI `m` log-moneyness anchor. That fix locks SVI to
+`fit_forward`. Taylor reprice is a SEPARATE first-order correction
+on top — it doesn't touch SVI at all, just shifts the post-Black76
+theo. Both must coexist:
+- SVI surface anchored on `fit_forward` (don't change this).
+- Black76 evaluated at `fit_forward` (gives `theo_at_fit`,
+  `delta_at_fit`).
+- Taylor adjustment uses `(current_spot − spot_at_fit)`.
+
+If you ever see a regression to `spot − forward` in the Taylor
+formula, revert it immediately and replace with `spot − spot_at_fit`.
+It is NOT just a small numerical difference — it kills two-sided
+quoting entirely on any product with calendar carry.
