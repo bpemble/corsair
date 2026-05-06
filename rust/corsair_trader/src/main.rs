@@ -757,9 +757,31 @@ fn process_event(
             // current spot — a few ms of IPC latency, well below
             // tick precision. Falling back to `vs.forward` would
             // re-introduce the carry-confusion bug.
-            let spot_at_fit = vs
-                .spot_at_fit
-                .unwrap_or_else(|| state.scalars.lock().underlying_price);
+            //
+            // §19 audit follow-up: throttled warning when the fallback
+            // fires, so a future broker change that silently drops the
+            // field gets noticed in telemetry. Logs at counts 1, 2, 4,
+            // 8, 16, 32 then falls silent — once is informative, the
+            // fallback is correct so we don't need to spam. See
+            // audits/sections-16-19-audit.md §2.4.
+            let spot_at_fit = match vs.spot_at_fit {
+                Some(v) => v,
+                None => {
+                    static MISSING_COUNT: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let n = MISSING_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if n < 50 && (n + 1).is_power_of_two() {
+                        log::warn!(
+                            "vol_surface from broker missing spot_at_fit \
+                             (event #{}); falling back to current spot. \
+                             §19 Taylor anchor protection is degraded; \
+                             investigate broker version.",
+                            n + 1
+                        );
+                    }
+                    state.scalars.lock().underlying_price
+                }
+            };
             let entry = Arc::new(crate::state::VolSurfaceEntry {
                 forward: vs.forward,
                 params: vs.params,
