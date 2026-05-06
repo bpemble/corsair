@@ -22,6 +22,48 @@
 
 use crate::messages::TickMsg;
 
+/// Read the `type` (always emitted) and `ts_ns` (optional) fields from
+/// a msgpack body without allocating. Returns `(type_bytes, ts_ns)`,
+/// where `type_bytes` borrows from `body`. None on malformed input.
+///
+/// Bundle 2C (2026-05-06): replaces the previous
+/// `rmp_serde::from_slice::<MsgHeader>(&body)` round trip, which built
+/// `MsgHeader { msg_type: String, ts_ns: Option<u64> }` per event.
+/// The String alloc was paid on every inbound event (~50/sec dominant
+/// = ticks); switching to a borrow-only walker eliminates the
+/// allocation and the reflection cost.
+pub fn decode_header(body: &[u8]) -> Option<(&[u8], Option<u64>)> {
+    let mut p = 0usize;
+    let (n_pairs, after_hdr) = read_map_header(body, p)?;
+    p = after_hdr;
+    let mut type_bytes: Option<&[u8]> = None;
+    let mut ts_ns: Option<u64> = None;
+    for _ in 0..n_pairs {
+        let (key, key_end) = read_str_bytes(body, p)?;
+        p = key_end;
+        match key.len() {
+            4 if key == b"type" => {
+                let (s, end) = read_str_bytes(body, p)?;
+                type_bytes = Some(s);
+                p = end;
+            }
+            5 if key == b"ts_ns" => {
+                if *body.get(p)? == 0xc0 {
+                    p += 1;
+                } else {
+                    let (v, end) = read_int(body, p)?;
+                    ts_ns = Some(v as u64);
+                    p = end;
+                }
+            }
+            _ => {
+                p = skip_value(body, p)?;
+            }
+        }
+    }
+    type_bytes.map(|t| (t, ts_ns))
+}
+
 /// Decode a `tick` msgpack body into `out`. Returns true on success.
 /// `out` is reused across calls; pre-existing `String` capacities for
 /// `expiry`/`right` are kept to avoid allocator pressure.

@@ -305,6 +305,7 @@ dependencies = [
  "parking_lot",
  "rmp-serde",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

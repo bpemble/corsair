@@ -12,21 +12,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Lightweight first-pass header. Hot path parses ONLY this, then
-/// re-parses the body bytes directly into the typed message struct
-/// for the matched variant. Avoids the `serde_json::Value`-tree round
-/// trip the previous `GenericMsg` carried via `#[serde(flatten)] extra`.
-///
-/// rmp_serde silently ignores unknown msgpack-map keys when a
-/// `#[derive(Deserialize)]` struct doesn't declare `deny_unknown_fields`,
-/// so this header skips every other field cheaply (no Value allocations).
-#[derive(Debug, Deserialize)]
-pub struct MsgHeader {
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    #[serde(default)]
-    pub ts_ns: Option<u64>,
-}
+// MsgHeader was retired in Bundle 2C (2026-05-06): replaced by
+// `msgpack_decode::decode_header`, a hand-rolled walker that returns
+// borrowed bytes for the type field — no `String` allocation per
+// inbound event.
 
 /// Typed kill / resume — replaces ad-hoc `extra.get("source")` lookups.
 #[derive(Debug, Deserialize)]

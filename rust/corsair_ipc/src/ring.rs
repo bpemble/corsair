@@ -253,6 +253,62 @@ impl Ring {
         self.read_atomic().store(v, ord);
     }
 
+    /// Producer side: write a body as a length-prefixed frame, in one
+    /// pass. The length prefix (4-byte BE u32) is written directly into
+    /// the mmap region — no intermediate `Vec` allocation. Equivalent
+    /// to `write_frame(&pack_frame(body))` but skips the alloc + copy.
+    ///
+    /// Bundle 1B (2026-05-06). The pack_frame Vec allocation cost is
+    /// most measurable at the broker tick fast-path (high frequency)
+    /// where every published TickEvent paid for one allocation.
+    pub fn write_body(&mut self, body: &[u8]) -> bool {
+        let n = body.len();
+        let frame_len = 4 + n;
+        if frame_len > self.capacity / 2 {
+            self.frames_dropped += 1;
+            return false;
+        }
+        let w = self.load_write(Ordering::Relaxed);
+        let r = self.load_read(Ordering::Acquire);
+        let free = self.capacity as u64 - (w - r);
+        if (free as usize) < frame_len {
+            self.frames_dropped += 1;
+            return false;
+        }
+        let prefix = (n as u32).to_be_bytes();
+        let pos = (w as usize) % self.capacity;
+        // Write the 4-byte length prefix. The `pos > capacity-4` wrap
+        // case is rare but must be handled (capacity is always exactly
+        // a power of two ≥ 1MiB so it's not a corner-case for tiny
+        // rings used in tests).
+        let end_p = pos + 4;
+        if end_p <= self.capacity {
+            self.mmap[HDR_SIZE + pos..HDR_SIZE + end_p].copy_from_slice(&prefix);
+        } else {
+            let tail = self.capacity - pos;
+            self.mmap[HDR_SIZE + pos..HDR_SIZE + self.capacity]
+                .copy_from_slice(&prefix[..tail]);
+            self.mmap[HDR_SIZE..HDR_SIZE + (4 - tail)]
+                .copy_from_slice(&prefix[tail..]);
+        }
+        // Write body starting at pos+4 (modulo capacity).
+        let body_pos = (pos + 4) % self.capacity;
+        let end_b = body_pos + n;
+        if end_b <= self.capacity {
+            self.mmap[HDR_SIZE + body_pos..HDR_SIZE + end_b].copy_from_slice(body);
+        } else {
+            let tail = self.capacity - body_pos;
+            self.mmap[HDR_SIZE + body_pos..HDR_SIZE + self.capacity]
+                .copy_from_slice(&body[..tail]);
+            self.mmap[HDR_SIZE..HDR_SIZE + (n - tail)]
+                .copy_from_slice(&body[tail..]);
+        }
+        let new_w = w + frame_len as u64;
+        self.store_write(new_w, Ordering::Release);
+        self.notify();
+        true
+    }
+
     /// Producer side: write a complete frame. Returns false on
     /// "buffer full" (caller drops or retries).
     pub fn write_frame(&mut self, frame: &[u8]) -> bool {
@@ -295,6 +351,36 @@ impl Ring {
         self.store_write(new_w, Ordering::Release);
         self.notify();
         true
+    }
+
+    /// Consumer side: read everything available, appending to the
+    /// caller-provided `buf` instead of allocating a new Vec. Returns
+    /// the number of bytes appended.
+    ///
+    /// Lever 2 (2026-05-06): the trader's hot loop calls this on every
+    /// busy-poll iteration; under steady-state ~50 ticks/sec the prior
+    /// `read_available -> Vec; buf.extend_from_slice(&Vec)` did one Vec
+    /// alloc per drain plus a redundant memcpy. Direct extend from
+    /// mmap eliminates the alloc and folds two memcpys into one.
+    pub fn read_available_into(&mut self, buf: &mut Vec<u8>) -> usize {
+        let w = self.load_write(Ordering::Acquire);
+        let r = self.load_read(Ordering::Relaxed);
+        let avail = w.saturating_sub(r) as usize;
+        if avail == 0 {
+            return 0;
+        }
+        let pos = (r as usize) % self.capacity;
+        let end = pos + avail;
+        if end <= self.capacity {
+            buf.extend_from_slice(&self.mmap[HDR_SIZE + pos..HDR_SIZE + end]);
+        } else {
+            let tail = self.capacity - pos;
+            let head_len = avail - tail;
+            buf.extend_from_slice(&self.mmap[HDR_SIZE + pos..HDR_SIZE + self.capacity]);
+            buf.extend_from_slice(&self.mmap[HDR_SIZE..HDR_SIZE + head_len]);
+        }
+        self.store_read(r + avail as u64, Ordering::Release);
+        avail
     }
 
     /// Consumer side: read everything available since last bump.
@@ -398,6 +484,60 @@ mod tests {
     /// is preserved end-to-end. Smoke test only; the real proof is
     /// the documented Acquire/Release pairing on the AtomicU64s and
     /// the absence of pre-fix behavior under loom-style reordering.
+    #[test]
+    fn write_body_round_trip_matches_write_frame() {
+        // Two rings, same input, must produce byte-identical mmap.
+        let dir = tempdir().unwrap();
+        let p1 = dir.path().join("a.events");
+        let p2 = dir.path().join("b.events");
+        let mut r1 = Ring::create_owner(&p1, 4096).unwrap();
+        let mut r2 = Ring::create_owner(&p2, 4096).unwrap();
+        let body = b"hello world";
+        let frame = crate::protocol::pack_frame(body);
+        assert!(r1.write_frame(&frame));
+        assert!(r2.write_body(body));
+        let mut c1 = Ring::open_client(&p1, 4096).unwrap();
+        let mut c2 = Ring::open_client(&p2, 4096).unwrap();
+        assert_eq!(c1.read_available(), c2.read_available());
+    }
+
+    #[test]
+    fn write_body_wrap_around_prefix_split() {
+        // Force the 4-byte length prefix to straddle the buffer wrap:
+        // advance write_offset to land at (capacity-2), then write a
+        // body whose prefix splits between [cap-2..cap] and [0..2].
+        // Capacity must be ≥ 2× frame size (write_body sanity check),
+        // hence 256 with ~60-byte frames.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ring.events");
+        const CAP: usize = 256;
+        let mut server = Ring::create_owner(&path, CAP).unwrap();
+        let mut client = Ring::open_client(&path, CAP).unwrap();
+        // Each round (write then drain) advances the write offset by
+        // (4 + body_len). We want offsets to land at CAP-2 = 254.
+        // 4 frames × 60B body × (4+60) = 256 — overflows. Instead: 4
+        // frames @ 50-byte body → 4*54 = 216, then a 5th frame whose
+        // header lands at offset 216, body at 220, ends at 220+B.
+        // Set B such that next-frame-pos = 254. After this 5th frame
+        // ends at 216 + 4 + B; new pos = (216+4+B) mod 256. We need
+        // pos = 254, so 220 + B ≡ 254 → B = 34.
+        for _ in 0..4 {
+            let body = vec![0xAAu8; 50];
+            assert!(server.write_body(&body));
+            let _ = client.read_available();
+        }
+        let priming = vec![0xCCu8; 34];
+        assert!(server.write_body(&priming));
+        let _ = client.read_available();
+        // Now write_offset % CAP == 254. Next prefix occupies [254..258],
+        // wrapping to [254..256] + [0..2]. Body small.
+        let body_split = vec![0xBBu8; 16];
+        assert!(server.write_body(&body_split));
+        let data = client.read_available();
+        assert_eq!(&data[..4], &(16u32).to_be_bytes());
+        assert_eq!(&data[4..], &body_split[..]);
+    }
+
     #[test]
     fn write_then_read_preserves_byte_order() {
         let dir = tempdir().unwrap();

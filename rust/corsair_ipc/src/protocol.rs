@@ -41,12 +41,40 @@ pub fn try_unpack_frame(buf: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(body))
 }
 
-/// Unpack ALL complete frames in front of buf, leaving partial frame
-/// at tail.
+/// Unpack ALL complete frames in front of buf, leaving any partial
+/// frame at the tail.
+///
+/// Bundle 4H (2026-05-06): cursor-walk implementation. The previous
+/// `while try_unpack_frame { drain }` form did `Vec::drain(..4+size)`
+/// per frame — O(N²) shift cost for N frames in a burst. The cursor
+/// walks all frames in one pass, then a single `drain(..cursor)`
+/// shifts whatever bytes were consumed at the end. Steady-state
+/// (1 frame per drain) is unchanged; bursts of 5+ frames see the win.
 pub fn unpack_all_frames(buf: &mut Vec<u8>) -> io::Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
-    while let Some(body) = try_unpack_frame(buf)? {
-        out.push(body);
+    let mut cursor = 0usize;
+    let n = buf.len();
+    while cursor + 4 <= n {
+        let size = u32::from_be_bytes([
+            buf[cursor],
+            buf[cursor + 1],
+            buf[cursor + 2],
+            buf[cursor + 3],
+        ]) as usize;
+        if size > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("oversize frame: {size} > {MAX_FRAME_BYTES}"),
+            ));
+        }
+        if cursor + 4 + size > n {
+            break;
+        }
+        out.push(buf[cursor + 4..cursor + 4 + size].to_vec());
+        cursor += 4 + size;
+    }
+    if cursor > 0 {
+        buf.drain(..cursor);
     }
     Ok(out)
 }

@@ -257,8 +257,14 @@ pub struct SharedState {
     /// `orderid_to_key` all share the same Arcs.
     pub options: DashMap<OptionKey, OptionState>,
 
-    /// Vol surface params per (expiry, right-char). Bounded by ~4 entries.
-    pub vol_surfaces: DashMap<VolSurfaceKey, VolSurfaceEntry>,
+    /// Vol surface params per (expiry, right-char). Bounded by ~4
+    /// entries.
+    ///
+    /// Bundle 3E (2026-05-06): values are wrapped in `Arc<>` so
+    /// `lookup_vol_surface` can clone the `Arc` (5 ns refcount bump)
+    /// instead of cloning the full `VolSurfaceEntry` (a `String` for
+    /// `model` plus 8 `Option<f64>` fields — measurable per-tick cost).
+    pub vol_surfaces: DashMap<VolSurfaceKey, Arc<VolSurfaceEntry>>,
 
     /// Optimization #3 — SVI/SABR theo cache, keyed by
     /// (strike_bits, expiry, right_char, fit_ts_ns). Stores the pair
@@ -368,19 +374,19 @@ impl SharedState {
         &self,
         expiry: &Arc<str>,
         right: char,
-    ) -> Option<VolSurfaceEntry> {
+    ) -> Option<Arc<VolSurfaceEntry>> {
         self.vol_surfaces
             .get(&(Arc::clone(expiry), right))
-            .map(|r| r.value().clone())
+            .map(|r| Arc::clone(r.value()))
             .or_else(|| {
                 self.vol_surfaces
                     .get(&(Arc::clone(expiry), 'C'))
-                    .map(|r| r.value().clone())
+                    .map(|r| Arc::clone(r.value()))
             })
             .or_else(|| {
                 self.vol_surfaces
                     .get(&(Arc::clone(expiry), 'P'))
-                    .map(|r| r.value().clone())
+                    .map(|r| Arc::clone(r.value()))
             })
     }
 }

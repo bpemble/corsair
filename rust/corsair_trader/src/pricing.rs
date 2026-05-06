@@ -6,6 +6,18 @@
 //! The corsair_pricing crate stays as the Python extension.
 
 use statrs::distribution::{ContinuousCDF, Normal};
+use std::sync::OnceLock;
+
+/// Standard normal `N(0, 1)` shared across calls. Bundle 6K
+/// (2026-05-06): previously each Black-76 evaluation called
+/// `Normal::new(0.0, 1.0).unwrap()` to construct a fresh instance —
+/// not free under statrs (validates parameters; small struct copy).
+/// One-time `OnceLock` init means the hot path reads a `&Normal`
+/// directly.
+fn standard_normal() -> &'static Normal {
+    static N: OnceLock<Normal> = OnceLock::new();
+    N.get_or_init(|| Normal::new(0.0, 1.0).expect("standard normal init"))
+}
 
 /// Black-76 option price. Mirrors corsair_pricing::black76_price.
 pub fn black76_price(f: f64, k: f64, t: f64, sigma: f64, r: f64, right: char) -> f64 {
@@ -33,8 +45,12 @@ pub fn black76_price_and_delta(
     let sqrt_t = t.sqrt();
     let d1 = ((f / k).ln() + 0.5 * sigma * sigma * t) / (sigma * sqrt_t);
     let d2 = d1 - sigma * sqrt_t;
-    let n = Normal::new(0.0, 1.0).unwrap();
-    let disc = (-r * t).exp();
+    let n = standard_normal();
+    // Bundle 6K (2026-05-06): r=0.0 in production (corsair never
+    // configures a non-zero rate). Skip the `exp` call when so;
+    // disc=1.0 collapses the multiply chain. ~10 ns saved per
+    // Black-76 call when r==0.
+    let disc = if r == 0.0 { 1.0 } else { (-r * t).exp() };
     let n_d1 = n.cdf(d1);
     if is_call {
         let price = disc * (f * n_d1 - k * n.cdf(d2));
@@ -48,6 +64,12 @@ pub fn black76_price_and_delta(
 }
 
 /// SABR Hagan (2002) implied vol. Mirror of src/sabr.py:sabr_implied_vol.
+///
+/// Bundle 6K (2026-05-06): caches `one_minus_beta` and powers thereof
+/// once per call, replacing repeated `(1.0 - beta)` and powf reuses.
+/// `.powf` calls remain only where the exponent is a runtime float
+/// (carry the actual `1.0 - beta` and `(1.0-beta)/2`); the `.powi`
+/// uses sit on integer exponents and are already cheap.
 pub fn sabr_implied_vol(
     f: f64, k: f64, t: f64,
     alpha: f64, beta: f64, rho: f64, nu: f64,
@@ -57,21 +79,30 @@ pub fn sabr_implied_vol(
     }
     const EPS: f64 = 1e-7;
 
+    let one_minus_beta = 1.0 - beta;
+    let one_minus_beta_sq = one_minus_beta * one_minus_beta;
+    let one_minus_beta_4 = one_minus_beta_sq * one_minus_beta_sq;
+    let rho_sq = rho * rho;
+    let nu_sq = nu * nu;
+    let alpha_sq = alpha * alpha;
+    let p3 = (2.0 - 3.0 * rho_sq) * nu_sq / 24.0;
+
     // ATM case.
     if (f - k).abs() < EPS * f {
         let fmid = f;
-        let fmid_beta = fmid.powf(1.0 - beta);
+        let fmid_beta = fmid.powf(one_minus_beta);
         let term1 = alpha / fmid_beta;
-        let p1 = ((1.0 - beta).powi(2) / 24.0) * alpha * alpha
-            / fmid.powf(2.0 - 2.0 * beta);
+        let p1 = (one_minus_beta_sq / 24.0) * alpha_sq
+            / fmid.powf(2.0 * one_minus_beta);
         let p2 = 0.25 * rho * beta * nu * alpha / fmid_beta;
-        let p3 = (2.0 - 3.0 * rho * rho) * nu * nu / 24.0;
         return term1 * (1.0 + (p1 + p2 + p3) * t);
     }
 
     let fk = f * k;
-    let fk_beta = fk.powf((1.0 - beta) / 2.0);
+    let fk_beta = fk.powf(0.5 * one_minus_beta);
     let log_fk = (f / k).ln();
+    let log_fk_sq = log_fk * log_fk;
+    let log_fk_4 = log_fk_sq * log_fk_sq;
 
     let z = (nu / alpha) * fk_beta * log_fk;
     let xz = if z.abs() < EPS {
@@ -81,15 +112,13 @@ pub fn sabr_implied_vol(
         z / ((sqrt_term + z - rho) / (1.0 - rho)).ln()
     };
 
-    let one_minus_beta = 1.0 - beta;
     let denom1 = fk_beta
         * (1.0
-            + one_minus_beta.powi(2) / 24.0 * log_fk.powi(2)
-            + one_minus_beta.powi(4) / 1920.0 * log_fk.powi(4));
+            + one_minus_beta_sq / 24.0 * log_fk_sq
+            + one_minus_beta_4 / 1920.0 * log_fk_4);
 
-    let p1 = one_minus_beta.powi(2) / 24.0 * alpha * alpha / fk.powf(one_minus_beta);
+    let p1 = one_minus_beta_sq / 24.0 * alpha_sq / fk.powf(one_minus_beta);
     let p2 = 0.25 * rho * beta * nu * alpha / fk_beta;
-    let p3 = (2.0 - 3.0 * rho * rho) * nu * nu / 24.0;
 
     (alpha / denom1) * xz * (1.0 + (p1 + p2 + p3) * t)
 }

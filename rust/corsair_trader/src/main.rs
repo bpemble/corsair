@@ -21,6 +21,7 @@ mod ipc;
 mod jsonl;
 mod messages;
 mod msgpack_decode;
+mod msgpack_encode;
 mod pricing;
 mod state;
 mod tte_cache;
@@ -107,23 +108,60 @@ fn main() -> std::io::Result<()> {
         .format_timestamp_millis()
         .init();
 
-    // Multi-thread tokio runtime with pinned workers. Default 2
-    // workers (per CLAUDE.md §17 — busy-poll hot loop + helpers).
-    // CORSAIR_TRADER_WORKERS overrides. Pinning honors docker
-    // cpuset; on bare-metal i9-13900K the trader gets cpuset
-    // 8,9,10,11 and SMT-aware pinning lands worker 0 on CPU 8 and
-    // worker 1 on CPU 10 (different physical cores).
-    let desired = std::env::var("CORSAIR_TRADER_WORKERS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(2);
-    let (workers, pins, pinner) =
-        corsair_ipc::cpu_affinity::build_pinner("corsair_trader", desired);
-    let main_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
-        .enable_all()
-        .on_thread_start(pinner)
-        .build()?;
+    // Lever 1 (2026-05-06): in busy_poll mode the hot loop runs on a
+    // dedicated `std::thread` pinned to cpu 8 (first allowed). Tokio
+    // workers are pinned to the REMAINING cpus so they don't share a
+    // physical core with the hot thread. Default workers drops to 1
+    // since main_rt's only future is `pending::<()>().await`; bg work
+    // (telemetry, staleness, signal handlers) lives on bg_rt.
+    //
+    // FIFO mode (busy_poll=0) keeps the legacy 2-worker layout —
+    // worker 0 owns the FIFO event loop on cpu 8, worker 1 helps on
+    // cpu 10.
+    let busy_poll_main = std::env::var("CORSAIR_TRADER_BUSY_POLL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let allowed_cpus_main = corsair_ipc::cpu_affinity::allowed_cpus();
+    let main_rt = if busy_poll_main {
+        let hot_cpu = allowed_cpus_main.first().copied().unwrap_or(0);
+        let tokio_cpu = allowed_cpus_main
+            .iter()
+            .find(|&&c| c != hot_cpu)
+            .copied()
+            .unwrap_or(hot_cpu);
+        let workers = std::env::var("CORSAIR_TRADER_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1);
+        log::warn!(
+            "busy_poll: tokio main_rt — {} worker(s) pinned to cpu {} \
+             (hot std::thread reserves cpu {})",
+            workers,
+            tokio_cpu,
+            hot_cpu
+        );
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .on_thread_start(move || {
+                corsair_ipc::cpu_affinity::pin_thread_to_cpu(tokio_cpu);
+                log::info!("busy_poll: tokio worker pinned to cpu {}", tokio_cpu);
+            })
+            .build()?
+    } else {
+        // FIFO-mode: 2 workers via build_pinner.
+        let desired = std::env::var("CORSAIR_TRADER_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2);
+        let (workers, _pins, pinner) =
+            corsair_ipc::cpu_affinity::build_pinner("corsair_trader", desired);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .on_thread_start(pinner)
+            .build()?
+    };
 
     // Background runtime — staleness sweep (10Hz) + telemetry (10s)
     // live here, off the hot loop's cores. Single-thread current-
@@ -137,15 +175,37 @@ fn main() -> std::io::Result<()> {
     // the hot loop is per-shard rather than against a single big
     // mutex.
     let allowed = corsair_ipc::cpu_affinity::allowed_cpus();
-    // Bg thread placement: reverse-iter so the first eligible cpu is the
-    // LAST allowed (e.g. cpu 11 with cpuset 8,9,10,11 + workers on 8,10).
-    // Cpu 11 is the SMT sibling of worker 1 (cpu 10), which perf data
-    // showed is mostly idle in busy-poll mode (worker 0 owns the hot
-    // loop). Sharing a physical core with the idle worker means the bg
-    // thread's 10Hz staleness sweep doesn't pollute worker 0's L1/L2.
-    // The previous forward-find landed bg on cpu 9 (sibling of worker
-    // 0) and the contention was visible in p99 telemetry.
-    let bg_cpu = allowed.iter().rev().find(|c| !pins.contains(c)).copied();
+    // Bg thread placement: reverse-iter so the first eligible cpu is
+    // the LAST allowed (e.g. cpu 11 with cpuset 8,9,10,11 + hot on 8,
+    // tokio worker on 10). Lever 1 placement (busy_poll=1):
+    //   cpu 8: hot std::thread (active, busy-spinning)
+    //   cpu 9: idle (SMT sibling of cpu 8 — kept clear of bg work)
+    //   cpu 10: tokio worker (parked on pending future)
+    //   cpu 11: bg_rt (telemetry/staleness/signal handlers)
+    // FIFO mode preserves the legacy `pins` exclusion so bg lands on
+    // a cpu not used by tokio workers.
+    let bg_cpu = if busy_poll_main {
+        // bg → cpu 11 typical (LAST allowed, SMT sibling of tokio cpu 10)
+        let hot_cpu = allowed_cpus_main.first().copied();
+        let tokio_cpu = allowed_cpus_main
+            .iter()
+            .find(|&&c| Some(c) != hot_cpu)
+            .copied();
+        allowed
+            .iter()
+            .rev()
+            .find(|c| Some(**c) != hot_cpu && Some(**c) != tokio_cpu)
+            .copied()
+    } else {
+        // FIFO mode: pick last cpu not used by tokio workers. Recompute
+        // pins via build_pinner (cheap; allocs a small Vec).
+        let desired = std::env::var("CORSAIR_TRADER_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2);
+        let (_w, pins, _p) = corsair_ipc::cpu_affinity::build_pinner("corsair_trader_bg_pin", desired);
+        allowed.iter().rev().find(|c| !pins.contains(c)).copied()
+    };
     let bg_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -235,9 +295,14 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
     // shared `&SharedState` references; no top-level mutex needed.
     // Counters use AtomicU64 fields — wait-free fetch_add per gate
     // increment, no mutex acquire.
+    //
+    // Bundle 4I (2026-05-06): events_ring stays unwrapped (no
+    // Arc<Mutex<>>) — only the hot loop reads it; bg tasks never
+    // touch it. Saves one parking_lot::Mutex acquire per inbound
+    // tick. commands_ring keeps the Arc<Mutex<>> wrapper because it
+    // has multiple writers (hot loop, staleness, telemetry, shutdown).
     let state = Arc::new(SharedState::new());
     let counters = Arc::new(DecisionCounters::default());
-    let events_ring = Arc::new(Mutex::new(events_ring));
     let commands_ring = Arc::new(Mutex::new(commands_ring));
 
     // Graceful shutdown: SIGTERM / SIGINT → cancel every resting
@@ -398,9 +463,6 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
         });
     }
 
-    // Hot loop: tight read of events ring + decision dispatch.
-    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
-
     // Mode select: busy-poll (CORSAIR_TRADER_BUSY_POLL=1) trades 1
     // CPU core for ~50-100µs latency reduction by skipping the FIFO
     // wakeup path entirely. Default OFF — operators opt in.
@@ -409,43 +471,60 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
         .unwrap_or(false);
 
     if busy_poll {
+        // Lever 1 (2026-05-06): hot loop runs on a dedicated
+        // `std::thread` outside the tokio scheduler. Eliminates the
+        // ~24% of cycles previously spent in tokio park/wake/defer
+        // visible in perf — the hot path no longer hits the scheduler
+        // even on empty-ring iterations (replaced `yield_now` with
+        // `std::hint::spin_loop()`).
+        let allowed = corsair_ipc::cpu_affinity::allowed_cpus();
+        let hot_cpu = allowed.first().copied();
+        let state_h = Arc::clone(&state);
+        let counters_h = Arc::clone(&counters);
+        let commands_ring_h = Arc::clone(&commands_ring);
+        let events_log_h = Arc::clone(&events_log);
+        let decisions_log_h = Arc::clone(&decisions_log);
+        std::thread::Builder::new()
+            .name("corsair-hot".into())
+            .spawn(move || {
+                hot_loop_blocking(
+                    events_ring,
+                    state_h,
+                    counters_h,
+                    commands_ring_h,
+                    events_log_h,
+                    decisions_log_h,
+                    hot_cpu,
+                );
+            })
+            .expect("spawn corsair-hot thread");
         log::warn!(
-            "CORSAIR_TRADER_BUSY_POLL=1 — busy-polling SHM ring \
-             (1 CPU core hot, lower latency)"
+            "CORSAIR_TRADER_BUSY_POLL=1 — hot loop on dedicated \
+             std::thread, pinned to cpu {:?} (Lever 1)",
+            hot_cpu
         );
-        loop {
-            let chunk = events_ring.lock().read_available();
-            if !chunk.is_empty() {
-                buf.extend_from_slice(&chunk);
-                let frames = ipc::protocol::unpack_all_frames(&mut buf)?;
-                for body in frames {
-                    // body is owned Vec<u8> — moved into process_event.
-                    process_event(
-                        &state, &counters, &commands_ring,
-                        body, &events_log, &decisions_log,
-                    );
-                }
-                continue;
-            }
-            // No frame ready. Yield to the tokio scheduler so other
-            // tasks (telemetry, staleness, JSONL flush) can run, but
-            // don't sleep — we want to recheck the ring immediately.
-            // tokio::task::yield_now is sub-microsecond.
-            tokio::task::yield_now().await;
-        }
+        // Block the tokio runtime so bg tasks (telemetry, staleness,
+        // graceful_shutdown signal handler) keep running. Hot thread
+        // is detached and runs until process exit. Graceful_shutdown
+        // calls std::process::exit on signal, which kills the hot
+        // thread along with the rest of the process.
+        std::future::pending::<()>().await;
+        Ok(())
     } else {
-        // FIFO-notify mode (default): block on the events FIFO; wake
-        // when broker writes a notification byte. Lower CPU; ~50-100µs
-        // worst-case wakeup latency from FIFO + scheduler.
+        // FIFO-notify mode: block on the events FIFO; wake when broker
+        // writes a notification byte. Lower CPU; ~50-100µs worst-case
+        // wakeup latency from FIFO + scheduler. Stays on tokio for
+        // back-compat — Lever 1 didn't refactor this path because
+        // production runs busy_poll=1 and the FIFO path is dev-only.
         use tokio::io::unix::AsyncFd;
-        let evt_fifo_fd = events_ring.lock().notify_r_fd().expect("events fifo");
+        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let evt_fifo_fd = events_ring.notify_r_fd().expect("events fifo");
         let evt_async_fd = AsyncFd::new(EvtFd(evt_fifo_fd))?;
 
         loop {
-            // Drain ring.
-            let chunk = events_ring.lock().read_available();
-            if !chunk.is_empty() {
-                buf.extend_from_slice(&chunk);
+            // Drain ring (zero-copy via Lever 2).
+            let n = events_ring.read_available_into(&mut buf);
+            if n > 0 {
                 let frames = ipc::protocol::unpack_all_frames(&mut buf)?;
                 for body in frames {
                     // body is owned Vec<u8> — moved into process_event.
@@ -456,7 +535,7 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                 }
                 continue;
             }
-            events_ring.lock().drain_notify();
+            events_ring.drain_notify();
             match tokio::time::timeout(
                 Duration::from_millis(100),
                 evt_async_fd.readable(),
@@ -471,6 +550,56 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                 }
             }
         }
+    }
+}
+
+/// Lever 1 (2026-05-06): trader hot loop on a dedicated `std::thread`.
+/// Pinned to `hot_cpu` (typically cpu 8 on production cpuset 8-11).
+/// Idles via `std::hint::spin_loop()` — no kernel transition, no
+/// scheduler hop. Uses Lever 2's `read_available_into` for zero-alloc
+/// drain. Runs forever until process exit.
+fn hot_loop_blocking(
+    mut events_ring: Ring,
+    state: Arc<SharedState>,
+    counters: Arc<DecisionCounters>,
+    commands_ring: Arc<Mutex<Ring>>,
+    events_log: Arc<jsonl::JsonlWriter>,
+    decisions_log: Arc<jsonl::JsonlWriter>,
+    hot_cpu: Option<usize>,
+) {
+    if let Some(cpu) = hot_cpu {
+        log::warn!("corsair-hot: pinning to cpu {}", cpu);
+        corsair_ipc::cpu_affinity::pin_thread_to_cpu(cpu);
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    loop {
+        let n = events_ring.read_available_into(&mut buf);
+        if n > 0 {
+            // Errors here are schema drift; we log + skip the whole
+            // drain rather than killing the process.
+            let frames = match ipc::protocol::unpack_all_frames(&mut buf) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::error!("corsair-hot: unpack error, skipping drain: {}", e);
+                    continue;
+                }
+            };
+            for body in frames {
+                process_event(
+                    &state,
+                    &counters,
+                    &commands_ring,
+                    body,
+                    &events_log,
+                    &decisions_log,
+                );
+            }
+            continue;
+        }
+        // Empty ring — pause hint. Single PAUSE instruction (Intel) /
+        // YIELD (ARM); sub-nanosecond, no kernel transition. Safe
+        // because this thread owns its CPU exclusively.
+        std::hint::spin_loop();
     }
 }
 
@@ -510,34 +639,34 @@ fn process_event(
     decisions_log: &Arc<jsonl::JsonlWriter>,
 ) {
     let recv_wall_ns = now_ns_wall();
-    // p50-1 (2026-05-04): direct typed dispatch. We previously parsed
-    // a `GenericMsg` with `#[serde(flatten)] extra: serde_json::Value`,
-    // then re-deserialized `extra` into the typed message via
-    // `serde_json::from_value(generic.extra.clone())`. That round-trip
-    // built a Value tree on every event AND cloned it once per typed
-    // parse — ~30-45µs of pure heap churn at the head of the hot path.
-    // The new MsgHeader has only `type` + `ts_ns` and no flatten, so
-    // rmp_serde walks past the rest of the map cheaply. The body is
-    // then re-parsed directly into the matched typed struct.
-    let header: MsgHeader = match rmp_serde::from_slice(&body) {
-        Ok(h) => h,
-        Err(e) => {
-            log::debug!("malformed msg, ignoring: {}", e);
+    // Bundle 2F (2026-05-06): wrap body in Arc<Vec<u8>> upfront so the
+    // JSONL enqueue is a refcount bump (~5 ns) instead of a fresh Vec
+    // clone (~100 ns for 100-200B msgpack bodies). Subsequent borrows
+    // (decode_header, decode_msg, decode_tick) read through the Arc.
+    let body_arc = Arc::new(body);
+    let body: &[u8] = &body_arc;
+
+    // Bundle 2C (2026-05-06): replaced `rmp_serde::from_slice::<MsgHeader>`
+    // with a hand-rolled walker that returns borrowed bytes for the
+    // type field — no String allocation per event. Symmetric to the
+    // tick decoder shipped earlier.
+    let (type_bytes, header_ts_ns) = match msgpack_decode::decode_header(body) {
+        Some(v) => v,
+        None => {
+            log::debug!("malformed msg, ignoring");
             counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
     };
 
     // p50-2 (2026-05-04): defer JSONL line construction to the writer
-    // task. The hot path enqueues raw msgpack bytes + recv_ns; the
-    // writer task decodes msgpack→serde_json::Value and formats the
-    // ISO `recv_ts` off-thread. Saves ~5-10µs per event.
+    // task.
     events_log.write(LogPayload::Event {
         recv_ns: recv_wall_ns,
-        body: body.clone(),
+        body: Arc::clone(&body_arc),
     });
 
-    if let Some(emit_ns) = header.ts_ns {
+    if let Some(emit_ns) = header_ts_ns {
         let lat = recv_wall_ns.saturating_sub(emit_ns) / 1000;
         if lat < 5_000_000 {
             let mut h = state.histograms.lock();
@@ -549,15 +678,15 @@ fn process_event(
         }
     }
 
-    match header.msg_type.as_str() {
-        "tick" => {
+    match type_bytes {
+        b"tick" => {
             // Hand-rolled msgpack decoder (msgpack_decode::decode_tick)
             // replaces rmp_serde::from_slice for the hot path. Saves
             // ~1-2 µs at p50 by avoiding the Value-tree round trip and
             // by reusing this stack-local TickMsg's String allocations
             // across consecutive ticks within process_event scope.
             let mut tick = TickMsg::default();
-            if !msgpack_decode::decode_tick(&body, &mut tick) {
+            if !msgpack_decode::decode_tick(body, &mut tick) {
                 counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -565,7 +694,7 @@ fn process_event(
             // (broker_ipc.py emits it there); copy it down so on_tick's
             // TTT computation has the broker's emit timestamp.
             if tick.ts_ns.is_none() {
-                tick.ts_ns = header.ts_ns;
+                tick.ts_ns = header_ts_ns;
             }
             on_tick(
                 state,
@@ -576,15 +705,15 @@ fn process_event(
                 recv_wall_ns,
             );
         }
-        "underlying_tick" => {
-            let ut: UnderlyingTickMsg = match decode_msg(&body, counters) {
+        b"underlying_tick" => {
+            let ut: UnderlyingTickMsg = match decode_msg(body, counters) {
                 Some(v) => v,
                 None => return,
             };
             state.scalars.lock().underlying_price = ut.price;
         }
-        "vol_surface" => {
-            let vs: VolSurfaceMsg = match decode_msg(&body, counters) {
+        b"vol_surface" => {
+            let vs: VolSurfaceMsg = match decode_msg(body, counters) {
                 Some(v) => v,
                 None => return,
             };
@@ -601,28 +730,28 @@ fn process_event(
             let spot_at_fit = vs
                 .spot_at_fit
                 .unwrap_or_else(|| state.scalars.lock().underlying_price);
-            let entry = crate::state::VolSurfaceEntry {
+            let entry = Arc::new(crate::state::VolSurfaceEntry {
                 forward: vs.forward,
                 params: vs.params,
                 fit_ts_ns: vs.ts_ns.unwrap_or(0),
                 calibrated_min_k: vs.calibrated_min_k,
                 calibrated_max_k: vs.calibrated_max_k,
                 spot_at_fit,
-            };
+            });
             let expiry_arc = state.intern_expiry(&vs.expiry);
             let side_upper = vs.side.to_ascii_uppercase();
             if side_upper == "BOTH" {
                 state
                     .vol_surfaces
-                    .insert((Arc::clone(&expiry_arc), 'C'), entry.clone());
+                    .insert((Arc::clone(&expiry_arc), 'C'), Arc::clone(&entry));
                 state.vol_surfaces.insert((expiry_arc, 'P'), entry);
             } else {
                 let side_char = side_upper.chars().next().unwrap_or('C');
                 state.vol_surfaces.insert((expiry_arc, side_char), entry);
             }
         }
-        "risk_state" => {
-            let r: RiskStateMsg = match decode_msg(&body, counters) {
+        b"risk_state" => {
+            let r: RiskStateMsg = match decode_msg(body, counters) {
                 Some(v) => v,
                 None => return,
             };
@@ -634,8 +763,8 @@ fn process_event(
             sc.risk_vega = Some(r.vega);
             sc.risk_state_age_monotonic_ns = now_ns_monotonic();
         }
-        "place_ack" => {
-            let p: PlaceAckMsg = match decode_msg(&body, counters) {
+        b"place_ack" => {
+            let p: PlaceAckMsg = match decode_msg(body, counters) {
                 Some(v) => v,
                 None => return,
             };
@@ -681,8 +810,8 @@ fn process_event(
         // Broker emits "order_status" (the canonical name in Rust runtime);
         // legacy adapters may use "order_ack". Both routed to the same
         // terminal-state cleanup path.
-        "order_status" | "order_ack" => {
-            let a: OrderAckMsg = match decode_msg(&body, counters) {
+        b"order_status" | b"order_ack" => {
+            let a: OrderAckMsg = match decode_msg(body, counters) {
                 Some(v) => v,
                 None => return,
             };
@@ -706,8 +835,8 @@ fn process_event(
                 }
             }
         }
-        "kill" => {
-            let k: KillMsg = match decode_msg(&body, counters) {
+        b"kill" => {
+            let k: KillMsg = match decode_msg(body, counters) {
                 Some(v) => v,
                 None => return,
             };
@@ -734,8 +863,8 @@ fn process_event(
                 state.kills_count.fetch_add(1, Ordering::Relaxed);
             }
         }
-        "resume" => {
-            let k: KillMsg = match decode_msg(&body, counters) {
+        b"resume" => {
+            let k: KillMsg = match decode_msg(body, counters) {
                 Some(v) => v,
                 None => return,
             };
@@ -754,15 +883,15 @@ fn process_event(
                 state.kills_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
-        "weekend_pause" => {
-            let wp: WeekendPauseMsg = match decode_msg(&body, counters) {
+        b"weekend_pause" => {
+            let wp: WeekendPauseMsg = match decode_msg(body, counters) {
                 Some(v) => v,
                 None => return,
             };
             state.scalars.lock().weekend_paused = wp.paused;
         }
-        "hello" => {
-            let h: HelloMsg = match decode_msg(&body, counters) {
+        b"hello" => {
+            let h: HelloMsg = match decode_msg(body, counters) {
                 Some(v) => v,
                 None => return,
             };
@@ -881,13 +1010,14 @@ fn on_tick(
         ask_size: merged_ask_size,
     };
     state.options.insert(opt_key, opt_state);
-    // Snapshot scalars once: forward feeds JSONL logging, gtd_lifetime_s
-    // feeds ModifyOrder.gtd_seconds. decide_on_tick takes its own snap
-    // internally for the gates that need the rest of the scalar block.
-    let (forward, gtd_lifetime_s) = {
-        let sc = state.scalars.lock();
-        (sc.underlying_price, sc.gtd_lifetime_s)
-    };
+    // Bundle 2D (2026-05-06): one scalar snapshot per tick. Previously
+    // on_tick locked scalars for `(forward, gtd_lifetime_s)` AND
+    // decide_on_tick locked separately for its own snapshot — two
+    // mutex acquires for the same data. Now we snapshot once here and
+    // hand the snapshot to decide_on_tick.
+    let snap = state.scalar_snapshot();
+    let forward = snap.underlying_price;
+    let gtd_lifetime_s = snap.gtd_lifetime_s;
     // Item 7 (2026-05-05): mutate the owned `tick` in place with the
     // merged L1 view rather than building a fresh `TickMsg`. The
     // previous approach allocated two Strings per tick (expiry, right
@@ -905,8 +1035,10 @@ fn on_tick(
         counters,
         &tick,
         &expiry_arc,
+        r_char,
         now_mono,
         decide_ns_wall,
+        &snap,
     );
 
     // p50-2: log decisions to JSONL via typed payload.
@@ -947,6 +1079,12 @@ fn on_tick(
     // length placeholder, then backfill the placeholder with the
     // actual body length. `frame_ranges` records each frame's slice
     // so the ring-write loop below feeds them out one at a time.
+    //
+    // Bundle 1A (2026-05-06): the encoders below are now hand-rolled
+    // (msgpack_encode::encode_*_into), reflection-free, replacing the
+    // prior `rmp_serde::encode::write_named` path. Saves ~1 µs per
+    // place/modify frame at p50 by skipping serde's reflection over
+    // the typed structs.
     let mut wire_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut frame_ranges: Vec<std::ops::Range<usize>> =
         Vec::with_capacity(decisions.len() * 2);
@@ -976,14 +1114,17 @@ fn on_tick(
     let mut cancels_to_track: Vec<(i64, usize)> = Vec::new();
     let mut cancel_all_fired = false;
 
-    fn encode_frame<T: serde::Serialize>(
+    /// Reserve a 4-byte length placeholder, run the body encoder, then
+    /// backfill the placeholder with the body length. Returns the
+    /// frame's range in `wire_buf` (length prefix + body).
+    fn frame_with<F: FnOnce(&mut Vec<u8>)>(
         buf: &mut Vec<u8>,
-        val: &T,
+        encode_body: F,
     ) -> std::ops::Range<usize> {
         let frame_start = buf.len();
-        buf.extend_from_slice(&[0u8; 4]); // length placeholder
+        buf.extend_from_slice(&[0u8; 4]);
         let body_start = buf.len();
-        let _ = rmp_serde::encode::write_named(buf, val);
+        encode_body(buf);
         let body_len = (buf.len() - body_start) as u32;
         buf[frame_start..frame_start + 4]
             .copy_from_slice(&body_len.to_be_bytes());
@@ -1003,7 +1144,9 @@ fn on_tick(
                         ts_ns: decide_ns_wall,
                         order_id: oid,
                     };
-                    frame_ranges.push(encode_frame(&mut wire_buf, &cancel));
+                    frame_ranges.push(frame_with(&mut wire_buf, |b| {
+                        msgpack_encode::encode_cancel_into(b, &cancel)
+                    }));
                 }
                 // Borrow expiry/right from `tick`; `side` is &'static
                 // from `Side::as_str()`. No String allocations on the
@@ -1026,7 +1169,9 @@ fn on_tick(
                     triggering_tick_broker_recv_ns: tick.broker_recv_ns,
                 };
                 let place_frame_idx = frame_ranges.len();
-                frame_ranges.push(encode_frame(&mut wire_buf, &p));
+                frame_ranges.push(frame_with(&mut wire_buf, |b| {
+                    msgpack_encode::encode_place_into(b, &p)
+                }));
                 let okey: OurOrderKey = (
                     SharedState::strike_key(tick.strike),
                     Arc::clone(&expiry_arc),
@@ -1060,7 +1205,9 @@ fn on_tick(
                     triggering_tick_broker_recv_ns: tick.broker_recv_ns,
                 };
                 let modify_frame_idx = frame_ranges.len();
-                frame_ranges.push(encode_frame(&mut wire_buf, &m));
+                frame_ranges.push(frame_with(&mut wire_buf, |b| {
+                    msgpack_encode::encode_modify_into(b, &m)
+                }));
                 let okey: OurOrderKey = (
                     SharedState::strike_key(tick.strike),
                     Arc::clone(&expiry_arc),
@@ -1078,7 +1225,9 @@ fn on_tick(
                         order_id: *oid,
                     };
                     let cancel_frame_idx = frame_ranges.len();
-                    frame_ranges.push(encode_frame(&mut wire_buf, &cancel));
+                    frame_ranges.push(frame_with(&mut wire_buf, |b| {
+                        msgpack_encode::encode_cancel_into(b, &cancel)
+                    }));
                     cancels_to_track.push((*oid, cancel_frame_idx));
                 }
                 log::warn!(

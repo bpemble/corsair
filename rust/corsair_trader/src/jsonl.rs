@@ -2,10 +2,16 @@
 //! Mirror of src/trader/main.py:JSONLWriter.
 //!
 //! Background-thread design: the hot path sends a typed `LogPayload`
-//! over an mpsc channel; a tokio task drains, formats the ISO `recv_ts`
-//! from a u64 ns timestamp, and serializes JSON to disk. Hot path
-//! never blocks on disk I/O nor pays for chrono::to_rfc3339 nor
-//! serde_json::Value tree construction.
+//! over an mpsc channel; a writer thread drains, formats the ISO
+//! `recv_ts` from a u64 ns timestamp, and serializes JSON to disk.
+//! Hot path never blocks on disk I/O nor pays for chrono::to_rfc3339
+//! nor serde_json::Value tree construction.
+//!
+//! Lever 1 (2026-05-06): writer runs on a dedicated `std::thread`
+//! with `std::sync::mpsc::sync_channel`. Previously was a tokio task
+//! on the bg runtime, which was a prerequisite blocker for moving
+//! the trader hot loop off tokio entirely (workers=1 regressed
+//! because the JSONL writer task contended on the single worker).
 //!
 //! Channel is bounded (10k); on overflow we drop the message and bump
 //! a counter (preferred over backpressuring the decision loop).
@@ -15,8 +21,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 const MAX_BYTES_PER_FILE: u64 = 256 * 1024 * 1024; // 256 MiB
 const CHANNEL_CAPACITY: usize = 10_000;
@@ -28,7 +34,9 @@ const CHANNEL_CAPACITY: usize = 10_000;
 pub enum LogPayload {
     /// Raw event body — writer decodes msgpack → JSON for the line.
     /// Defers msgpack→Value tree allocation off the hot path.
-    Event { recv_ns: u64, body: Vec<u8> },
+    /// Bundle 2F (2026-05-06): `Arc<Vec<u8>>` so the hot-path enqueue
+    /// is a refcount bump instead of a fresh Vec clone.
+    Event { recv_ns: u64, body: Arc<Vec<u8>> },
     /// Decision struct — writer wraps with `recv_ts` and serializes.
     Decision(DecisionLog),
 }
@@ -59,28 +67,32 @@ pub struct DecisionInner {
 }
 
 pub struct JsonlWriter {
-    sender: mpsc::Sender<LogPayload>,
+    sender: SyncSender<LogPayload>,
     pub dropped: Arc<AtomicU64>,
 }
 
 impl JsonlWriter {
-    /// Spawn the background writer task and return a handle.
+    /// Spawn the background writer thread and return a handle.
     pub fn start(log_dir: PathBuf, prefix: &'static str) -> Self {
-        let (tx, rx) = mpsc::channel::<LogPayload>(CHANNEL_CAPACITY);
+        let (tx, rx) = sync_channel::<LogPayload>(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let dropped_clone = Arc::clone(&dropped);
-        tokio::spawn(async move {
-            writer_task(log_dir, prefix, rx, dropped_clone).await;
-        });
+        std::thread::Builder::new()
+            .name(format!("jsonl-{}", prefix))
+            .spawn(move || {
+                writer_task(log_dir, prefix, rx, dropped_clone);
+            })
+            .expect("jsonl writer thread spawn");
         Self { sender: tx, dropped }
     }
 
     /// Hot-path entry. Non-blocking: drops on full channel and bumps
     /// the dropped counter. Returns false if dropped.
+    #[inline]
     pub fn write(&self, value: LogPayload) -> bool {
         match self.sender.try_send(value) {
             Ok(()) => true,
-            Err(_) => {
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 false
             }
@@ -101,10 +113,10 @@ fn format_iso(ns: u64) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-async fn writer_task(
+fn writer_task(
     log_dir: PathBuf,
     prefix: &'static str,
-    mut rx: mpsc::Receiver<LogPayload>,
+    rx: Receiver<LogPayload>,
     dropped: Arc<AtomicU64>,
 ) {
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
@@ -122,7 +134,7 @@ async fn writer_task(
     // Reusable serialization buffer — saves one Vec<u8> alloc per line.
     let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
 
-    while let Some(payload) = rx.recv().await {
+    while let Ok(payload) = rx.recv() {
         let today = Utc::now();
         let day_str = format!(
             "{:04}-{:02}-{:02}",
@@ -178,7 +190,7 @@ async fn writer_task(
                 LogPayload::Event { recv_ns, body } => {
                     // msgpack → serde_json::Value, then wrap with recv_ts.
                     let event_value: serde_json::Value =
-                        match rmp_serde::from_slice(&body) {
+                        match rmp_serde::from_slice(body.as_slice()) {
                             Ok(v) => v,
                             Err(e) => {
                                 log::warn!("jsonl: event msgpack decode failed: {}", e);

@@ -124,14 +124,17 @@ pub fn decide_on_tick(
     counters: &DecisionCounters,
     tick: &TickMsg,
     expiry_arc: &Arc<str>,
+    r_char: char,
     now_monotonic_ns: u64,
     now_wall_ns: u64,
+    snap: &ScalarSnapshot,
 ) -> Vec<Decision> {
     let mut out = Vec::with_capacity(2);
 
-    // One scalar lock for the whole decision flow. Subsequent reads
-    // hit the stack-local `snap`.
-    let snap = state.scalar_snapshot();
+    // Bundle 2D (2026-05-06): scalar snapshot is now passed in — taken
+    // once by on_tick and shared with this function. Bundle 2G (same):
+    // r_char is also passed in (computed in process_event from
+    // tick.right) so this function doesn't redo `chars().next()`.
 
     // Spot is the front-month underlying price (HGK6 tick stream).
     // Distinct from the option's pricing forward (HGM6 parity-F or
@@ -141,20 +144,6 @@ pub fn decide_on_tick(
         return out;
     }
     let strike = tick.strike;
-    // Single canonical right-as-char for the rest of the function.
-    // 'C' / 'P' uppercased. Caller (`on_tick`) already drops ticks
-    // with an empty `right`, but defend in depth here: a malformed
-    // right would mis-route puts into the call vol surface lookup
-    // and produce wildly wrong theos, so on the off chance one slips
-    // through (e.g. a future caller bypasses on_tick), we count it
-    // and skip rather than default to 'C'.
-    let r_char = match tick.right.chars().next() {
-        Some(c) => c.to_ascii_uppercase(),
-        None => {
-            counters.dropped_parse_errors.fetch_add(1, Ordering::Relaxed);
-            return out;
-        }
-    };
 
     // Don't quote into a halt. Atomic mirror of `kills.len()` —
     // DashMap::is_empty() would touch every shard, measurable cost
@@ -752,6 +741,28 @@ mod tests {
     use crate::state::{DecisionCounters, SharedState, VolSurfaceEntry};
     use std::sync::atomic::Ordering;
 
+    /// Test helper: derives `r_char` from `tick.right` and snapshots
+    /// scalars, then forwards to `decide_on_tick`. Bundle 2D/2G shifted
+    /// those derivations to the caller (`on_tick`); production sites
+    /// pass them in directly. Tests use this shim to stay terse.
+    fn run_decide(
+        state: &SharedState,
+        counters: &DecisionCounters,
+        tick: &TickMsg,
+        expiry_arc: &Arc<str>,
+        now_mono: u64,
+        now_wall: u64,
+    ) -> Vec<Decision> {
+        let r_char = tick
+            .right
+            .chars()
+            .next()
+            .unwrap_or('C')
+            .to_ascii_uppercase();
+        let snap = state.scalar_snapshot();
+        decide_on_tick(state, counters, tick, expiry_arc, r_char, now_mono, now_wall, &snap)
+    }
+
     fn fresh_state(forward: f64) -> SharedState {
         let s = SharedState::new();
         {
@@ -777,7 +788,7 @@ mod tests {
             .unwrap_or(0);
         state.vol_surfaces.insert(
             (expiry_arc, side),
-            VolSurfaceEntry {
+            Arc::new(VolSurfaceEntry {
                 forward: 6.0,
                 params: VolParams {
                     model: "svi".to_string(),
@@ -801,7 +812,7 @@ mod tests {
                 // theo, isolating each gate. The Taylor-specific test
                 // exercises a non-zero (spot − spot_at_fit) explicitly.
                 spot_at_fit: 6.0,
-            },
+            }),
         );
     }
 
@@ -829,7 +840,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert!(counters.skip_no_vol_surface.load(Ordering::Relaxed) > 0);
     }
@@ -841,7 +852,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(7.0, "20260526", "C", 0.01, 0.02);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_off_atm.load(Ordering::Relaxed), 1);
     }
@@ -853,7 +864,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(5.85, "20260526", "C", 0.20, 0.22);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_itm.load(Ordering::Relaxed), 1);
     }
@@ -865,7 +876,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.15, "20260526", "P", 0.20, 0.22);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_itm.load(Ordering::Relaxed), 1);
     }
@@ -878,7 +889,7 @@ mod tests {
         let mut tick = make_tick(6.0, "20260526", "C", 0.0, 0.10);
         tick.bid = Some(0.0);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_one_sided_or_dark.load(Ordering::Relaxed), 2);
     }
@@ -891,7 +902,7 @@ mod tests {
         let mut tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         tick.bid_size = Some(0);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_thin_book.load(Ordering::Relaxed), 2);
     }
@@ -905,15 +916,19 @@ mod tests {
         // Mutate the surface entry to set calibrated bounds.
         let expiry_arc = state.intern_expiry("20260526");
         if let Some(mut entry) = state.vol_surfaces.get_mut(&(expiry_arc, 'C')) {
-            entry.calibrated_min_k = Some(5.95);
-            entry.calibrated_max_k = Some(6.05);
+            // Bundle 3E: VolSurfaceEntry now lives behind Arc;
+            // Arc::make_mut clones when shared (here refcount=1, so
+            // it gives back the inner without cost).
+            let inner = Arc::make_mut(&mut *entry);
+            inner.calibrated_min_k = Some(5.95);
+            inner.calibrated_max_k = Some(6.05);
         }
         let counters = DecisionCounters::default();
         // 6.10 is past calibrated_max_k=6.05 (more than half a tick),
         // but still inside ATM-window (6.10 - 6.0 = 0.10 < 0.30).
         let tick = make_tick(6.10, "20260526", "C", 0.10, 0.105);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_uncalibrated_strike.load(Ordering::Relaxed), 1);
     }
@@ -927,7 +942,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.20);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.skip_wide_spread.load(Ordering::Relaxed), 2);
     }
@@ -942,7 +957,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.20);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert_eq!(counters.skip_wide_spread.load(Ordering::Relaxed), 0);
     }
 
@@ -958,7 +973,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
     }
@@ -975,7 +990,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
     }
@@ -994,7 +1009,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
     }
@@ -1015,7 +1030,7 @@ mod tests {
         let expiry_arc = state.intern_expiry(&tick.expiry);
         // Should NOT block on theta. (May skip for other reasons, e.g.
         // wide spread, but risk_block from theta should be 0.)
-        let _ = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let _ = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         // The risk_block counter increments by 2 only when ALL is set.
         // With only theta_kill=0 and no other gate trips, ALL won't fire
         // from the theta path.
@@ -1034,7 +1049,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
         assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
     }
@@ -1047,7 +1062,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
     }
 
@@ -1066,7 +1081,7 @@ mod tests {
         let counters = DecisionCounters::default();
         let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
         let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
     }
 
@@ -1093,7 +1108,7 @@ mod tests {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
 
-        let _ = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, now_wall_ns);
+        let _ = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, now_wall_ns);
 
         // Cache should hold one entry — the (theo_at_fit, delta_at_fit) pair.
         let cache_entries: Vec<_> = state

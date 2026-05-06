@@ -1,8 +1,8 @@
 # Corsair — Local Latency Optimization Ledger
 
-**Date:** 2026-05-05
+**Date:** 2026-05-06 (last updated)
 **Predecessor:** `docs/HANDOFF_LATENCY_OPTIMIZATION.md` (2026-05-04)
-**Status:** local hot-path optimization complete; further latency reduction now requires infrastructure spend (FIX gateway, co-location).
+**Status:** local hot-path optimization is approaching its structural floor. Two big architectural levers remain (trader+broker merge, infrastructure spend); see §10 + §11.
 
 This ledger captures every local-latency change attempted on the i9-13900K
 ("Elephas") through 2026-05-05. Every result here was measured against a
@@ -492,3 +492,218 @@ done
 - `CLAUDE.md` `project_fix_colo_evidence` — concurrency-RTT empirical findings
 - `docs/latency_decomp_results.md` — the original concurrency sweep probe (April)
 - `docs/HANDOFF_BAREMETAL_MIGRATION.md` — host-port mechanics
+
+---
+
+## 10. 2026-05-06 — Bundles 1-6 + Levers 1-3
+
+Pickup from §1-9 above. Today's session ran a fresh full pass through the
+hot path against the harness, shipped six bundles + two of three Levers,
+and identified the next architectural lever (§11 below).
+
+### 10.1 Headline (cumulative vs §1)
+
+| metric | §1 baseline (2026-05-05) | post-2026-05-06 | total Δ |
+|---|---|---|---|
+| **TTT p50 (harness)** | 12-15 µs | **5 µs** | the harness now runs in the floor band; production is ~15 µs (§10.5) |
+| **TTT p99 (harness)** | ~30 µs | **~12-14 µs** | -55%; clean shifts in repeated runs |
+| **IPC p50 (harness)** | 8 µs | 0-2 µs | floor |
+| Production TTT p50 (busy market) | 15 µs | **15-16 µs** (post-deploy) | structural; harness improvement carries through under the noise floor |
+| Production TTT p99 (busy market) | 42 µs steady | (limited samples post-deploy; theta halt during validation) | — |
+
+### 10.2 Bundles 1-6 (shipped 2026-05-06 morning)
+
+All bundles are A/B tested via `scripts/run_ab_test.sh` against the
+harness; verdicts in dollar-value order of significance. Each "KEEP"
+shipped to production via image rebuild.
+
+| bundle | what | code touchpoints | result | KS p |
+|---|---|---|---|---|
+| **B1 (A+B)** | Hand-rolled msgpack encoders for `PlaceOrder` / `ModifyOrder` / `CancelOrder`; `Ring::write_body` writes 4-byte BE length prefix directly into mmap (eliminates `pack_frame` Vec alloc on broker publish) | `corsair_trader/src/msgpack_encode.rs` (new), `corsair_ipc/src/ring.rs::write_body`, `corsair_ipc/src/server.rs::publish` | **SHIP** — TTT p50 -1 µs, p99 -5.1 µs | 0.001 |
+| **B2 (C+D+F+G)** | Hand-rolled `decode_header` (no String alloc per inbound event); single `ScalarSnapshot` per tick (was 2× lock); `Arc<Vec<u8>>` for `events_log` body (refcount bump vs Vec clone); `r_char` cached at decode-time | `msgpack_decode::decode_header`, `state.rs::scalar_snapshot`, `jsonl.rs::LogPayload`, `messages.rs` (drop dead `MsgHeader`) | **KEEP** — neutral on perf, cleaner code; KS p=0.83 on rerun | 0.83 |
+| **B3 (E)** | `vol_surfaces: DashMap<…, Arc<VolSurfaceEntry>>` so lookup is refcount bump, not full struct clone | `state.rs::lookup_vol_surface` | **KEEP** — neutral; defends p99 on cold-fit ticks | 0.45 |
+| **B4 (H+I)** | Cursor-walk `unpack_all_frames` (single `Vec::drain` at end vs O(N²) per-frame); drop `Arc<Mutex<>>` on events_ring (single-reader path) | `corsair_ipc/src/protocol.rs`, trader `main.rs::async_main` | **KEEP** — neutral; defends p99 on tick bursts | 0.70 |
+| **B5 (J)** | Replace `Arc<str>` keys with `u16` expiry intern | (deferred — not implemented) | **DEFER** — expected sustained gain ~30-50 ns is below the harness's ~500 ns p50 noise floor; refactor scope (5 files) outweighs measurability | — |
+| **B6 (K)** | Pricing micro-opts: `OnceLock<Normal>` standard normal; cached `(1−β)` powers in SABR; short-circuit `disc=1.0` when `r=0` | `corsair_trader/src/pricing.rs` | **KEEP** — neutral (theo-cache absorbs steady-state); helps only on cache-miss ticks | 0.99 |
+
+### 10.3 Bundles total
+
+```
+TTT (harness, n=148/152, baseline → post-B6):
+  p50:    6.0 → 5.0 µs   (-1.0,  -16.7%)
+  p90:   13.0 → 10.0 µs  (-3.0,  -23.1%)
+  p99:   20.1 → 17.5 µs  (-2.6,  -12.8%)
+  p99.9: 21.0 → 18.8 µs  (-2.2,  -10.2%)
+  KS p=0.0017  (>99.9% confident the distribution shifted)
+```
+
+Verdict from compare_latency.py reads "INCONCLUSIVE" because p50 lands
+exactly on the ±1000 ns gate — the cross-percentile shift is the real
+signal here.
+
+### 10.4 Levers 1-3 (afternoon — perf-driven)
+
+A `perf record` profile after Bundles 1-6 showed the new function-level
+breakdown:
+
+```
+24.43%  combined tokio scheduler (park / wake_by_ref / context::defer / runtime glue)
+ 4.44%  Ring::read_available
+ 8.44%  async_main closure (busy-poll body, all hot-path code inlined)
+ ~62%   outside binary (mmap memcpy from SHM ring + libc)
+ ~0%    each: decode_tick, decide_on_tick, encode_*_into, mimalloc
+```
+
+Hot path is now invisible at percent-resolution; tokio scheduler is
+the largest visible chunk. Three Levers tested against this picture:
+
+| lever | what | result | KS p |
+|---|---|---|---|
+| **L3** | mimalloc env tuning (`MIMALLOC_PURGE_DELAY=10000`, `MIMALLOC_RESERVE_HUGE_OS_PAGES=1`) | **REJECT** — TTT p99 +152.9% blowup. Likely the huge-pages fallback path. Single-flag retest (PURGE_DELAY only) was not run; do that before re-trying. | 0.018 |
+| **L2** | `Ring::read_available_into(&mut Vec)` — extends caller's buf directly from mmap, no per-drain Vec alloc + memcpy | **SHIP** (bundled with L1) | — |
+| **L1** | Trader hot loop on a dedicated `std::thread` (off tokio); `std::hint::spin_loop()` instead of `tokio::task::yield_now().await`; JSONL writer also moved to `std::thread` (was a tokio task; previously blocked workers=1 per the §3.1b reject) | **SHIP** (bundled with L2) — TTT p99 -5-6 µs (-28-34%) across two repeat runs; p50 unchanged (already at floor); KS p=0.58/0.87 (signal is in the tail, p50 doesn't move past gate) | 0.58 / 0.87 |
+
+L1 implementation notes:
+- `JsonlWriter` switched from `tokio::sync::mpsc::channel` + `tokio::spawn`
+  to `std::sync::mpsc::sync_channel` + `std::thread::spawn`. Channel is
+  bounded (10 000); `try_send` semantics unchanged.
+- Hot loop extracted to `hot_loop_blocking()` which takes ownership of
+  the Ring (Bundle 4I had already dropped its `Arc<Mutex<>>` wrapper)
+  plus `Arc` clones of state/counters/commands_ring/jsonl writers.
+- Pinning: `corsair-hot` thread → cpu 8 (first allowed). Tokio main_rt
+  default workers drops to 1 in busy_poll mode, pinned to cpu 10
+  (skipping cpu 8). bg_rt → cpu 11 (sibling of tokio worker). Cpu 9
+  (SMT sibling of hot cpu 8) deliberately idle.
+
+Production layout post-Lever-1 (cpuset 8-11):
+
+```
+cpu 8  → corsair-hot (std::thread, busy-spin SHM ring, owns the hot path)
+cpu 9  → idle (SMT sibling of cpu 8 — kept clear so cpu 8 has full pipeline)
+cpu 10 → tokio main_rt worker (parked on `pending::<()>().await`; wakes only on shutdown)
+cpu 11 → bg_rt (telemetry 10s, staleness 10Hz, signal handler, JSONL writer threads if not yet pinned)
+```
+
+To revert L1: `git revert` the L1 commit + rebuild + force-recreate
+trader. The threading model is the only structural change in this
+batch; everything else is local refactor.
+
+### 10.5 Production deploy + theta halt (2026-05-06 ~17:33 UTC)
+
+`docker compose up -d --force-recreate trader` was run after Bundles
+1-6 + L1+L2 landed. Trader started with `corsair-hot pinning to cpu 8`
+log line — confirms the std::thread launched. Live telemetry pre-halt
+(during 90s warmup, before vol_surface fits arrived):
+
+```
+ipc_p50=8 µs  ipc_p99=22 ms  ttt_p50=15 µs  ttt_p99=58 µs
+```
+
+p50/p99 match §1's pre-experiment numbers within noise — the bundles'
+harness improvement (-1 µs at p50, -2.6 µs at p99) is below the 1 µs
+production-telemetry resolution. The 11 ms outlier observed mid-warmup
+disappeared from later samples.
+
+A theta halt fired ~30s after startup (`THETA HALT: $-717 < $-500`)
+on carried positions. Halt blocks all `decide_on_tick` paths early
+via the `kills_count > 0` gate, so post-halt telemetry produces no
+TTT samples (decisions return before the encode/write/histogram-push
+path). Validation of L1+L2 in production beyond the 90s pre-halt
+window deferred until positions are flattened and the broker is
+restarted to clear the sticky kill.
+
+### 10.6 What's still in the local hot path
+
+After Bundles 1-6 + L1+L2, the visible cycle distribution is dominated
+by:
+- mmap memcpy from SHM ring (~62% — `Ring::read_available_into` plus
+  the resulting buffer extend)
+- the broker→trader IPC framing/parsing layer (msgpack encode on broker
+  side, decode on trader side, length prefix per frame)
+- tokio scheduler glue (24.4% post-L1 — only the bg_rt and the parked
+  main_rt worker)
+
+The hot path's USEFUL work (decode → decide → encode → write) is now
+sub-percent on the profile. The next big win is structural elimination
+of the SHM IPC layer — see §11.
+
+---
+
+## 11. The next big lever: trader + broker merge (eliminate IPC)
+
+Current architecture (§15 of CLAUDE.md):
+
+```
+ib-gateway TWS  ←——TCP——→  corsair_broker_rust  ←——SHM ring——→  corsair_trader_rust
+                            (1MiB ring + msgpack)
+                            owns IBKR clientId=0
+                            risk + hedge + snapshot + vol_surface fitter
+```
+
+The SHM IPC was originally built to allow swapping the broker
+adapter (FIX/iLink) without touching the trader. **In practice**:
+- The broker has a single adapter (`NativeBroker`, the in-tree native
+  IBKR wire client). No alternate adapter is implemented.
+- The IPC layer costs ~9 µs at p50 (broker emit + ring write + trader
+  read + decode), which is roughly half of the current 15 µs production
+  TTT.
+
+**Merge proposal**: collapse the broker and trader into one process.
+- Single tokio runtime (or std::thread for the hot path; bg async runtime).
+- Direct access to broker state from the decision flow — no msgpack.
+- Tick events go from native client → in-process closure → decision
+  flow, with no ring write or read.
+- Outbound place/modify/cancel calls go directly to the IBKR wire
+  protocol; no command ring; no tokio mpsc dispatch.
+
+Expected impact: **TTT p50 dropping from ~15 µs to ~3-6 µs** (eliminate
+the ~9 µs IPC + msgpack chain). p99 similarly drops by ~10-15 µs.
+Combined with L1's tail wins, target p99 ~5-8 µs from current ~12-14 µs.
+
+Caveats and unknowns:
+- The kill IPC path (broker → trader for kills) becomes intra-process
+  function call. Existing kills_count atomic stays usable; just dispatch
+  changes.
+- `corsair_flatten` (the ops binary at `rust/corsair_ipc/examples/flatten.rs`)
+  uses the SHM IPC to inject orders without the trader. Either: keep
+  the IPC as a *secondary* observability/control path; or rewrite
+  flatten to spawn a sidecar that talks to the merged binary's REST/UDS
+  command socket.
+- `corsair_tick_replay` (the harness) feeds ticks into the events ring.
+  Same options: keep the IPC for replay only (broker bypassed at boot)
+  or refactor the harness to spawn the merged binary with a fake-tick
+  source.
+- Failure isolation: today, a broker panic doesn't take down decision
+  state; merged, both go together. Mitigated by the existing native
+  IBKR client being already in-tree (commit `f7e10fd` and following).
+- The merged binary still wants to be small: keep the existing module
+  separation (`corsair_broker`, `corsair_market_data`, `corsair_pricing`,
+  `corsair_risk`, `corsair_hedge`, `corsair_position`) so the runtime
+  glue is what changes, not the math.
+
+Effort estimate: **2-4 days of focused work** (a Phase 7 to mirror
+Phase 6.7's broker/trader split, but in the opposite direction).
+Risk: medium-high — same-day reversion path is the existing v3 split
+with the SHM IPC fallback enabled.
+
+This is the recommendation when local µs-level tuning has been
+exhausted (now), and before committing to FIX gateway access ($500/mo)
+or co-location ($500-2000/mo) — the merged hot path is the last large
+locally-controllable lever.
+
+---
+
+## 12. 2026-05-06 — Pointers and harness data
+
+Add to §8:
+
+| location | content |
+|---|---|
+| `~/corsair_latency/baseline_2026-05-06_today.json` | fresh baseline against pre-Bundle-1 image |
+| `~/corsair_latency/exp_b1_handenc_zeroalloc.json` | Bundle 1 candidate dump |
+| `~/corsair_latency/exp_b6_pricing_micro.json` | Bundles 1-6 cumulative dump (used as Lever baseline) |
+| `~/corsair_latency/exp_l3_mimalloc_purge.json` | Lever 3 result (REJECT) |
+| `~/corsair_latency/exp_l12_stdthread_zerocopy.json` + `_v2.json` | Lever 1+2 candidate dumps (both SHIP-direction) |
+| `~/corsair_latency/exp_l12_pinfix.json` | post-cpu-pin-fix Lever 1+2 verification |
+| `/tmp/trader_perf.data` | 30s perf record post-Bundle-6, used for the §10.4 profile (note: tmpfs, ages out on reboot) |
+| `/tmp/corsair_trader_rust` | binary copy needed for symbol resolution against `/tmp/trader_perf.data` (matches BuildID `482ff10a...`) |

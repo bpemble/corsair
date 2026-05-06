@@ -142,10 +142,15 @@ impl SHMServer {
 
     /// Publish an event to the events ring. Returns false if the
     /// ring is full (frame dropped — caller may want to log).
+    ///
+    /// Bundle 1B (2026-05-06): switched from `pack_frame` (alloc) +
+    /// `write_frame` to direct `write_body`, which writes the 4-byte
+    /// length prefix into mmap without an intermediate Vec. Saves one
+    /// allocation per published event — measurable on the broker tick
+    /// fast-path where every TickEvent paid for it.
     pub fn publish(&self, msgpack_body: &[u8]) -> bool {
-        let frame = crate::protocol::pack_frame(msgpack_body);
         let mut r = self.events_ring.lock();
-        r.write_frame(&frame)
+        r.write_body(msgpack_body)
     }
 
     /// Snapshot of dropped-frame counters for telemetry.
