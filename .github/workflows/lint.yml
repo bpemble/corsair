@@ -1,0 +1,27 @@
+# Lint pipeline — guards regression-prevention rules from audits.
+#
+# Currently runs only `lint_pricing_args.sh` (the §16/§19 ban on
+# passing current underlying_price to pricing functions). When more
+# audit-derived lints land, add them here.
+#
+# Rust workspace tests (`cargo test --workspace`) are not yet wired
+# into CI — they require Python dev headers (libpython3.X-dev) for
+# the `corsair_pricing` PyO3 dependency to link, plus the `clang +
+# mold` toolchain configured in `.cargo/config.toml`. That setup is
+# tracked separately; this workflow intentionally focuses on the
+# zero-dependency lints that codify audit findings.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-pricing-args:
+    name: lint § pricing-function arguments (audit §16/§19 backstop)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run pricing-arg lint
+        run: bash scripts/lint_pricing_args.sh
