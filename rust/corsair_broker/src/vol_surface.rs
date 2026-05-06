@@ -35,6 +35,16 @@ struct VolSurfaceEvent<'a> {
     side: &'a str,
     /// Forward used for the fit (parity-implied if available, spot otherwise).
     forward: f64,
+    /// Spot price (front-month underlying) observed AT FIT TIME. Used
+    /// by the trader's Taylor reprice as the anchor for measuring spot
+    /// drift since the fit: theo += delta × (current_spot − spot_at_fit).
+    /// Distinct from `forward` — `forward` includes the static carry
+    /// between front-month (HGK6) and the option's underlying month
+    /// (HGM6) which is structurally ~$0.04–0.05; using `forward` as the
+    /// Taylor anchor would conflate that carry with actual spot
+    /// movement and shift theos by delta × carry every tick. With
+    /// `spot_at_fit`, Taylor reflects only post-fit spot dynamics.
+    spot_at_fit: f64,
     /// SABR params (carries `model` field for trader-side dispatch).
     params: SabrParams,
     /// Fit RMSE in IV space.
@@ -113,7 +123,7 @@ fn fit_and_publish(runtime: &Arc<Runtime>, server: &Arc<SHMServer>) {
         .products();
 
     for product in products {
-        let (forward, expiry_side_groups) = match snapshot_chain(runtime, &product) {
+        let (forward, spot_at_fit, expiry_side_groups) = match snapshot_chain(runtime, &product) {
             Some(v) => v,
             None => continue,
         };
@@ -203,6 +213,7 @@ fn fit_and_publish(runtime: &Arc<Runtime>, server: &Arc<SHMServer>) {
                         expiry: expiry_str.clone(),
                         side: side_label,
                         forward,
+                        spot_at_fit,
                         params: SabrParams {
                             model: "sabr",
                             alpha: f.alpha,
@@ -262,7 +273,7 @@ fn fit_and_publish(runtime: &Arc<Runtime>, server: &Arc<SHMServer>) {
 fn snapshot_chain(
     runtime: &Arc<Runtime>,
     product: &str,
-) -> Option<(f64, std::collections::HashMap<(String, char), Vec<(f64, f64, f64)>>)> {
+) -> Option<(f64, f64, std::collections::HashMap<(String, char), Vec<(f64, f64, f64)>>)> {
     let md = runtime.market_data.lock().unwrap();
     let und_spot = md.underlying_price(product)?;
     if und_spot <= 0.0 {
@@ -409,7 +420,7 @@ fn snapshot_chain(
     if by_expiry_side.is_empty() {
         return None;
     }
-    Some((forward, by_expiry_side))
+    Some((forward, und_spot, by_expiry_side))
 }
 
 use crate::time::now_ns;

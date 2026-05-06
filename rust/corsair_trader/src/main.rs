@@ -592,12 +592,22 @@ fn process_event(
             // combined surface, see audit T4-10). The lookup tries
             // (expiry, right_char) → 'C' → 'P'; it never tries 'B'.
             // So when broker emits "BOTH", populate both 'C' and 'P'.
+            // Taylor reprice anchor: prefer broker-provided
+            // `spot_at_fit` (the spot the broker actually saw when
+            // fitting). When absent (older broker), fall back to our
+            // current spot — a few ms of IPC latency, well below
+            // tick precision. Falling back to `vs.forward` would
+            // re-introduce the carry-confusion bug.
+            let spot_at_fit = vs
+                .spot_at_fit
+                .unwrap_or_else(|| state.scalars.lock().underlying_price);
             let entry = crate::state::VolSurfaceEntry {
                 forward: vs.forward,
                 params: vs.params,
                 fit_ts_ns: vs.ts_ns.unwrap_or(0),
                 calibrated_min_k: vs.calibrated_min_k,
                 calibrated_max_k: vs.calibrated_max_k,
+                spot_at_fit,
             };
             let expiry_arc = state.intern_expiry(&vs.expiry);
             let side_upper = vs.side.to_ascii_uppercase();
@@ -1240,12 +1250,20 @@ fn staleness_check(
             Some(t) if t > 0.0 => t,
             _ => continue,
         };
-        // Use fit-time forward (anchored point for SVI).
-        let res = match compute_theo(vp.forward, strike, tte, r_char, &vp.params) {
-            Some(v) => v,
-            None => continue,
-        };
-        let theo = res.1;
+        // Use fit-time forward (anchored point for SVI), then apply
+        // the same Taylor reprice the hot-path decision flow applies:
+        //   theo ≈ theo_at_fit + delta_at_fit × (spot − spot_at_fit)
+        // Anchored on `vp.spot_at_fit` (broker's spot at fit time),
+        // NOT `vp.forward` — the latter conflates carry with drift.
+        // Without this in the staleness loop, the loop's drift check
+        // compares order.price vs fit-frozen theo, can't see when our
+        // quote is stale relative to current market mid.
+        let (_iv, theo_at_fit, delta_at_fit) =
+            match compute_theo(vp.forward, strike, tte, r_char, &vp.params) {
+                Some(v) => v,
+                None => continue,
+            };
+        let theo = (theo_at_fit + delta_at_fit * (snap.underlying_price - vp.spot_at_fit)).max(0.01);
 
         // Stale if our price is too unfavorable vs current theo.
         // Drift > threshold → modify to fresh edge (amend bias).

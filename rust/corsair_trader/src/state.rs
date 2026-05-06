@@ -59,6 +59,11 @@ pub struct VolSurfaceEntry {
     /// None when broker is older than the gate (back-compat).
     pub calibrated_min_k: Option<f64>,
     pub calibrated_max_k: Option<f64>,
+    /// Spot price observed at fit time. Anchor for the Taylor reprice
+    /// path: theo += delta × (current_spot − spot_at_fit). Distinct
+    /// from `forward` so the static carry between front-month and the
+    /// option's underlying month doesn't pollute the Taylor shift.
+    pub spot_at_fit: f64,
 }
 
 /// Per-resting-order metadata; keyed by (strike, expiry, right, side).
@@ -256,14 +261,17 @@ pub struct SharedState {
     pub vol_surfaces: DashMap<VolSurfaceKey, VolSurfaceEntry>,
 
     /// Optimization #3 — SVI/SABR theo cache, keyed by
-    /// (strike_bits, expiry, right_char, fit_ts_ns). theo is a pure
-    /// function of (forward, strike, tte, params, right); within a
-    /// single fit cycle the only changing input is tte, which moves
-    /// less than 1 tick over a 60s fit window. We invalidate the
-    /// entry when fit_ts_ns changes (new SABR fit landed). Saves
-    /// ~80µs per tick (SVI/SABR + Black76) in the steady-state amend
-    /// loop where the same key sees many ticks per second.
-    pub theo_cache: DashMap<TheoCacheKey, f64>,
+    /// (strike_bits, expiry, right_char, fit_ts_ns). Stores the pair
+    /// (theo_at_fit, delta_at_fit), both pure functions of
+    /// (fit_forward, strike, tte, params, right); within a single fit
+    /// cycle the only changing input is tte, which moves less than 1
+    /// tick over a 60s fit window. We invalidate the entry when
+    /// fit_ts_ns changes (new SABR fit landed). Saves ~80µs per tick
+    /// (SVI/SABR + Black76 + greeks) in the steady-state amend loop.
+    /// Delta is cached alongside theo so the Taylor reprice path
+    /// (theo + delta × (spot − fit_forward)) doesn't recompute greeks
+    /// on the hot path.
+    pub theo_cache: DashMap<TheoCacheKey, (f64, f64)>,
 
     /// Resting orders we've placed, keyed by
     /// (strike-bits, expiry, right-char, side-char).

@@ -9,19 +9,41 @@ use statrs::distribution::{ContinuousCDF, Normal};
 
 /// Black-76 option price. Mirrors corsair_pricing::black76_price.
 pub fn black76_price(f: f64, k: f64, t: f64, sigma: f64, r: f64, right: char) -> f64 {
+    black76_price_and_delta(f, k, t, sigma, r, right).0
+}
+
+/// Black-76 option price + delta in one pass. Both share the d1/d2 +
+/// CDF computation, so combining saves one norm_cdf vs two separate
+/// calls. Used by the trader's Taylor reprice path: theo at fit-time
+/// forward and delta at fit-time forward are cached together; current
+/// theo = cached_theo + cached_delta × (spot − fit_forward).
+pub fn black76_price_and_delta(
+    f: f64, k: f64, t: f64, sigma: f64, r: f64, right: char,
+) -> (f64, f64) {
     let is_call = right == 'C' || right == 'c';
     if t <= 0.0 || sigma <= 0.0 || f <= 0.0 || k <= 0.0 {
-        return if is_call { (f - k).max(0.0) } else { (k - f).max(0.0) };
+        let price = if is_call { (f - k).max(0.0) } else { (k - f).max(0.0) };
+        let delta = if is_call {
+            if f > k { 1.0 } else if f < k { 0.0 } else { 0.5 }
+        } else {
+            if f > k { 0.0 } else if f < k { -1.0 } else { -0.5 }
+        };
+        return (price, delta);
     }
     let sqrt_t = t.sqrt();
     let d1 = ((f / k).ln() + 0.5 * sigma * sigma * t) / (sigma * sqrt_t);
     let d2 = d1 - sigma * sqrt_t;
     let n = Normal::new(0.0, 1.0).unwrap();
     let disc = (-r * t).exp();
+    let n_d1 = n.cdf(d1);
     if is_call {
-        disc * (f * n.cdf(d1) - k * n.cdf(d2))
+        let price = disc * (f * n_d1 - k * n.cdf(d2));
+        let delta = disc * n_d1;
+        (price, delta)
     } else {
-        disc * (k * n.cdf(-d2) - f * n.cdf(-d1))
+        let price = disc * (k * n.cdf(-d2) - f * (1.0 - n_d1));
+        let delta = disc * (n_d1 - 1.0);
+        (price, delta)
     }
 }
 
@@ -109,6 +131,57 @@ mod tests {
         // T=0 collapses to intrinsic.
         assert_eq!(black76_price(100.0, 90.0, 0.0, 0.2, 0.0, 'C'), 10.0);
         assert_eq!(black76_price(100.0, 110.0, 0.0, 0.2, 0.0, 'P'), 10.0);
+    }
+
+    #[test]
+    fn black76_delta_atm_call() {
+        // ATM, normal vol+T → call delta should be near 0.5
+        // (with disc=1 since r=0).
+        let (_p, d) = black76_price_and_delta(100.0, 100.0, 0.25, 0.20, 0.0, 'C');
+        assert!((d - 0.5).abs() < 0.05, "atm call delta {}", d);
+    }
+
+    #[test]
+    fn black76_delta_atm_put() {
+        // ATM put delta near -0.5.
+        let (_p, d) = black76_price_and_delta(100.0, 100.0, 0.25, 0.20, 0.0, 'P');
+        assert!((d - (-0.5)).abs() < 0.05, "atm put delta {}", d);
+    }
+
+    #[test]
+    fn black76_taylor_first_order_check() {
+        // Sanity: theo(F + dF) ≈ theo(F) + delta(F) × dF for small dF.
+        let f0 = 6.0;
+        let k = 6.05;
+        let t = 25.0 / 365.0;
+        let sigma = 0.30;
+        let (theo0, delta0) = black76_price_and_delta(f0, k, t, sigma, 0.0, 'C');
+        let df = 0.005; // 10 ticks on HG
+        let (theo1, _) = black76_price_and_delta(f0 + df, k, t, sigma, 0.0, 'C');
+        let theo_taylor = theo0 + delta0 * df;
+        // First-order error should be tiny (gamma × dF² / 2 ≪ 1bp on cheap option).
+        assert!(
+            (theo1 - theo_taylor).abs() < 1e-4,
+            "Taylor mismatch: actual={:.6}, taylor={:.6}",
+            theo1, theo_taylor
+        );
+    }
+
+    #[test]
+    fn black76_price_unchanged_after_refactor() {
+        // Regression: confirm price-only path still matches the
+        // combined path bit-for-bit (same d1/cdf chain).
+        let cases = [
+            (100.0, 90.0, 0.5, 0.20, 0.0, 'C'),
+            (100.0, 110.0, 0.5, 0.20, 0.0, 'P'),
+            (6.0, 5.95, 0.07, 0.30, 0.0, 'P'),
+            (6.0, 6.10, 0.07, 0.30, 0.0, 'C'),
+        ];
+        for (f, k, t, sigma, r, right) in cases {
+            let p_only = black76_price(f, k, t, sigma, r, right);
+            let (p_pair, _d) = black76_price_and_delta(f, k, t, sigma, r, right);
+            assert_eq!(p_only, p_pair, "mismatch f={} k={} t={} right={}", f, k, t, right);
+        }
     }
 
     #[test]

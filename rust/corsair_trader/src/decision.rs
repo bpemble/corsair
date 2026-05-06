@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::messages::{TickMsg, VolParams};
-use crate::pricing::{black76_price, sabr_implied_vol, svi_implied_vol};
+use crate::pricing::{black76_price_and_delta, sabr_implied_vol, svi_implied_vol};
 use crate::state::{DecisionCounters, ScalarSnapshot, SharedState};
 
 // Constants matching Python's src/trader/main.py.
@@ -288,10 +288,13 @@ pub fn decide_on_tick(
         r_char,
         vp_msg.fit_ts_ns,
     );
-    let theo = match state.theo_cache.get(&theo_key).map(|r| *r.value()) {
-        Some(t) => t,
+    // Cached value is (theo_at_fit, delta_at_fit) — both pure functions
+    // of (fit_forward, strike, tte, params, right). Caching delta lets
+    // the Taylor reprice below run without recomputing greeks per tick.
+    let (theo_at_fit, delta_at_fit) = match state.theo_cache.get(&theo_key).map(|r| *r.value()) {
+        Some(td) => td,
         None => {
-            let (_iv, t) =
+            let (_iv, t, d) =
                 match compute_theo(pricing_forward, strike, tte, r_char, &vp_msg.params) {
                     Some(v) => v,
                     None => {
@@ -309,10 +312,31 @@ pub fn decide_on_tick(
                     .theo_cache
                     .retain(|(_, _, _, ts), _| *ts == current_fit);
             }
-            state.theo_cache.insert(theo_key, t);
-            t
+            state.theo_cache.insert(theo_key, (t, d));
+            (t, d)
         }
     };
+
+    // First-order Taylor reprice for spot drift since the SABR fit.
+    // Anchor is `spot_at_fit` (front-month spot the broker saw when
+    // fitting), NOT `pricing_forward` (the option's underlying-month
+    // parity-F). Using `forward` would conflate the static front-vs-
+    // deferred carry (~$0.04–0.05 in HG) with actual drift, shifting
+    // every theo by delta × carry — that bug killed all SELL quotes
+    // via cross-protect on 2026-05-06 between 12:35 and 12:45 UTC.
+    //
+    //   theo ≈ theo_at_fit + delta_at_fit × (spot − spot_at_fit)
+    //
+    // The SVI/SABR surface anchor stays at fit-time forward (don't
+    // pass current spot to SVI — see §16). Taylor adds back the
+    // first-order directional shift so quotes don't sit fit-frozen
+    // for up to 60s between fits. Without this, fast moves drive
+    // adverse fills (overnight 2026-05-06 pickoff cluster, §14).
+    //
+    // Bounded below at 1¢ (mirrors Python). Gamma curvature dominates
+    // beyond ~50 ticks of drift; the MAX_FORWARD_DRIFT_TICKS gate
+    // upstream catches that regime so this stays a safe first-order.
+    let theo = (theo_at_fit + delta_at_fit * (spot - vp_msg.spot_at_fit)).max(0.01);
 
     // Bid/ask + sizes for the dark-book guards.
     let raw_bid = tick.bid.unwrap_or(0.0);
@@ -675,7 +699,7 @@ pub fn compute_theo(
     tte: f64,
     right: char,
     params: &VolParams,
-) -> Option<(f64, f64)> {
+) -> Option<(f64, f64, f64)> {
     if forward <= 0.0 || strike <= 0.0 || tte <= 0.0 {
         return None;
     }
@@ -704,11 +728,11 @@ pub fn compute_theo(
     if iv <= 0.0 || iv.is_nan() {
         return None;
     }
-    let theo = black76_price(forward, strike, tte, iv, 0.0, right);
+    let (theo, delta) = black76_price_and_delta(forward, strike, tte, iv, 0.0, right);
     if theo <= 0.0 {
         return None;
     }
-    Some((iv, theo))
+    Some((iv, theo, delta))
 }
 
 /// Convert a YYYYMMDD expiry string to time-to-expiry in years.
@@ -772,6 +796,11 @@ mod tests {
                 // hit the new gate first.
                 calibrated_min_k: None,
                 calibrated_max_k: None,
+                // Test fixture: spot_at_fit = forward (no Taylor shift)
+                // so existing tests continue to assert against fit-frozen
+                // theo, isolating each gate. The Taylor-specific test
+                // exercises a non-zero (spot − spot_at_fit) explicitly.
+                spot_at_fit: 6.0,
             },
         );
     }
@@ -1039,5 +1068,47 @@ mod tests {
         let expiry_arc = state.intern_expiry(&tick.expiry);
         let decisions = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
         assert!(decisions.is_empty());
+    }
+
+    #[test]
+    fn taylor_cache_stores_theo_and_delta_pair() {
+        // Verifies the cache layout change (f64 → (f64, f64)). The
+        // Taylor reprice path in decide_on_tick reads the stored
+        // delta_at_fit; without the pair shape, the formula has no
+        // delta to apply. Pricing-level correctness of the Taylor
+        // formula is covered by `black76_taylor_first_order_check`
+        // in pricing.rs.
+        //
+        // Test runs decide_on_tick with a tick that's likely to be
+        // skipped by downstream gates (wide spread) — but the theo
+        // cache populates BEFORE those gates fire, so the cache
+        // entry is observable regardless of whether a Place result.
+        let state = fresh_state(6.00);
+        install_svi_surface(&state, "20260526", 'C');
+        let counters = DecisionCounters::default();
+        let tick = make_tick(6.05, "20260526", "C", 0.05, 0.30);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let now_wall_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        let _ = decide_on_tick(&state, &counters, &tick, &expiry_arc, 1_000_000_000, now_wall_ns);
+
+        // Cache should hold one entry — the (theo_at_fit, delta_at_fit) pair.
+        let cache_entries: Vec<_> = state
+            .theo_cache
+            .iter()
+            .map(|e| *e.value())
+            .collect();
+        assert_eq!(cache_entries.len(), 1, "expected exactly one cache entry");
+        let (theo_at_fit, delta_at_fit) = cache_entries[0];
+        assert!(theo_at_fit > 0.0, "theo_at_fit must be positive: {}", theo_at_fit);
+        // Slightly-OTM call (K=6.05 vs F=6.0) → delta in (0, 0.5).
+        assert!(
+            delta_at_fit > 0.0 && delta_at_fit < 0.5,
+            "delta_at_fit out of expected range for slightly-OTM call: {}",
+            delta_at_fit
+        );
     }
 }

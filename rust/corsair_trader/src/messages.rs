@@ -153,6 +153,16 @@ pub struct VolSurfaceMsg {
     pub calibrated_min_k: Option<f64>,
     #[serde(default)]
     pub calibrated_max_k: Option<f64>,
+    /// Spot price (front-month underlying) observed by the broker AT
+    /// FIT TIME. Anchor for the trader's Taylor reprice — Taylor uses
+    /// (current_spot − spot_at_fit), NOT (current_spot − forward), so
+    /// the static carry between front-month and the option's
+    /// underlying month doesn't get treated as drift. Optional for
+    /// back-compat with older broker builds; when None the trader
+    /// falls back to its own current spot at message-arrival time
+    /// (close enough — the gap is a few ms of IPC latency).
+    #[serde(default)]
+    pub spot_at_fit: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
