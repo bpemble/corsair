@@ -76,7 +76,7 @@ quoting:
 hedging:
   enabled: true
   mode: execute                # LIVE: place hedge orders
-  tolerance_deltas: 0.5
+  tolerance_deltas: 2.0   # 0.5 → 2.0 on 2026-05-06: 0.5 caused per-fill hedge churn (~10 round-trips for net-0 over a session) at ~$0.001/contract slippage each. 2.0 still well inside delta_ceiling=3.0 and delta_kill=5.0; peak unhedged delta floats to ±2 between fits.
   rebalance_on_fill: true
   rebalance_cadence_sec: 30
   include_in_daily_pnl: true
