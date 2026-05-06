@@ -12,14 +12,14 @@
 //!   persisted in the kill_switch JSONL; fills in the fills JSONL.
 //!   Discord is for operator visibility, not the audit trail.
 //! - Bounded latency: 5s timeout on the POST.
-//! - Rate-limited: Discord webhook free tier allows ~30 req/min.
-//!   `notify_fill` enforces a 6s minimum gap between fill posts to
-//!   stay well under the limit. Excess fills are silently dropped
-//!   (with a counter logged at INFO every minute) — operators can
-//!   read the JSONL stream for the complete record.
+//! - No rate limit: previously a 6s gap dropped the second of any
+//!   back-to-back fills (e.g. a close+open pair within 1s during the
+//!   2026-05-06 morning hedge churn) and the operator never saw
+//!   half the activity. Discord webhook real limits (~150/min) are
+//!   well above our worst observed fill burst. If Discord starts
+//!   returning 429s in practice, switch to a token bucket here.
 
 use corsair_risk::KillEvent;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Cached webhook URL — None if env var unset. Resolved once at
@@ -105,19 +105,6 @@ pub fn notify_kill(ev: KillEvent) {
 }
 
 // ─── Fill notifications ──────────────────────────────────────────────
-
-/// Minimum nanoseconds between consecutive fill notifications. Discord
-/// free-tier allows ~30 req/min; 6s = 10 req/min, leaves headroom for
-/// kill events to also pass through. Excess fills are dropped (the
-/// fills JSONL has the complete record).
-const FILL_NOTIFY_MIN_GAP_NS: u64 = 6_000_000_000;
-
-/// Last-fill-notify wall-clock ns. Updated atomically. New fills check
-/// `now_ns - last >= FILL_NOTIFY_MIN_GAP_NS` before posting.
-static LAST_FILL_NS: AtomicU64 = AtomicU64::new(0);
-/// Counter of fills dropped due to rate limit. Logged + reset every
-/// minute by the periodic_fill_summary task (or read on shutdown).
-static DROPPED_FILL_NOTIFIES: AtomicU64 = AtomicU64::new(0);
 
 fn fill_color(side: corsair_broker_api::Side) -> u64 {
     match side {
@@ -247,33 +234,14 @@ fn format_fill_payload(
     })
 }
 
-/// Fire-and-forget fill notification. Rate-limited (one post per
-/// `FILL_NOTIFY_MIN_GAP_NS`). Drops excess fills and counts them.
-/// Caller passes a `FillNotifyContext` with whatever decoration fields
-/// it could resolve from broker state — missing fields render as "—".
+/// Fire-and-forget fill notification. Caller passes a
+/// `FillNotifyContext` with whatever decoration fields it could
+/// resolve from broker state — missing fields render as "—".
 pub fn notify_fill(fill: corsair_broker_api::events::Fill, ctx: FillNotifyContext) {
     let url = match webhook_url() {
         Some(u) => u,
         None => return,
     };
-    // Rate-limit check (atomic CAS).
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let last = LAST_FILL_NS.load(Ordering::Acquire);
-    if now.saturating_sub(last) < FILL_NOTIFY_MIN_GAP_NS {
-        DROPPED_FILL_NOTIFIES.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    if LAST_FILL_NS
-        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        // Lost the race to another fill — that one wins, this one drops.
-        DROPPED_FILL_NOTIFIES.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
     let payload = format_fill_payload(&fill, &ctx);
     tokio::spawn(async move {
         let client = http_client();
@@ -289,14 +257,4 @@ pub fn notify_fill(fill: corsair_broker_api::events::Fill, ctx: FillNotifyContex
             }
         }
     });
-}
-
-/// Drain + log the dropped-fill counter. Called periodically by the
-/// broker so operators see a one-line reminder if many fills were
-/// rate-limited.
-pub fn log_and_reset_dropped_fills() {
-    let dropped = DROPPED_FILL_NOTIFIES.swap(0, Ordering::AcqRel);
-    if dropped > 0 {
-        log::info!("notify: rate-limited {dropped} fill notifications in last interval (full record in fills JSONL)");
-    }
 }

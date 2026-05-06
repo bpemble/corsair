@@ -73,14 +73,6 @@ pub fn spawn_ipc(
     tokio::spawn(forward_status(runtime.clone(), Arc::clone(&server)));
     tokio::spawn(forward_connection(runtime.clone(), Arc::clone(&server)));
     tokio::spawn(periodic_risk_state(runtime.clone(), Arc::clone(&server)));
-    // Periodic log of fill notifications dropped by Discord rate limit.
-    // 60s cadence — operator sees a one-liner if many were skipped.
-    tokio::spawn(async {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            crate::notify::log_and_reset_dropped_fills();
-        }
-    });
 
     // Tick fast-path: install a publisher closure on NativeBroker
     // so the dispatcher writes ticks directly to SHM, bypassing the
