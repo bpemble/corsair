@@ -331,10 +331,31 @@ pub fn calibrate_sabr(
     let atm_iv = market_ivs[atm_idx];
     let alpha_0 = (atm_iv * f.powf(1.0 - beta)).max(0.001);
 
-    // Bounds matching Python.
+    // SABR parameter bounds.
+    //
+    // rho ∈ [-0.99, 0.99] — tightened from ±0.999 per fp32 precision
+    // study (2026-05-06). Hagan 2002 SABR has structural numerical
+    // instability near |ρ| → 1: the closed form computes
+    //   xz = z / ln((sqrt(1 − 2ρz + z²) + z − ρ) / (1 − ρ))
+    // and both `(1 − ρ)` and `(sqrt(...) + z − ρ)` are O(1 − |ρ|),
+    // so their ratio amplifies floating-point noise into
+    // percentage-level errors when |ρ| is near 1. The fp32 study
+    // documented ~5–13% IV drift on rho=0.999 fits in fp32 (the
+    // FPGA-prototype-blocking finding). The same instability exists
+    // in fp64 at smaller magnitudes — and the calibrator's noise
+    // floor on rho is already well above 0.009, so the last 0.009
+    // of rho range is statistically uninteresting (the LM solver
+    // hitting the boundary indicates the data doesn't constrain
+    // rho tightly, not that rho is genuinely 0.999).
+    //
+    // Eliminates the only observed structural fp32 failure mode
+    // (precision study verdict) and removes a known fp64 SABR
+    // pitfall as a side effect. See:
+    //   - audits/sections-16-19-audit.md (precision-study cross-ref)
+    //   - /home/ethereal/fp32-precision-spike/results/analysis_report.md §5
     let alpha_ub = (10.0_f64).max(alpha_0 * 5.0);
-    let lb = [0.0001_f64, -0.999, 0.0001];
-    let ub = [alpha_ub, 0.999, 5.0];
+    let lb = [0.0001_f64, -0.99, 0.0001];
+    let ub = [alpha_ub, 0.99, 5.0];
 
     let initial_guesses: [[f64; 3]; 4] = [
         [alpha_0, -0.3, 0.3],
@@ -592,6 +613,157 @@ mod tests {
         let ivs = vec![0.10, 0.50, 0.20, 0.40, 0.20, 0.50, 0.10]; // jagged
         let res = calibrate_sabr(f, t, &ks, &ivs, None, 0.5, 0.001);
         assert!(res.is_none(), "should reject very high rmse");
+    }
+
+    #[test]
+    fn sabr_rho_bound_clamps_at_0_99() {
+        // Synthesize a chain from a SABR with rho_true near the old
+        // (±0.999) boundary. With the new (±0.99) bound, the fit's
+        // rho must NOT exceed 0.99 in absolute value. This test
+        // validates that the LM solver respects the new constraint
+        // and does not overshoot the bound.
+        //
+        // Tolerance: project() snaps to the bound exactly; allow
+        // tiny epsilon for numerical-roundoff in the LM step that
+        // produces the bound-touching iterate.
+        let f = 6.0;
+        let t = 25.0 / 365.0;
+        let alpha_true = 0.65;
+        let beta = 0.5;
+        let nu_true = 0.5;
+        let ks = vec![5.6, 5.7, 5.8, 5.9, 6.0, 6.1, 6.2, 6.3, 6.4];
+
+        for rho_true in [0.995_f64, -0.995, 0.999, -0.999] {
+            let ivs = synth_chain_sabr(f, t, alpha_true, beta, rho_true, nu_true, &ks);
+            let fit = calibrate_sabr(f, t, &ks, &ivs, None, beta, 0.5)
+                .unwrap_or_else(|| panic!("fit failed for rho_true={rho_true}"));
+            assert!(
+                fit.rho.abs() <= 0.99 + 1e-9,
+                "rho bound violated: rho_true={rho_true}, fit.rho={}",
+                fit.rho
+            );
+            // The bound-touching iterate is the expected outcome here —
+            // confirm the calibrator pushed rho to the boundary rather
+            // than landing somewhere arbitrary.
+            assert!(
+                fit.rho.abs() >= 0.985,
+                "expected rho near boundary for rho_true={rho_true}, got fit.rho={}",
+                fit.rho
+            );
+        }
+    }
+
+    #[test]
+    fn sabr_rho_unchanged_for_typical_values() {
+        // Synthesize chains over a representative range of rho values
+        // that fall inside the new (±0.99) bound. Each fit must
+        // recover the underlying rho within tolerance — the bound
+        // tightening should not perturb fits in the safe region.
+        // Sweeping confirms there's no regression at any specific rho
+        // (the boundary tightening could in principle have introduced
+        // a numerical artifact in the LM trajectory; this test would
+        // catch that).
+        let f = 6.0;
+        let t = 25.0 / 365.0;
+        let alpha_true = 0.55;
+        let beta = 0.5;
+        let nu_true = 1.0;
+        let ks = vec![5.6, 5.7, 5.8, 5.9, 6.0, 6.1, 6.2, 6.3, 6.4];
+
+        for rho_true in [-0.95_f64, -0.50, -0.25, 0.0, 0.25, 0.50, 0.95] {
+            let ivs = synth_chain_sabr(f, t, alpha_true, beta, rho_true, nu_true, &ks);
+            let fit = calibrate_sabr(f, t, &ks, &ivs, None, beta, 0.05)
+                .unwrap_or_else(|| panic!("fit failed for rho_true={rho_true}"));
+            // Same tolerance as `lm_recovers_synthetic_sabr_params` —
+            // we're asserting parity with the pre-tightening behavior
+            // in this region.
+            assert!(
+                (fit.rho - rho_true).abs() < 0.10,
+                "rho drift at rho_true={rho_true}: fit.rho={}",
+                fit.rho
+            );
+            assert!(
+                fit.rmse < 1e-3,
+                "rmse too high at rho_true={rho_true}: rmse={}",
+                fit.rmse
+            );
+        }
+    }
+
+    #[test]
+    fn sabr_real_world_rho_boundary_fits_converge_with_new_bound() {
+        // Real-world validation. Params extracted from production
+        // logs-paper/trader_events-2026-05-{05,06}.jsonl — the SABR fits
+        // that hit |rho|=0.999 (which the new bound rejects). For each,
+        // synthesize the implied chain on a HG-realistic strike grid
+        // (15 strikes spanning ±$0.35 around F at $0.05 spacing) and
+        // confirm the calibrator produces a sane fit with the new
+        // (±0.99) bound: convergence, RMSE within reasonable range
+        // (≤ 0.05 — the same max_rmse the production calibrator uses),
+        // and rho clamped at the new boundary.
+        //
+        // This is the production sanity check the PR description
+        // references — it answers "does the tighter bound break any
+        // real fits the calibrator was making?". Empirical answer: no.
+        //
+        // Format: (F, alpha, beta, rho_old, nu)
+        let real_boundary_fits: &[(f64, f64, f64, f64, f64)] = &[
+            (5.98165,           0.5935306229887087, 0.5,  0.999,                0.130790712609745),
+            (5.982349999999999, 0.5924917654859228, 0.5,  0.999,                0.1478298845397704),
+            (5.9906999999999995, 0.5951153861106905, 0.5, -0.999,                0.10136175011755671),
+            (6.003522727272727, 0.6019820006457103, 0.5, -0.999,                0.022055044508673023),
+            (6.0049,            0.6032202968799343, 0.5,  0.9989999359809747,   0.005902932488886279),
+            (5.9904,            0.601444921044216,  0.5,  0.998999999975501,    0.0477784914230657),
+            (6.009575,          0.5995941341268647, 0.5, -0.9989999582752446,   0.004793804563487619),
+            (5.98875,           0.5968936318711497, 0.5, -0.9985859785308195,   0.0270000492729843),
+        ];
+        let t = 25.0 / 365.0;
+
+        for &(f, alpha, beta, rho_old, nu) in real_boundary_fits {
+            // Synthesize the chain at a HG-realistic strike grid.
+            let ks_full: Vec<f64> = (-7..=7).map(|i| f + (i as f64) * 0.05).collect();
+            let mut ks = Vec::new();
+            let mut ivs = Vec::new();
+            for &k in &ks_full {
+                let iv = sabr_implied_vol(f, k, t, alpha, beta, rho_old, nu);
+                if iv.is_finite() && iv > 0.0 {
+                    ks.push(k);
+                    ivs.push(iv);
+                }
+            }
+            assert!(
+                ks.len() >= 5,
+                "synthesis produced too few valid strikes for rho_old={rho_old}: {}",
+                ks.len()
+            );
+
+            // Re-fit with NEW bounds (the lb/ub at lines above).
+            // max_rmse=0.5 lets us see whether the fit converged at ALL
+            // (production uses 0.05 — checked separately below).
+            let refit = calibrate_sabr(f, t, &ks, &ivs, None, beta, 0.5)
+                .unwrap_or_else(|| panic!("refit failed for rho_old={rho_old}"));
+
+            // rho must respect the new bound. The fit may either clamp
+            // at ±0.99 (when the data really wants extreme rho) OR
+            // settle at an interior value (when the new bound gives
+            // the LM solver enough room to find a numerically
+            // better-conditioned solution that the old ±0.999 boundary
+            // was masking — this is the GOOD outcome).
+            assert!(
+                refit.rho.abs() <= 0.99 + 1e-9,
+                "rho bound violated for rho_old={rho_old}: refit.rho={}",
+                refit.rho
+            );
+            // RMSE must stay within production's max_rmse (0.05). If
+            // the fit needs a larger budget than that, the bound is too
+            // tight for this real-world chain — the test fails and we
+            // re-evaluate the bound choice.
+            assert!(
+                refit.rmse <= 0.05,
+                "RMSE exceeds production max_rmse=0.05 for rho_old={rho_old}: rmse={}",
+                refit.rmse
+            );
+        }
     }
 
     #[test]
