@@ -1096,3 +1096,74 @@ If you ever see a regression to `spot − forward` in the Taylor
 formula, revert it immediately and replace with `spot − spot_at_fit`.
 It is NOT just a small numerical difference — it kills two-sided
 quoting entirely on any product with calendar carry.
+
+## 20. Round-half-away tick quantizer — verified bias, deferred to live telemetry (2026-05-06)
+
+The fp32 precision study (`/home/ethereal/fp32-precision-spike/`)
+flagged a directional bias at half-tick targets and recommended
+switching the tick quantizer in `corsair_trader/src/decision.rs:516-517`
+from round-half-away-from-zero to round-toward-`mkt_mid`. Followup
+verification + backtest concluded **the bias is real but the change
+is deferred to Path C (live `effective_delta` telemetry observation)**
+rather than shipped via PR. Recording the lineage here so the
+finding doesn't get lost.
+
+### What was found
+
+`verification_fp64_directional_bias.md` (fp32-precision-spike repo)
+confirmed that the round-half-away rule produces a deterministic
+UP-bias on tick-aligned mid-capped targets in production fp64 — same
+rule, opposite direction from the fp32 spike's original finding. On
+Day 1's trace (2026-05-06 10-11 CDT, 244k priced ticks):
+- BUY mid-capped: 32% UP (more aggressive) / 16% DOWN / 52% EXACT.
+- SELL mid-capped: 51% UP (less aggressive) / 0.3% DOWN / 49% EXACT.
+- Net inventory direction predicted: small LONG-drift (~4 contracts
+  per 6h-equivalent session, well within `delta_kill = 5.0`).
+
+### What was tested
+
+`quantizer_backtest_results.md` (fp32-precision-spike repo) compared
+round-half-away vs round-toward-mkt_mid on 3 days (Day 1 = 2026-05-06,
+Day 2 = 2026-05-05, Day 3 = 2026-05-04). Pre-committed thresholds
+required ≥2/3 days to pass both magnitude (>50 changes per 6h-equiv)
+and symmetry (|BUY-SELL effect|/max < 0.30). 0/3 days passed both —
+Day 1 had the magnitude (47k BUY corrections) but ~1.0 asymmetry
+(SELL had 300 corrections, not 47k). Days 2 and 3 had zero
+mid-capped placements at all (different microstructure regimes).
+
+### Why deferred rather than shipped
+
+The asymmetry is intrinsic to the fix structure: Rule A's UP-bias
+maps to MORE aggressive on BUY but LESS aggressive on SELL (because
+"UP" means different operational things on the two sides). Rule B
+("round AWAY from spread") corrects BUY (47k cases per Day 1) but
+not SELL (matches Rule A's existing UP direction). The fix is a
+PARTIAL correction — and the binding pre-committed threshold caught
+that.
+
+The hedge runs continuously and corrects directional drift; if the
+rule's bias is operationally invisible at the `effective_delta`
+telemetry level, the change isn't worth a behavior shift. Path C
+is: observe live telemetry post-deploy, and only revisit the
+quantizer if the predicted LONG-drift shows up in `risk_effective_delta`
+time series over 1-2 weeks of clean live data.
+
+### How to apply
+
+- **Don't ship a quantizer change without new evidence.** The
+  pre-committed test said skip; ship only if (a) live telemetry
+  shows the predicted drift, or (b) a new analysis with fill-level
+  data tightens the magnitude estimate enough to override the
+  pre-committed verdict.
+- **Don't ship the change just because the FPGA prototype wants it.**
+  The FPGA portability concern was secondary motivation — the rule's
+  behavior is the same in fp32 and fp64 (just different magnitudes
+  of representation noise). FPGA implementation can adopt
+  round-toward-mkt_mid independently if the FPGA team prefers it
+  for predictability; that's an FPGA-side decision, not a production
+  trader change.
+- **The §16/§19 lineage is closed at this point.** Audit (PR #1),
+  calibrator constraint (PR #2), and this verification + backtest are
+  the complete §16/§19 followup record. Newtype refactor (audit
+  Option A) is the next downstream item; tracked separately as task
+  #16 in the spike's task list.
