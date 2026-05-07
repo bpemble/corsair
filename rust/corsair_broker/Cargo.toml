@@ -21,7 +21,6 @@ corsair_constraint = { path = "../corsair_constraint" }
 corsair_hedge = { path = "../corsair_hedge" }
 corsair_ipc = { path = "../corsair_ipc" }
 corsair_market_data = { path = "../corsair_market_data" }
-corsair_oms = { path = "../corsair_oms" }
 corsair_position = { path = "../corsair_position" }
 corsair_pricing = { path = "../corsair_pricing" }
 corsair_risk = { path = "../corsair_risk" }

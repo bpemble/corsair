@@ -13,7 +13,6 @@ use corsair_broker_ibkr_native::{
 use corsair_constraint::{ConstraintChecker, ConstraintConfig};
 use corsair_hedge::{HedgeConfig, HedgeFanout, HedgeManager, HedgeMode};
 use corsair_market_data::MarketDataState;
-use corsair_oms::OrderBook;
 use corsair_position::{PortfolioState, ProductInfo, ProductRegistry};
 use corsair_risk::{RiskConfig, RiskMonitor};
 use corsair_snapshot::{SnapshotConfig, SnapshotPublisher};
@@ -78,7 +77,13 @@ pub struct Runtime {
     pub risk: Mutex<RiskMonitor>,
     pub constraint: Mutex<ConstraintChecker>,
     pub hedge: Mutex<HedgeFanout>,
-    pub oms: Mutex<OrderBook>,
+    /// Set of OrderIds we've observed at least one OrderStatus for.
+    /// `pump_status` inserts on first sight and removes on terminal.
+    /// Used only to drive a debug log for "status update for orderId
+    /// we never tracked" — which surfaces stray statuses from other
+    /// clientIds on the FA-master clientId=0 connection. Inlined
+    /// 2026-05-07 from the retired `corsair_oms` crate.
+    pub seen_orders: Mutex<std::collections::HashSet<corsair_broker_api::OrderId>>,
     pub market_data: Mutex<MarketDataState>,
     pub snapshot: Mutex<SnapshotPublisher>,
 
@@ -93,7 +98,7 @@ pub struct Runtime {
         Mutex<std::collections::HashMap<corsair_broker_api::InstrumentId, corsair_broker_api::Contract>>,
 
     /// Fast-path contract lookup for `handle_place` / `handle_modify`,
-    /// keyed by (strike-bits, expiry-YYYYMMDD, right-char).
+    /// keyed by (strike-quantized-i64, expiry-YYYYMMDD, right-char).
     ///
     /// Replaces the O(N×M) scan over `MarketDataState::options_for_
     /// product` that handle_place used to do — that scan included a
@@ -103,8 +108,16 @@ pub struct Runtime {
     /// `qualified_contracts`) so the hot path can resolve a contract
     /// in a single `HashMap::get`. Bounded by quoted strikes
     /// (~30 in production) so memory is trivial.
+    ///
+    /// Strike is quantized via `strike_key_i64` (matches the trader's
+    /// `SharedState::strike_key` defense from §18). Both producer
+    /// (subscribe_strike) and consumer (handle_place) within the
+    /// broker derive strike from the same f64s today, but a future
+    /// path computing strike from arithmetic (e.g. `atm + n * tick`)
+    /// would silently miss the cache under bit-precision drift —
+    /// quantization closes that class entirely.
     pub contract_by_key:
-        Mutex<std::collections::HashMap<(u64, String, char), corsair_broker_api::Contract>>,
+        Mutex<std::collections::HashMap<(i64, String, char), corsair_broker_api::Contract>>,
 
     /// Cached account snapshot from `Broker::account_values()`. Updated
     /// every ~5min by `periodic_account_poll`. Read by
@@ -246,7 +259,6 @@ impl Runtime {
         // is enabled.
         let hedge = build_hedge_fanout(&cfg);
 
-        let oms = OrderBook::new();
         let market_data = MarketDataState::new();
 
         let snapshot_cfg = SnapshotConfig {
@@ -262,7 +274,7 @@ impl Runtime {
             risk: Mutex::new(risk),
             constraint: Mutex::new(constraint),
             hedge: Mutex::new(hedge),
-            oms: Mutex::new(oms),
+            seen_orders: Mutex::new(std::collections::HashSet::new()),
             market_data: Mutex::new(market_data),
             snapshot: Mutex::new(snapshot),
             qualified_contracts: Mutex::new(std::collections::HashMap::new()),
@@ -753,12 +765,6 @@ fn build_hedge_fanout(cfg: &BrokerDaemonConfig) -> HedgeFanout {
             rebalance_cadence_sec: cfg.hedging.rebalance_cadence_sec,
             include_in_daily_pnl: cfg.hedging.include_in_daily_pnl,
             flatten_on_halt_enabled: cfg.hedging.flatten_on_halt,
-            // Dead — hedge orders are MARKET-IOC since 2026-05-04
-            // (CLAUDE.md §10). The corsair_hedge::HedgeConfig struct
-            // still carries these fields for back-compat; we pass
-            // arbitrary placeholders.
-            ioc_tick_offset: 0,
-            hedge_tick_size: 0.0,
             lockout_days: cfg.hedging.hedge_lockout_days,
         }));
     }

@@ -1265,6 +1265,7 @@ fn on_tick(
                     qty: 1,
                     price,
                     order_ref: "corsair_trader_rust",
+                    gtd_seconds: gtd_lifetime_s as u32,
                     triggering_tick_broker_recv_ns: tick.broker_recv_ns,
                 };
                 let place_frame_idx = frame_ranges.len();

@@ -318,9 +318,22 @@ async fn pump_status(runtime: Arc<Runtime>) {
     loop {
         match rx.recv().await {
             Ok(update) => {
-                let mut oms = runtime.oms.lock().unwrap();
-                let resolved = oms.apply_status(update.order_id, update.status);
-                if !resolved {
+                let terminal = matches!(
+                    update.status,
+                    OrderStatus::Filled
+                        | OrderStatus::Cancelled
+                        | OrderStatus::Rejected
+                        | OrderStatus::Inactive
+                );
+                let already_seen = {
+                    let mut seen = runtime.seen_orders.lock().unwrap();
+                    if terminal {
+                        seen.remove(&update.order_id)
+                    } else {
+                        !seen.insert(update.order_id)
+                    }
+                };
+                if !already_seen {
                     log::debug!(
                         "status update for unknown orderId {}: {:?}",
                         update.order_id,
@@ -464,10 +477,53 @@ async fn pump_errors(runtime: Arc<Runtime>) {
         match rx.recv().await {
             Ok(err) => {
                 log::warn!("broker error: {err}");
-                // TODO: route certain protocol errors (e.g. 1100
-                // disconnect) to risk.fire as KillSource::Disconnect.
-                // Today the connection stream handles disconnects.
-                let _ = runtime;
+                // Route disconnect-class errors to a Disconnect kill
+                // so quoting halts even when the connection-stream
+                // event is delayed or never fires (rare on partial
+                // socket faults). The connection-event listener
+                // (`pump_connection`) clears the kill on reconnect,
+                // matching CLAUDE.md §15's clear-on-reconnect rule.
+                //
+                // IBKR codes 1100 / 1102 / 1300 / 504 are gateway
+                // disconnect / TWS reset / port reset; they are the
+                // canonical disconnect-class protocol codes.
+                let disconnect_kill = match &err {
+                    corsair_broker_api::BrokerError::ConnectionLost(msg) => Some(format!(
+                        "broker error → ConnectionLost: {msg}"
+                    )),
+                    corsair_broker_api::BrokerError::Protocol {
+                        code: Some(c @ (1100 | 1102 | 1300 | 504)),
+                        message,
+                    } => Some(format!(
+                        "broker error → Protocol {c}: {message}"
+                    )),
+                    _ => None,
+                };
+                if let Some(reason) = disconnect_kill {
+                    let already_disconnect = {
+                        let r = runtime.risk.lock().unwrap();
+                        r.kill_event()
+                            .map(|e| e.source.is_disconnect())
+                            .unwrap_or(false)
+                    };
+                    if already_disconnect {
+                        // Already disconnect-killed; don't re-fire.
+                        continue;
+                    }
+                    let ev = corsair_risk::KillEvent {
+                        reason,
+                        source: corsair_risk::KillSource::Disconnect,
+                        kill_type: corsair_risk::KillType::Halt,
+                        timestamp_ns: crate::time::now_ns(),
+                    };
+                    {
+                        let mut r = runtime.risk.lock().unwrap();
+                        r.fire(ev.clone());
+                    }
+                    crate::notify::notify_kill(ev.clone());
+                    crate::ipc::publish_kill(&runtime, &ev);
+                    cancel_all_resting(&runtime, "disconnect").await;
+                }
             }
             Err(RecvError::Lagged(_)) => {}
             Err(RecvError::Closed) => break,
@@ -893,17 +949,16 @@ async fn place_hedge_order(
         return;
     }
     // Hedge order type: MARKET-IOC. The original design was limit-IOC
-    // anchored at F ± `ioc_tick_offset` ticks — small bounded slippage
-    // if filled, but the IOC dies when the market moves >N ticks
-    // during the ~140 ms IBKR RTT. In a fast move (exactly when we
-    // MOST need to be hedged) the IOC reliably missed. HG futures
-    // depth is deep enough that a 4-contract market order slips 1-2
-    // ticks at worst — "fill at any reasonable price" beats "fill at
-    // +N ticks or never". 2026-05-04: switched after observing 4
-    // consecutive 30 s periodic IOC misses while options_delta sat
-    // at −4.3. The `ioc_tick_offset` and `hedge_tick_size` fields are
-    // dead since the switch — see runtime.rs build_hedge_fanout for
-    // the ignored placeholder values.
+    // anchored at F ± N ticks — small bounded slippage if filled, but
+    // the IOC dies when the market moves >N ticks during the ~140 ms
+    // IBKR RTT. In a fast move (exactly when we MOST need to be
+    // hedged) the IOC reliably missed. HG futures depth is deep
+    // enough that a 4-contract market order slips 1-2 ticks at worst
+    // — "fill at any reasonable price" beats "fill at +N ticks or
+    // never". 2026-05-04: switched after observing 4 consecutive 30 s
+    // periodic IOC misses while options_delta sat at −4.3. The legacy
+    // `ioc_tick_offset` and `hedge_tick_size` HedgeConfig fields were
+    // removed entirely with that switch.
     let req = corsair_broker_api::PlaceOrderReq {
         contract,
         side: if is_buy {

@@ -269,6 +269,12 @@ pub struct PlaceOrder<'a> {
     pub price: f64,
     #[serde(rename = "orderRef")]
     pub order_ref: &'static str,
+    /// GTD lifetime in seconds; broker converts to absolute UTC.
+    /// Send on every place so `quoting.gtd_lifetime_s` from runtime
+    /// config actually drives the order's expiry. Without this field,
+    /// the broker fell through to `cmd.gtd_seconds.unwrap_or(30)`,
+    /// silently disagreeing with any non-30s YAML setting.
+    pub gtd_seconds: u32,
     /// v2 wire-timing: TickMsg.broker_recv_ns of the tick that drove
     /// this decision (latest tick the trader had cached for this key
     /// at decide_quote time). Skipped on the wire when None.

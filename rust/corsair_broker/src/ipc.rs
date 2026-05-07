@@ -676,10 +676,29 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
     // iteration — ~10–15 µs of pure dispatch latency per place call.
     // `contract_by_key` is populated in subscribe_strike alongside
     // qualified_contracts so the hot path is one HashMap::get.
-    let r_norm = cmd.right.chars().next()
-        .map(|c| c.to_ascii_uppercase())
-        .unwrap_or('C');
-    let lookup_key = (cmd.strike.to_bits(), cmd.expiry.clone(), r_norm);
+    //
+    // Reject on empty/invalid right rather than silently bucketing as
+    // 'C' — a schema-drift PlaceOrderCmd with a missing right would
+    // otherwise route puts as call lookups (silent directional fault).
+    // Mirrors the trader's strict tick/place_ack handling.
+    let r_norm = match cmd.right.chars().next() {
+        Some(c) => {
+            let up = c.to_ascii_uppercase();
+            if up != 'C' && up != 'P' {
+                log::warn!(
+                    "ipc place_order: dropping — invalid right {:?} (must be C or P)",
+                    cmd.right
+                );
+                return;
+            }
+            up
+        }
+        None => {
+            log::warn!("ipc place_order: dropping — empty `right`");
+            return;
+        }
+    };
+    let lookup_key = (crate::strike_key_i64(cmd.strike), cmd.expiry.clone(), r_norm);
     let cached = runtime.contract_by_key.lock().unwrap().get(&lookup_key).cloned();
     let contract = match cached {
         Some(c) => c,
@@ -710,9 +729,21 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
             return;
         }
     };
+    // Reject on anything other than exact "BUY"/"SELL". A catch-all
+    // → Sell (the prior behavior) silently flips direction on any
+    // schema drift (lowercase, typo, empty); the trader's place_ack
+    // handler at corsair_trader/src/main.rs:868-872 is similarly
+    // strict on side parsing.
     let side = match cmd.side.as_str() {
         "BUY" => Side::Buy,
-        _ => Side::Sell,
+        "SELL" => Side::Sell,
+        other => {
+            log::warn!(
+                "ipc place_order: dropping — invalid side {:?} (must be BUY or SELL)",
+                other
+            );
+            return;
+        }
     };
     let order_type = match cmd.order_type.as_str() {
         "market" => OrderType::Market,

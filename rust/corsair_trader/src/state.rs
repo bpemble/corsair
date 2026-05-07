@@ -244,7 +244,6 @@ impl ScalarState {
             theta_kill: self.theta_kill,
             vega_kill: self.vega_kill,
             margin_ceiling_pct: self.margin_ceiling_pct,
-            contract_multiplier: self.contract_multiplier,
             weekend_paused: self.weekend_paused,
             gtd_lifetime_s: self.gtd_lifetime_s,
             gtd_refresh_lead_s: self.gtd_refresh_lead_s,
@@ -270,12 +269,6 @@ pub struct ScalarSnapshot {
     pub theta_kill: f64,
     pub vega_kill: f64,
     pub margin_ceiling_pct: f64,
-    /// Snapshot of `ScalarState::contract_multiplier`. Currently only
-    /// snapshotted for completeness; `improving_passes` evaluates sign
-    /// only and so doesn't need the magnitude. Kept so future
-    /// "improving by ≥ N% of breach" gating lands without re-plumbing.
-    #[allow(dead_code)]
-    pub contract_multiplier: f64,
     pub weekend_paused: bool,
     pub gtd_lifetime_s: f64,
     pub gtd_refresh_lead_s: f64,
@@ -394,25 +387,37 @@ impl OutboundLimiter {
     /// Try to consume a burst slot at `now_ns`. Returns true if the
     /// caller may send (not at cap), false if it should skip.
     /// `max_age_ns` is the sliding-window length.
+    ///
+    /// Uses `compare_exchange` to claim the older slot atomically:
+    /// the prior load+store implementation had a TOCTOU window where
+    /// the hot loop and staleness loop could both pass the cap-check
+    /// and both store, silently exceeding the 2-cap. CAS retries on
+    /// contention; under realistic load (≤2 threads racing) bounded
+    /// retries.
     #[inline]
     pub fn try_consume(&self, now_ns: u64, max_age_ns: u64) -> bool {
-        let a = self.slot_a.load(Ordering::Relaxed);
-        let b = self.slot_b.load(Ordering::Relaxed);
-        let a_recent = now_ns.saturating_sub(a) < max_age_ns;
-        let b_recent = now_ns.saturating_sub(b) < max_age_ns;
-        if a_recent && b_recent {
-            return false;
+        loop {
+            let a = self.slot_a.load(Ordering::Relaxed);
+            let b = self.slot_b.load(Ordering::Relaxed);
+            let a_recent = now_ns.saturating_sub(a) < max_age_ns;
+            let b_recent = now_ns.saturating_sub(b) < max_age_ns;
+            if a_recent && b_recent {
+                return false;
+            }
+            // Prefer the older slot — it's either stale or empty (0).
+            let (slot, expected) = if a <= b {
+                (&self.slot_a, a)
+            } else {
+                (&self.slot_b, b)
+            };
+            if slot
+                .compare_exchange(expected, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+            // Another caller raced us; retry with fresh reads.
         }
-        // Overwrite the oldest slot. Under hot-path single-thread
-        // access this is race-free; under cross-thread (staleness
-        // loop calling concurrently) the worst case is one extra
-        // send slipping through — acceptable.
-        if a <= b {
-            self.slot_a.store(now_ns, Ordering::Relaxed);
-        } else {
-            self.slot_b.store(now_ns, Ordering::Relaxed);
-        }
-        true
     }
 }
 
@@ -566,6 +571,12 @@ pub struct DecisionCounters {
     /// piling onto the IBKR OMS queue. Caller will re-evaluate on
     /// the next tick (typically <20ms later).
     pub skip_burst_cap: AtomicU64,
+    /// Risk-state event arrived without a field that an enabled gate
+    /// expects (theta_kill < 0 → risk_theta required; vega_kill > 0
+    /// → risk_vega required). Bumped per gate-side per occurrence so
+    /// schema drift between broker and trader surfaces in telemetry
+    /// instead of silently disabling the gate.
+    pub risk_state_partial: AtomicU64,
 }
 
 impl Default for DecisionCounters {
@@ -604,6 +615,7 @@ impl DecisionCounters {
             modify: AtomicU64::new(0),
             place_dropped: AtomicU64::new(0),
             skip_burst_cap: AtomicU64::new(0),
+            risk_state_partial: AtomicU64::new(0),
         }
     }
 
@@ -640,6 +652,7 @@ impl DecisionCounters {
             ("modify", &self.modify),
             ("place_dropped", &self.place_dropped),
             ("skip_burst_cap", &self.skip_burst_cap),
+            ("risk_state_partial", &self.risk_state_partial),
         ];
         for (k, v) in pairs {
             let n = v.load(Ordering::Relaxed);

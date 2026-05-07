@@ -82,13 +82,11 @@ hedging:
   rebalance_cadence_sec: 30
   include_in_daily_pnl: true
   flatten_on_halt: true
-  # Bumped 2 → 4 on 2026-05-04. Thin HG futures and ~140ms IBKR
-  # round trip mean a ±2-tick IOC arrives stale ~half the time and
-  # dies unfilled — exactly what was leaving us at -4.3 delta with
-  # hedge_qty=0 despite the periodic firing every 30s. Trade-off:
-  # ~$25/contract slippage at HG's 0.0005 tick × 25k multiplier.
-  ioc_tick_offset: 4
-  hedge_tick_size: 0.0005
+  # ioc_tick_offset and hedge_tick_size were dropped 2026-05-07
+  # (tracked finding #6 in the audit). Hedge orders are MARKET-IOC
+  # since 2026-05-04 (CLAUDE.md §10) — the limit-IOC offset knobs
+  # have been dead since the switch and the HedgeConfig struct no
+  # longer carries them.
   hedge_lockout_days: 30
 
 snapshot:

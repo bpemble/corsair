@@ -42,9 +42,6 @@ pub struct HedgeConfig {
     pub rebalance_cadence_sec: f64,
     pub include_in_daily_pnl: bool,
     pub flatten_on_halt_enabled: bool,
-    /// IOC limit aggression in ticks past F.
-    pub ioc_tick_offset: i32,
-    pub hedge_tick_size: f64,
     /// Phase 0 lockout: skip contracts within N days of expiry.
     /// 0 disables. Audit T4-23 (verified): the runtime's contract
     /// resolver in `corsair_broker::runtime::resolve_hedge_contracts`
@@ -97,10 +94,12 @@ pub struct HedgeManager {
     /// Layer C burst-pull cooldown — when nonzero and now < this,
     /// rebalance_periodic bypasses the cadence gate.
     priority_drain_until_ns: u64,
-    /// Dedupe set for execDetails — prevents double-counting.
-    processed_exec_ids: std::collections::HashSet<String>,
-    /// Bounded order for FIFO eviction.
-    processed_exec_ids_order: std::collections::VecDeque<String>,
+    /// Insertion-ordered dedupe set for execDetails — prevents
+    /// double-counting. `IndexSet` gives both O(1) membership check
+    /// and O(1) FIFO eviction (via `shift_remove_index(0)` on
+    /// overflow), replacing the prior pair of HashSet + VecDeque
+    /// kept in sync by hand.
+    processed_exec_ids: indexmap::IndexSet<String>,
 }
 
 const PROCESSED_EXEC_IDS_MAX: usize = 10_000;
@@ -113,8 +112,7 @@ impl HedgeManager {
             hedge_contract: None,
             last_periodic_ns: 0,
             priority_drain_until_ns: 0,
-            processed_exec_ids: std::collections::HashSet::new(),
-            processed_exec_ids_order: std::collections::VecDeque::new(),
+            processed_exec_ids: indexmap::IndexSet::new(),
         }
     }
 
@@ -306,13 +304,11 @@ impl HedgeManager {
         if fill.exec_id.is_empty() || self.processed_exec_ids.contains(&fill.exec_id) {
             return false;
         }
-        if self.processed_exec_ids_order.len() >= PROCESSED_EXEC_IDS_MAX {
-            if let Some(old) = self.processed_exec_ids_order.pop_front() {
-                self.processed_exec_ids.remove(&old);
-            }
+        if self.processed_exec_ids.len() >= PROCESSED_EXEC_IDS_MAX {
+            // FIFO eviction: drop the oldest insertion.
+            self.processed_exec_ids.shift_remove_index(0);
         }
         self.processed_exec_ids.insert(fill.exec_id.clone());
-        self.processed_exec_ids_order.push_back(fill.exec_id.clone());
         let pre = self.state.hedge_qty;
         let is_buy = matches!(fill.side, corsair_broker_api::Side::Buy);
         self.state
@@ -391,8 +387,6 @@ mod tests {
             rebalance_cadence_sec: 30.0,
             include_in_daily_pnl: true,
             flatten_on_halt_enabled: true,
-            ioc_tick_offset: 2,
-            hedge_tick_size: 0.0005,
             lockout_days: 30,
         }
     }

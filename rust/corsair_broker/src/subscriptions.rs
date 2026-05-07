@@ -656,7 +656,7 @@ async fn qualify_and_subscribe(
         };
         let expiry_str = expiry.format("%Y%m%d").to_string();
         let mut cbk = runtime.contract_by_key.lock().unwrap();
-        cbk.insert((strike.to_bits(), expiry_str, r_char), qualified.clone());
+        cbk.insert((crate::strike_key_i64(strike), expiry_str, r_char), qualified.clone());
     }
     {
         let b = runtime.broker.clone();

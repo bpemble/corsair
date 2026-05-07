@@ -187,7 +187,7 @@ pub fn decide_on_tick(
     // Compute risk-gate values once per tick. Per-side decisions
     // below combine `gates.theta_breach` / `gates.delta_breach_dir`
     // with the per-strike cached greeks via `improving_passes`.
-    let gates = compute_risk_gates(&snap, now_monotonic_ns);
+    let gates = compute_risk_gates(snap, now_monotonic_ns, counters);
 
     // ATM-window restriction — anchored on PRICING forward (Rec 3).
     if (strike - pricing_forward).abs() > MAX_STRIKE_OFFSET_USD {
@@ -675,8 +675,15 @@ pub struct RiskGates {
 
 /// Compute risk gates from `ScalarSnapshot`. Reads stack-local
 /// snapshot so caller pays one mutex acquire (snapshot) per tick
-/// instead of one per gate read.
-pub fn compute_risk_gates(snap: &ScalarSnapshot, now_monotonic_ns: u64) -> RiskGates {
+/// instead of one per gate read. `counters` is bumped (per gate-side
+/// per call) when a configured gate's required field is absent on
+/// the latest risk_state — the gate is silently skipped in that
+/// case but the counter surfaces the schema-drift signal.
+pub fn compute_risk_gates(
+    snap: &ScalarSnapshot,
+    now_monotonic_ns: u64,
+    counters: &DecisionCounters,
+) -> RiskGates {
     let mut g = RiskGates::default();
     let age_s = if snap.risk_state_age_monotonic_ns > 0 {
         (now_monotonic_ns.saturating_sub(snap.risk_state_age_monotonic_ns)) as f64 / 1e9
@@ -711,9 +718,16 @@ pub fn compute_risk_gates(snap: &ScalarSnapshot, now_monotonic_ns: u64) -> RiskG
     // Theta breach → improving-only (BUYs blocked, SELLs allowed).
     // theta_kill is negative; 0 disables.
     if snap.theta_kill < 0.0 {
-        if let Some(theta) = snap.risk_theta {
-            if theta < snap.theta_kill {
-                g.theta_breach = true;
+        match snap.risk_theta {
+            Some(theta) => {
+                if theta < snap.theta_kill {
+                    g.theta_breach = true;
+                }
+            }
+            None => {
+                counters
+                    .risk_state_partial
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -724,10 +738,17 @@ pub fn compute_risk_gates(snap: &ScalarSnapshot, now_monotonic_ns: u64) -> RiskG
     // default — improving direction for vega isn't well-defined since
     // the breach magnitude can flip sign with positions).
     if snap.vega_kill > 0.0 {
-        if let Some(vega) = snap.risk_vega {
-            if vega.abs() >= snap.vega_kill {
-                g.block_all = true;
-                return g;
+        match snap.risk_vega {
+            Some(vega) => {
+                if vega.abs() >= snap.vega_kill {
+                    g.block_all = true;
+                    return g;
+                }
+            }
+            None => {
+                counters
+                    .risk_state_partial
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
