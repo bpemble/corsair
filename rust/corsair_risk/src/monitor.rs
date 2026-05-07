@@ -227,62 +227,19 @@ impl RiskMonitor {
             return self.fire(ev);
         }
 
-        // Delta kill (CLAUDE.md §6.2). If hedge state is STALE per
-        // CLAUDE.md §14, we don't trust hedge_qty as a delta offset:
-        // strip it back out and evaluate options-only. WARN is emitted
-        // by the caller (or the constraint checker) — the kill itself
-        // is a one-shot event, not an ongoing log target.
-        let effective_worst_delta = if !hedge_fresh && hedge_qty_in_worst_delta != 0.0 {
-            worst_delta - hedge_qty_in_worst_delta
-        } else {
-            worst_delta
-        };
-        if effective_worst_delta.abs() > self.cfg.delta_kill {
-            let ev = KillEvent {
-                reason: format!(
-                    "DELTA KILL: {:+.2} > ±{:.1}{}",
-                    effective_worst_delta,
-                    self.cfg.delta_kill,
-                    if !hedge_fresh && hedge_qty_in_worst_delta != 0.0 {
-                        " [hedge_stale: options-only]"
-                    } else {
-                        ""
-                    }
-                ),
-                source: KillSource::Risk,
-                kill_type: KillType::HedgeFlat,
-                timestamp_ns: now_ns(),
-            };
-            return self.fire(ev);
-        }
-
-        // Vega halt — disabled when 0 (Alabaster).
-        if self.cfg.vega_kill > 0.0 && worst_vega.abs() > self.cfg.vega_kill {
-            let ev = KillEvent {
-                reason: format!(
-                    "VEGA HALT: ${:+.0} > ±${:.0}",
-                    worst_vega, self.cfg.vega_kill
-                ),
-                source: KillSource::Risk,
-                kill_type: KillType::Halt,
-                timestamp_ns: now_ns(),
-            };
-            return self.fire(ev);
-        }
-
-        // Theta halt — disabled when 0.
-        if self.cfg.theta_kill < 0.0 && worst_theta < self.cfg.theta_kill {
-            let ev = KillEvent {
-                reason: format!(
-                    "THETA HALT: ${:.0} < ${:.0}",
-                    worst_theta, self.cfg.theta_kill
-                ),
-                source: KillSource::Risk,
-                kill_type: KillType::Halt,
-                timestamp_ns: now_ns(),
-            };
-            return self.fire(ev);
-        }
+        // §25: Strategy-level greek kills (delta_kill, theta_kill,
+        // vega_kill) moved to the trader as improving-only gates.
+        // Broker retains only operational/infrastructure kills (§7
+        // spec — gateway disconnect, calibration failure, recon
+        // failure, fill rate) plus the daily P&L halt below. Greek
+        // values still flow to the trader via `risk_state` for the
+        // trader's own gating; we just don't fire from here.
+        //
+        // Hedge-staleness fail-closed (CLAUDE.md §14) likewise moves
+        // to the trader: the trader's `compute_risk_gates` strips
+        // hedge from effective_delta when the hedge_state is stale.
+        let _ = (worst_delta, worst_theta, worst_vega);
+        let _ = (hedge_qty_in_worst_delta, hedge_fresh);
 
         // Daily P&L halt — primary v1.4 defense. Operator-override
         // kill_type=Halt (positions preserved).
@@ -395,40 +352,10 @@ impl RiskMonitor {
     /// strips that contribution before testing the kill threshold
     /// (CLAUDE.md §14 fail-closed). Pass 0.0/true for options-only
     /// callers.
-    pub fn check_per_fill_delta(
-        &mut self,
-        effective_delta: f64,
-        hedge_qty_included: f64,
-        hedge_fresh: bool,
-    ) -> RiskCheckOutcome {
-        if self.killed.is_some() {
-            return RiskCheckOutcome::AlreadyKilled(self.killed.clone().unwrap());
-        }
-        let evaluated = if !hedge_fresh && hedge_qty_included != 0.0 {
-            effective_delta - hedge_qty_included
-        } else {
-            effective_delta
-        };
-        if evaluated.abs() > self.cfg.delta_kill {
-            let ev = KillEvent {
-                reason: format!(
-                    "DELTA KILL (fill-path): {:+.2} > ±{:.1}{}",
-                    evaluated,
-                    self.cfg.delta_kill,
-                    if !hedge_fresh && hedge_qty_included != 0.0 {
-                        " [hedge_stale: options-only]"
-                    } else {
-                        ""
-                    }
-                ),
-                source: KillSource::Risk,
-                kill_type: KillType::HedgeFlat,
-                timestamp_ns: now_ns(),
-            };
-            return self.fire(ev);
-        }
-        RiskCheckOutcome::Healthy
-    }
+    // §25: `check_per_fill_delta` removed. Per-fill delta gating
+    // moved to the trader's improving-only logic
+    // (`corsair_trader::decision::improving_passes`); broker only
+    // forwards risk_state for the trader to act on.
 
     /// Check for induced-kill sentinels in the configured directory.
     /// Removes the sentinel BEFORE firing so the kill can't re-trigger
@@ -473,8 +400,10 @@ impl RiskMonitor {
         None
     }
 
-    /// Internal: transition to killed state and return the outcome.
-    fn fire(&mut self, ev: KillEvent) -> RiskCheckOutcome {
+    /// Transition to killed state and return the outcome. Called
+    /// internally by `check` and externally by the broker watchdog
+    /// (§25 trader_silent path).
+    pub fn fire(&mut self, ev: KillEvent) -> RiskCheckOutcome {
         log::error!(
             "KILL SWITCH ACTIVATED [{} / {:?}]: {}",
             ev.source.label(),
@@ -645,44 +574,24 @@ mod tests {
         matches!(outcome, RiskCheckOutcome::Healthy);
     }
 
+    // §25: delta_kill / vega_kill / theta_kill tests removed —
+    // strategy-level greek gating moved to the trader. Greek values
+    // still flow through `check` but no longer fire kills from the
+    // broker. The trader's `improving_passes` truth table is the
+    // canonical test for the new gating behavior.
     #[test]
-    fn delta_kill_fires() {
+    fn strategy_greek_breaches_no_longer_fire_from_broker() {
         let mut m = RiskMonitor::new(cfg_for_test());
         let p = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&p, 0.0, 5.5, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
-        match outcome {
-            RiskCheckOutcome::Killed(ev) => {
-                assert!(ev.reason.contains("DELTA KILL"));
-                assert_eq!(ev.kill_type, KillType::HedgeFlat);
-            }
-            other => panic!("expected delta kill, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn vega_kill_fires_when_threshold_set() {
-        let mut m = RiskMonitor::new(cfg_for_test());
-        let p = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&p, 0.0, 0.0, 0.0, 1_500.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
-        matches!(outcome, RiskCheckOutcome::Killed(_));
-    }
-
-    #[test]
-    fn vega_kill_disabled_when_zero() {
-        let mut cfg = cfg_for_test();
-        cfg.vega_kill = 0.0;
-        let mut m = RiskMonitor::new(cfg);
-        let p = portfolio_with_pnl(0.0, 0.0);
+        // Massive delta breach (would have fired pre-§25).
+        let outcome = m.check(&p, 0.0, 50.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
+        matches!(outcome, RiskCheckOutcome::Healthy);
+        // Massive theta breach.
+        let outcome = m.check(&p, 0.0, 0.0, -10_000.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
+        matches!(outcome, RiskCheckOutcome::Healthy);
+        // Massive vega breach.
         let outcome = m.check(&p, 0.0, 0.0, 0.0, 99_999.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
         matches!(outcome, RiskCheckOutcome::Healthy);
-    }
-
-    #[test]
-    fn theta_kill_fires() {
-        let mut m = RiskMonitor::new(cfg_for_test());
-        let p = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&p, 0.0, 0.0, -250.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
-        matches!(outcome, RiskCheckOutcome::Killed(_));
     }
 
     // ── Daily halt ──────────────────────────────────────────────
@@ -701,48 +610,10 @@ mod tests {
         }
     }
 
-    // ── Stale-hedge fail-closed (CLAUDE.md §14) ────────────────
-
-    #[test]
-    fn delta_kill_strips_hedge_when_stale() {
-        // Caller pre-combined options=4 + hedge=-3 → worst_delta=+1
-        // (within delta_kill 5.0). With hedge_fresh=false the monitor
-        // strips out the -3 hedge contribution → effective=+4 (still
-        // within delta_kill), so no kill.
-        let mut m = RiskMonitor::new(cfg_for_test());
-        let p = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&p, 0.0, 1.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), -3.0, false);
-        matches!(outcome, RiskCheckOutcome::Healthy);
-    }
-
-    #[test]
-    fn delta_kill_fires_when_options_only_breaches_after_strip() {
-        // Caller pre-combined options=+8 + hedge=-4 → worst_delta=+4
-        // (under delta_kill 5.0). With hedge stale, strip → +8 →
-        // breach → kill.
-        let mut m = RiskMonitor::new(cfg_for_test());
-        let p = portfolio_with_pnl(0.0, 0.0);
-        let outcome = m.check(&p, 0.0, 4.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), -4.0, false);
-        match outcome {
-            RiskCheckOutcome::Killed(ev) => {
-                assert!(ev.reason.contains("DELTA KILL"));
-                assert!(ev.reason.contains("hedge_stale"));
-            }
-            other => panic!("expected delta kill on stripped delta, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_per_fill_delta_strips_hedge_when_stale() {
-        let mut m = RiskMonitor::new(cfg_for_test());
-        // effective=+1 (5.0 − 4 hedge); strip → +5 → still under 5.0,
-        // so no kill (boundary case).
-        let outcome = m.check_per_fill_delta(1.0, -4.0, false);
-        matches!(outcome, RiskCheckOutcome::Healthy);
-        // effective=+2 (6.5 − 4.5 hedge); strip → +6.5 → kill.
-        let outcome = m.check_per_fill_delta(2.0, -4.5, false);
-        matches!(outcome, RiskCheckOutcome::Killed(_));
-    }
+    // §25: stale-hedge fail-closed tests removed — that fail-closed
+    // logic moved to the trader's `compute_risk_gates` alongside the
+    // improving-only delta gating. Trader-side test in
+    // `corsair_trader::decision::tests`.
 
     #[test]
     fn check_daily_pnl_only_fires_on_breach() {
@@ -769,10 +640,19 @@ mod tests {
 
     #[test]
     fn risk_kill_is_sticky() {
+        // §25: drive the kill via `fire` directly since strategy-level
+        // greek breaches no longer fire from the broker. Margin is
+        // still broker-side, so this could equivalently use a margin
+        // breach — fire is more direct.
         let mut m = RiskMonitor::new(cfg_for_test());
+        m.fire(KillEvent {
+            reason: "test".into(),
+            source: KillSource::Risk,
+            kill_type: KillType::Halt,
+            timestamp_ns: 0,
+        });
         let p = portfolio_with_pnl(0.0, 0.0);
-        m.check(&p, 0.0, 5.5, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true); // delta kill
-        let outcome = m.check(&p, 0.0, 0.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true); // would be healthy
+        let outcome = m.check(&p, 0.0, 0.0, 0.0, 0.0, &NoOpMarketView, &empty_fanout(), 0.0, true);
         matches!(outcome, RiskCheckOutcome::AlreadyKilled(_));
     }
 

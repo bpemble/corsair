@@ -35,6 +35,12 @@ pub enum KillSource {
     DailyHalt,
     /// Sticky (SABR RMSE, latency, abnormal fill rate).
     Operational,
+    /// §25 trader watchdog: broker hasn't received any frame from
+    /// the trader within the watchdog timeout. Sticky — trader can
+    /// reconnect and stream heartbeats again, but the kill stays
+    /// active until the operator restarts the broker. This forces
+    /// review of the underlying trader fault before resuming.
+    TraderSilent,
     /// Boot-self-test sentinel kill. Inner carries the underlying
     /// source we're exercising; induced_daily_halt auto-clears at
     /// rollover, others are sticky.
@@ -60,6 +66,7 @@ impl KillSource {
             KillSource::Disconnect => "disconnect".into(),
             KillSource::DailyHalt => "daily_halt".into(),
             KillSource::Operational => "operational".into(),
+            KillSource::TraderSilent => "trader_silent".into(),
             KillSource::Induced(inner) => format!("induced_{}", inner.label()),
         }
     }

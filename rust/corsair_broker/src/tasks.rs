@@ -41,8 +41,75 @@ pub fn spawn_all(runtime: Arc<Runtime>) -> Vec<tokio::task::JoinHandle<()>> {
     handles.push(tokio::spawn(periodic_account_poll(runtime.clone())));
     handles.push(tokio::spawn(daily_halt_rollover(runtime.clone())));
     handles.push(tokio::spawn(periodic_tick_type_hist(runtime.clone())));
+    handles.push(tokio::spawn(trader_watchdog(runtime.clone())));
 
     handles
+}
+
+/// §25 trader watchdog. 1Hz check that the trader is still emitting
+/// frames on the commands ring. Fires `trader_silent` kill if the gap
+/// exceeds `CORSAIR_TRADER_WATCHDOG_TIMEOUT_S` (default 5s).
+///
+/// Recovery semantics: the kill is sticky. A reconnecting trader will
+/// resume sending heartbeats but will inherit the active kill via the
+/// `hello`'s `active_kills` field and stay quoting-blocked. Operator
+/// must `docker compose restart corsair-broker-rs` after investigating
+/// the underlying fault. This is deliberate — auto-resume on heartbeat
+/// would silently mask a trader stuck in a crash-restart loop.
+async fn trader_watchdog(runtime: Arc<Runtime>) {
+    let timeout_s = std::env::var("CORSAIR_TRADER_WATCHDOG_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5);
+    let timeout_ns: u64 = timeout_s.saturating_mul(1_000_000_000);
+    log::info!("trader_watchdog: cadence 1s, timeout {}s", timeout_s);
+
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let last = runtime
+            .last_trader_msg_ns
+            .load(std::sync::atomic::Ordering::Acquire);
+        if last == 0 {
+            // Pre-startup: no frame yet. The first frame from the
+            // trader (welcome on connect) will set this.
+            continue;
+        }
+        let now_ns = crate::time::now_ns();
+        let gap = now_ns.saturating_sub(last);
+        if gap <= timeout_ns {
+            continue;
+        }
+        // Already killed for trader_silent? Don't double-fire — the
+        // kill is sticky and a re-fire would just spam the log.
+        let already_silent = {
+            let r = runtime.risk.lock().unwrap();
+            r.kill_event()
+                .map(|e| matches!(e.source, corsair_risk::KillSource::TraderSilent))
+                .unwrap_or(false)
+        };
+        if already_silent {
+            continue;
+        }
+        log::error!(
+            "trader_watchdog: trader silent for {}ms — firing trader_silent kill",
+            gap / 1_000_000
+        );
+        let ev = corsair_risk::KillEvent {
+            reason: format!("TRADER SILENT: no commands-ring frame for {}ms", gap / 1_000_000),
+            source: corsair_risk::KillSource::TraderSilent,
+            kill_type: corsair_risk::KillType::Halt,
+            timestamp_ns: now_ns,
+        };
+        {
+            let mut r = runtime.risk.lock().unwrap();
+            let _ = r.fire(ev.clone());
+        }
+        crate::notify::notify_kill(ev.clone());
+        crate::ipc::publish_kill(&runtime, &ev);
+        cancel_all_resting(&runtime, "trader_silent").await;
+    }
 }
 
 /// Diagnostic: every 30s, log the histogram of incoming TickSize
@@ -212,40 +279,15 @@ async fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::F
         cancel_all_resting(runtime, "daily_halt_per_fill").await;
     }
 
-    // Per-fill DELTA enforcement. The 300s periodic risk_check is too
-    // slow to catch a fast cascade — on 2026-05-04 we accumulated ~38
-    // contracts in ~4 minutes (options_delta 0 → -14.6) before the
-    // periodic check fired. This gate runs on EVERY option fill and
-    // forces the kill the moment effective_delta crosses delta_kill.
-    let (effective_delta_post_fill, hedge_qty_total, hedge_fresh): (f64, f64, bool) = {
-        let p = runtime.portfolio.lock().unwrap();
-        let h = runtime.hedge.lock().unwrap();
-        let agg = p.aggregate();
-        let hedge_qty: i32 = h.managers().iter().map(|m| m.hedge_qty()).sum();
-        // CLAUDE.md §14: hedge state must be fresh for the gate to
-        // trust hedge_qty as a delta offset. all_fresh ⇒ no strip;
-        // any stale ⇒ RiskMonitor::check_per_fill_delta strips
-        // hedge_qty back out and gates options-only (fail-closed).
-        let now_ns = crate::time::now_ns();
-        let all_fresh = h
-            .managers()
-            .iter()
-            .all(|m| m.state().is_fresh(now_ns, HEDGE_FRESHNESS_MAX_AGE_NS));
-        (
-            agg.total.net_delta + hedge_qty as f64,
-            hedge_qty as f64,
-            all_fresh,
-        )
-    };
-    let delta_outcome = {
-        let mut r = runtime.risk.lock().unwrap();
-        r.check_per_fill_delta(effective_delta_post_fill, hedge_qty_total, hedge_fresh)
-    };
-    if let corsair_risk::RiskCheckOutcome::Killed(ref ev) = delta_outcome {
-        crate::notify::notify_kill(ev.clone());
-        crate::ipc::publish_kill(runtime, ev);
-        cancel_all_resting(runtime, "delta_kill_per_fill").await;
-    }
+    // §25: per-fill delta enforcement removed from broker. Trader's
+    // `improving_passes` (`compute_risk_gates`) consumes the broker's
+    // 1Hz risk_state events and gates per-fill via the cached
+    // per-strike greeks. The 2026-05-04 fast-cascade scenario this
+    // path was added for is now caught by the trader's per-tick gate
+    // (which sees effective_delta the same way the broker did) plus
+    // the trader_silent watchdog (5s timeout if trader can't process
+    // the signal). Hedge engine still runs continuously and is the
+    // primary delta control loop.
 
     // CLAUDE.md §10: rebalance hedge on every option fill (in
     // addition to the 30s periodic). Without this, every option fill

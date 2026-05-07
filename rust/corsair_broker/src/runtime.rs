@@ -152,6 +152,18 @@ pub struct Runtime {
     /// through the dispatch path). Set during corsair_broker::ipc::
     /// spawn just after server creation; None until then.
     pub ipc_server: Mutex<Option<Arc<corsair_ipc::SHMServer>>>,
+
+    /// §25 trader watchdog: wall-clock ns of the most recent commands-
+    /// ring frame received from the trader. Updated on every command
+    /// dispatch (place / cancel / modify / telemetry / heartbeat /
+    /// welcome). The watchdog task (`trader_watchdog` in `tasks.rs`)
+    /// reads this 1Hz and fires `trader_silent` if the gap exceeds
+    /// `CORSAIR_TRADER_WATCHDOG_TIMEOUT_S` (default 5s).
+    ///
+    /// Atomic so the dispatch path doesn't need to take a lock; the
+    /// watchdog reads with `Acquire` to pair with the dispatcher's
+    /// `Release`.
+    pub last_trader_msg_ns: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +270,7 @@ impl Runtime {
             latency_samples: Mutex::new(crate::latency::LatencySamples::new()),
             vol_surface_cache: Mutex::new(Arc::new(std::collections::HashMap::new())),
             ipc_server: Mutex::new(None),
+            last_trader_msg_ns: std::sync::atomic::AtomicU64::new(0),
             account: Mutex::new(corsair_broker_api::AccountSnapshot {
                 net_liquidation: 0.0,
                 maintenance_margin: 0.0,

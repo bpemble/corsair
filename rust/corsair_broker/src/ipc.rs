@@ -451,16 +451,17 @@ struct HelloConfigPayload {
     gtd_refresh_lead_s: f64,
     dead_band_ticks: i32,
     skip_if_spread_over_edge_mul: f64,
-    /// Theta-breach threshold (negative; 0 disables). Trader self-gates
-    /// at this value so a theta breach is honored locally even if the
-    /// kill IPC event is dropped (defense in depth — see also the
-    /// kill_event publish path below). 2026-05-05 incident: 384 of 422
-    /// adverse fills happened AFTER broker fired THETA HALT because
-    /// kills weren't propagated AND trader had no theta gate.
+    /// Theta-breach threshold (negative; 0 disables). §25: trader is
+    /// the authoritative theta gate (improving-only — SELLs allowed,
+    /// BUYs blocked). Broker no longer fires from theta; this value
+    /// just configures the trader's local check.
     theta_kill: f64,
     /// Vega-breach threshold (positive; 0 disables; currently 0 per
     /// CLAUDE.md §13 — Alabaster characterization).
     vega_kill: f64,
+    /// Contract multiplier (HG=25_000, ETH=50). §25 trader uses this
+    /// to scale per-strike Black-76 greeks for improving-only gates.
+    contract_multiplier: f64,
 }
 
 /// Broker → trader kill event. Mirrors the trader's `KillMsg`. Fires
@@ -519,6 +520,13 @@ struct HelloEvent<'a> {
     ty: &'a str,
     timestamp_ns: u64,
     config: HelloConfigPayload,
+    /// §25: active kill sources at hello time. Trader populates its
+    /// local `killed` map from this list so a reconnecting trader
+    /// (post-crash, post-restart) inherits any active kills the
+    /// broker is still holding (trader_silent, daily_halt,
+    /// operational, etc.) and stays out of the market until the
+    /// operator clears via broker restart.
+    active_kills: Vec<String>,
 }
 
 fn publish_hello(runtime: &Arc<Runtime>) {
@@ -529,6 +537,25 @@ fn publish_hello(runtime: &Arc<Runtime>) {
     let q = &runtime.config.quoting;
     let c = &runtime.config.constraints;
     let r = &runtime.config.risk;
+    // §25: snapshot active kill sources for hello rehydration.
+    let active_kills: Vec<String> = {
+        let risk = runtime.risk.lock().unwrap();
+        risk.kill_event()
+            .map(|e| vec![e.source.label()])
+            .unwrap_or_default()
+    };
+    // Pull contract multiplier from the first product in the registry
+    // (current config has only HG so this is unambiguous; if/when ETH
+    // returns the trader will key by product anyway).
+    let contract_multiplier = {
+        let p = runtime.portfolio.lock().unwrap();
+        let registry = p.registry();
+        registry
+            .products()
+            .first()
+            .and_then(|name| registry.multiplier_for(name))
+            .unwrap_or(25_000.0)
+    };
     let ev = HelloEvent {
         ty: "hello",
         timestamp_ns: now_ns(),
@@ -544,7 +571,9 @@ fn publish_hello(runtime: &Arc<Runtime>) {
             skip_if_spread_over_edge_mul: q.skip_if_spread_over_edge_mul,
             theta_kill: r.theta_kill,
             vega_kill: r.vega_kill,
+            contract_multiplier,
         },
+        active_kills,
     };
     if let Ok(body) = rmp_serde::to_vec_named(&ev) {
         if !server.publish(&body) {
@@ -567,6 +596,14 @@ async fn dispatch_commands(
     mut rx: tokio::sync::mpsc::Receiver<ServerCommand>,
 ) {
     while let Some(cmd) = rx.recv().await {
+        // §25 watchdog: refresh the last-trader-msg timestamp on every
+        // received frame regardless of kind. Place / modify / cancel
+        // / telemetry / heartbeat / welcome all reset the watchdog
+        // timer. Heartbeat is the explicit liveness signal that runs
+        // at 1Hz so calm markets still drive this clock.
+        runtime
+            .last_trader_msg_ns
+            .store(crate::time::now_ns(), std::sync::atomic::Ordering::Release);
         match cmd.kind.as_str() {
             // Spawn each order command so it doesn't serialize behind
             // the previous one's IBKR ack. handle_place awaits a 2s
@@ -594,6 +631,10 @@ async fn dispatch_commands(
             // so we don't need to surface them here. Logging at
             // trace so it's silent under default filter.
             "telemetry" => log::trace!("ipc: trader telemetry frame"),
+            // §25 1Hz heartbeat from trader. The ack is just the
+            // dispatch entry above (which bumps last_trader_msg_ns);
+            // body is unused. Logged at trace so it doesn't spam.
+            "heartbeat" => log::trace!("ipc: trader heartbeat"),
             // Trader sends "welcome" once on connect. Respond with a
             // hello event carrying the broker's runtime config so the
             // trader replaces its compile-time defaults (GTD,

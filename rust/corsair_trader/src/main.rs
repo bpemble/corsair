@@ -454,6 +454,36 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
         });
     }
 
+    // §25: Spawn 1Hz heartbeat task. Broker's watchdog fires
+    // `trader_silent` if no commands-ring frame arrives within
+    // `CORSAIR_TRADER_WATCHDOG_TIMEOUT_S` (default 5s). In active
+    // markets, place/modify/cancel keep the watchdog warm; in calm
+    // markets, this 1Hz pulse is the explicit liveness signal.
+    {
+        let commands_ring = Arc::clone(&commands_ring);
+        bg_handle.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let hb = Heartbeat {
+                    msg_type: "heartbeat",
+                    ts_ns: now_ns_wall(),
+                };
+                let body = match rmp_serde::to_vec_named(&hb) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::warn!("heartbeat encode failed: {}", e);
+                        continue;
+                    }
+                };
+                let frame = ipc::protocol::pack_frame(&body);
+                let mut ring = commands_ring.lock();
+                ring.write_frame(&frame);
+            }
+        });
+    }
+
     // Spawn telemetry loop (10s cadence). Also on bg runtime.
     {
         let state = Arc::clone(&state);
@@ -960,9 +990,9 @@ fn process_event(
                 if let Some(v) = cfg.delta_ceiling {
                     sc.delta_ceiling = v;
                 }
-                if let Some(v) = cfg.delta_kill {
-                    sc.delta_kill = v;
-                }
+                // delta_kill removed in §25 — hedge engine owns the
+                // delta control loop. Field still arrives in hello for
+                // back-compat but is silently ignored.
                 if let Some(v) = cfg.margin_ceiling_pct {
                     sc.margin_ceiling_pct = v;
                 }
@@ -983,6 +1013,22 @@ fn process_event(
                 }
                 if let Some(v) = cfg.vega_kill {
                     sc.vega_kill = v;
+                }
+                if let Some(v) = cfg.contract_multiplier {
+                    sc.contract_multiplier = v;
+                }
+            }
+            // §25: re-hydrate kill state from broker. If trader
+            // reconnected after a crash and broker still holds active
+            // kills (trader_silent, daily_halt, operational), trader
+            // stays out of the market until operator clears via broker
+            // restart. Sticky semantics — auto-resume is deliberately
+            // not supported. The `kills_count` atomic is the hot-path
+            // gate ("any kills?") in the staleness loop.
+            for src in h.active_kills {
+                if state.kills.insert(src.clone(), "rehydrated_from_hello".to_string()).is_none() {
+                    state.kills_count.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("hello rehydrated active kill: {}", src);
                 }
             }
         }
@@ -1461,12 +1507,12 @@ fn staleness_check(
         // Without this in the staleness loop, the loop's drift check
         // compares order.price vs fit-frozen theo, can't see when our
         // quote is stale relative to current market mid.
-        let (_iv, theo_at_fit, delta_at_fit) =
+        let (_iv, gx) =
             match compute_theo(vp.forward, strike, tte, r_char, &vp.params) {
                 Some(v) => v,
                 None => continue,
             };
-        let theo = (theo_at_fit + delta_at_fit * (snap.underlying_price - vp.spot_at_fit)).max(0.01);
+        let theo = (gx.theo + gx.delta * (snap.underlying_price - vp.spot_at_fit)).max(0.01);
 
         // Stale if our price is too unfavorable vs current theo.
         // Drift > threshold → modify to fresh edge (amend bias).

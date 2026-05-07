@@ -14,8 +14,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::messages::{TickMsg, VolParams};
-use crate::pricing::{black76_price_and_delta, sabr_implied_vol, svi_implied_vol};
-use crate::state::{DecisionCounters, ScalarSnapshot, SharedState};
+use crate::pricing::{sabr_implied_vol, svi_implied_vol};
+use crate::state::{DecisionCounters, ScalarSnapshot, SharedState, TheoGreeks};
 
 // Constants matching Python's src/trader/main.py.
 // 0.25 = ATM + 5 OTM strikes per side (spec §3.3, asym ATM+OTM).
@@ -184,8 +184,10 @@ pub fn decide_on_tick(
     };
     let pricing_forward = vp_msg.forward;
 
-    // Compute risk-gate values once per tick.
-    let (risk_buy, risk_sell, risk_all) = compute_risk_gates(&snap, now_monotonic_ns);
+    // Compute risk-gate values once per tick. Per-side decisions
+    // below combine `gates.theta_breach` / `gates.delta_breach_dir`
+    // with the per-strike cached greeks via `improving_passes`.
+    let gates = compute_risk_gates(&snap, now_monotonic_ns);
 
     // ATM-window restriction — anchored on PRICING forward (Rec 3).
     if (strike - pricing_forward).abs() > MAX_STRIKE_OFFSET_USD {
@@ -204,7 +206,7 @@ pub fn decide_on_tick(
     }
 
     // All-blocking risk gate hoisted before per-side loop.
-    if risk_all {
+    if gates.block_all {
         counters.risk_block.fetch_add(2, Ordering::Relaxed);
         // Proactive cancel: when self-blocked on risk AND we still
         // have live quotes resting, fire cancel_all immediately. The
@@ -309,13 +311,15 @@ pub fn decide_on_tick(
         r_char,
         vp_msg.fit_ts_ns,
     );
-    // Cached value is (theo_at_fit, delta_at_fit) — both pure functions
-    // of (fit_forward, strike, tte, params, right). Caching delta lets
-    // the Taylor reprice below run without recomputing greeks per tick.
-    let (theo_at_fit, delta_at_fit) = match state.theo_cache.get(&theo_key).map(|r| *r.value()) {
+    // Cached value is full `TheoGreeks` (theo, delta, theta, vega) —
+    // all pure functions of (fit_forward, strike, tte, params, right).
+    // Delta drives Taylor reprice; theta + vega drive improving-only
+    // gates (CLAUDE.md §25). Caching all four together lets the hot
+    // path skip the SABR + Black76 chain on every tick.
+    let cached: TheoGreeks = match state.theo_cache.get(&theo_key).map(|r| *r.value()) {
         Some(td) => td,
         None => {
-            let (_iv, t, d) =
+            let (_iv, gx) =
                 match compute_theo(pricing_forward, strike, tte, r_char, &vp_msg.params) {
                     Some(v) => v,
                     None => {
@@ -333,10 +337,12 @@ pub fn decide_on_tick(
                     .theo_cache
                     .retain(|(_, _, _, ts), _| *ts == current_fit);
             }
-            state.theo_cache.insert(theo_key, (t, d));
-            (t, d)
+            state.theo_cache.insert(theo_key, gx);
+            gx
         }
     };
+    let theo_at_fit = cached.theo;
+    let delta_at_fit = cached.delta;
 
     // First-order Taylor reprice for spot drift since the SABR fit.
     // Anchor is `spot_at_fit` (front-month spot the broker saw when
@@ -525,17 +531,16 @@ pub fn decide_on_tick(
         let target_q = (target / snap.tick_size).round() * snap.tick_size;
         let target_q = (target_q * 10000.0).round() / 10000.0; // 4dp clean
 
-        // Per-side risk gate.
-        match side {
-            Side::Buy if risk_buy => {
-                counters.risk_block_buy.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            Side::Sell if risk_sell => {
-                counters.risk_block_sell.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            _ => {}
+        // Per-side improving-only gate. At theta or delta breach,
+        // only fills that move the breached greek BACK toward the
+        // safe zone are allowed. Sign-aware for puts via `gx.delta`
+        // sign convention. See `improving_passes` doc.
+        if !improving_passes(&gates, r_char, side, cached) {
+            match side {
+                Side::Buy => counters.risk_block_buy.fetch_add(1, Ordering::Relaxed),
+                Side::Sell => counters.risk_block_sell.fetch_add(1, Ordering::Relaxed),
+            };
+            continue;
         }
 
         // Compact key: strike-bits + expiry-arc + right-char +
@@ -638,12 +643,41 @@ pub fn decide_on_tick(
     out
 }
 
-/// Risk gates — return (buy_blocked, sell_blocked, all_blocked).
-/// Mirrors the Python check in _decide_on_tick. Reads the
-/// stack-local `ScalarSnapshot` so the caller pays for one mutex
-/// acquire (snapshot) per tick instead of one per gate read.
-pub fn compute_risk_gates(snap: &ScalarSnapshot, now_monotonic_ns: u64) -> (bool, bool, bool) {
-    let eff = snap.risk_effective_delta;
+/// Risk gate decision after `compute_risk_gates`. Combines hard
+/// halts (margin breach, missing risk state) with breach-direction
+/// signals that the per-key/per-side `improving_passes` consumes.
+///
+/// Strategy (CLAUDE.md §25, spec §6.2):
+/// - margin breach (soft ceiling or hard kill) → `block_all`
+/// - theta breach (theta < theta_kill) → improving-only:
+///   SELLs allowed (collect decay), BUYs blocked
+/// - delta breach (|effective_delta| > delta_ceiling) → improving-only:
+///   per-right + per-side check that the post-fill move reduces the
+///   breach magnitude
+/// - daily P&L halt → broker-side, fires KillMsg → trader sets
+///   `killed["daily_halt"]` upstream of this gate
+/// - vega → currently disabled (CLAUDE.md §13)
+/// - delta_kill (the hard 5.0 threshold) → REMOVED (§25): hedge owns
+///   the delta control loop; the soft ceiling above is the trader's
+///   only delta gate. This was a deliberate change in §25 because the
+///   spec'd action ("force-hedge to 0") IS what the hedge engine does
+///   continuously — having a separate hard halt was redundant and
+///   could fire spuriously when hedge was mid-rebalance.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RiskGates {
+    pub block_all: bool,
+    pub theta_breach: bool,
+    /// Direction of delta breach: +1 = effective_delta > +ceiling
+    /// (need to DECREASE delta), -1 = < -ceiling (need to INCREASE).
+    /// None = no breach.
+    pub delta_breach_dir: Option<i8>,
+}
+
+/// Compute risk gates from `ScalarSnapshot`. Reads stack-local
+/// snapshot so caller pays one mutex acquire (snapshot) per tick
+/// instead of one per gate read.
+pub fn compute_risk_gates(snap: &ScalarSnapshot, now_monotonic_ns: u64) -> RiskGates {
+    let mut g = RiskGates::default();
     let age_s = if snap.risk_state_age_monotonic_ns > 0 {
         (now_monotonic_ns.saturating_sub(snap.risk_state_age_monotonic_ns)) as f64 / 1e9
     } else {
@@ -652,77 +686,138 @@ pub fn compute_risk_gates(snap: &ScalarSnapshot, now_monotonic_ns: u64) -> (bool
     // Fail-closed if either gating-relevant field has not yet arrived
     // OR the snapshot is stale. Margin-None gets the same treatment as
     // delta-None: without a margin reading we can't enforce
-    // margin_ceiling_pct, so we must not place. (Prior version only
-    // fail-closed on delta-None — a broker that briefly published
-    // effective_delta without margin_pct could open a placement window.)
-    if eff.is_none() || snap.risk_margin_pct.is_none() || age_s > RISK_STATE_STALE_S {
-        return (false, false, true); // risk_all
+    // margin_ceiling_pct. Theta is allowed to be None (theta gate is a
+    // separate check) but if delta or margin is None we block all.
+    if snap.risk_effective_delta.is_none()
+        || snap.risk_margin_pct.is_none()
+        || age_s > RISK_STATE_STALE_S
+    {
+        g.block_all = true;
+        return g;
     }
-    let eff = eff.unwrap();
-    let mut buy = false;
-    let mut sell = false;
-    let mut all = false;
-    if eff + 1.0 >= snap.delta_ceiling {
-        buy = true;
-    }
-    if eff - 1.0 <= -snap.delta_ceiling {
-        sell = true;
-    }
-    // The `-1.0` is an intentional grace buffer (MED-004): a fill can
-    // push effective_delta over the kill threshold between the broker's
-    // 1Hz risk_state publish and the trader's next decision. Without
-    // the buffer, that fill would slip through one extra place at the
-    // ceiling. With it, we pre-emptively block placements when within
-    // 1 contract-delta of the kill, giving risk_state propagation a
-    // round trip to catch up. delta_kill ceiling is documented
-    // unbuffered (e.g. 5.0); the trader self-blocks at 4.0.
-    if eff.abs() >= snap.delta_kill - 1.0 {
-        all = true;
-    }
+    let eff = snap.risk_effective_delta.unwrap();
+
+    // Margin: any breach (ceiling or kill) → block all. Hard kill at
+    // margin_kill_pct fires the broker's sticky kill via the existing
+    // path; this clause is the soft-ceiling block-all (no improving
+    // exception per user direction CLAUDE.md §25).
     if let Some(margin_pct) = snap.risk_margin_pct {
         if margin_pct >= snap.margin_ceiling_pct {
-            all = true;
+            g.block_all = true;
+            return g;
         }
     }
-    // Theta self-gate (2026-05-05 incident fix): the broker also fires
-    // a theta kill at the same threshold and now publishes a kill IPC
-    // event, but this local check is defense-in-depth against IPC
-    // drops or kill-event ring-full. theta_kill is negative (e.g.
-    // -500) and risk_theta accumulates negative for short-vol books;
-    // breach is `theta < theta_kill`. Zero disables.
+
+    // Theta breach → improving-only (BUYs blocked, SELLs allowed).
+    // theta_kill is negative; 0 disables.
     if snap.theta_kill < 0.0 {
         if let Some(theta) = snap.risk_theta {
             if theta < snap.theta_kill {
-                all = true;
+                g.theta_breach = true;
             }
         }
     }
-    // Vega self-gate. vega_kill is positive and the magnitude of the
-    // worst-case vega exposure trips it. CLAUDE.md §13: 0 disables
-    // (current operational state per Alabaster characterization).
+
+    // Vega: currently disabled. Kept here as a hook so a future
+    // re-enable can become improving-only without rearchitecture.
+    // For now, vega_kill > 0 just blocks all (matches §25 conservative
+    // default — improving direction for vega isn't well-defined since
+    // the breach magnitude can flip sign with positions).
     if snap.vega_kill > 0.0 {
         if let Some(vega) = snap.risk_vega {
             if vega.abs() >= snap.vega_kill {
-                all = true;
+                g.block_all = true;
+                return g;
             }
         }
     }
-    (buy, sell, all)
+
+    // Delta breach → per-right per-side improving check via
+    // `improving_passes`. Sign-aware (fixes the §22 latent puts-
+    // direction bug: the prior `compute_risk_gates` blocked BUYs on
+    // delta>+ceiling regardless of right, but BUY put adds NEGATIVE
+    // delta and IS the improving side when delta is too high).
+    if eff > snap.delta_ceiling {
+        g.delta_breach_dir = Some(1);
+    } else if eff < -snap.delta_ceiling {
+        g.delta_breach_dir = Some(-1);
+    }
+
+    g
 }
 
-/// Compute theo via SVI (or future SABR). Returns (iv, theo) or None.
+/// Per-key per-side improving-fill gate. Returns true if a single
+/// BUY/SELL on this strike+right is allowed under the current breach
+/// state. Hot-path call: 1-2 multiplies + branches.
+///
+/// Sign table (per spec §6.2 + CLAUDE.md §25):
+/// ```text
+///     side    right   ΔportΔ          ΔportΘ
+///     BUY     C       +greeks.delta   +greeks.theta (long decays)
+///     SELL    C       -greeks.delta   -greeks.theta (short collects)
+///     BUY     P       +greeks.delta   +greeks.theta (note: greeks.delta < 0 for puts)
+///     SELL    P       -greeks.delta   -greeks.theta
+/// ```
+/// "Improving" means moving the breached portfolio greek AWAY from
+/// the breach side (toward zero or into the safe zone).
+///
+/// `multiplier` scales the per-strike greeks (cached at multiplier=1.0)
+/// to dollar terms so the comparison sign — but not magnitude — matches
+/// the broker's risk_state values. We only check sign here, not
+/// magnitude, so the multiplier could in principle be omitted; it's
+/// included for clarity and so that a future "improving by ≥ N%"
+/// extension lands cleanly.
+pub fn improving_passes(g: &RiskGates, _right: char, side: Side, gx: TheoGreeks) -> bool {
+    let qty_signed = if side == Side::Buy { 1.0 } else { -1.0 };
+    if g.theta_breach {
+        // Portfolio theta < theta_kill (too negative). Need post-fill
+        // theta to INCREASE (move toward zero). theta_change = qty ×
+        // option_theta; option_theta ≤ 0 for live OTM strikes, so:
+        //   BUY  → theta_change ≤ 0 (worsens or no-op) → reject
+        //   SELL → theta_change ≥ 0 (improves) → accept
+        // Sign-aware against gx.theta rather than structural-by-side
+        // so a hypothetical positive-theta input (degenerate / ITM)
+        // doesn't fall through.
+        let theta_change = qty_signed * gx.theta;
+        if theta_change <= 0.0 {
+            return false;
+        }
+    }
+    if let Some(dir) = g.delta_breach_dir {
+        // delta_change = sign-of-fill × option-delta. gx.delta is
+        // signed by right (+ve calls, -ve puts), so this expression
+        // covers all four (right, side) combos correctly without
+        // branching on `right`.
+        // dir=+1: portfolio delta too high → need delta_change < 0
+        // dir=-1: portfolio delta too low → need delta_change > 0
+        let delta_change = qty_signed * gx.delta;
+        if (dir as f64) * delta_change > 0.0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compute theo + greeks via SVI/SABR + Black76. Returns
+/// `(iv, TheoGreeks)` or None if inputs are invalid or the price is
+/// non-positive.
+///
 /// CRITICAL: theo MUST use the option's actual right ('C' or 'P') —
 /// call price ≠ put price. Bug 2026-05-01: passing 'C' for both
 /// produced wildly wrong put theos (call price for OTM puts is
 /// MUCH less than put price), making us SELL puts BELOW the bid
 /// and BUY puts ABOVE the ask.
+///
+/// Greeks (theta, vega) are returned at multiplier=1.0 alongside theo
+/// + delta so the per-strike cache stores all four together. Callers
+/// scale to dollar terms via `scalars.contract_multiplier`.
 pub fn compute_theo(
     forward: f64,
     strike: f64,
     tte: f64,
     right: char,
     params: &VolParams,
-) -> Option<(f64, f64, f64)> {
+) -> Option<(f64, TheoGreeks)> {
     if forward <= 0.0 || strike <= 0.0 || tte <= 0.0 {
         return None;
     }
@@ -751,11 +846,16 @@ pub fn compute_theo(
     if iv <= 0.0 || iv.is_nan() {
         return None;
     }
-    let (theo, delta) = black76_price_and_delta(forward, strike, tte, iv, 0.0, right);
-    if theo <= 0.0 {
+    let g = crate::pricing::black76_greeks(forward, strike, tte, iv, 0.0, right);
+    if g.price <= 0.0 {
         return None;
     }
-    Some((iv, theo, delta))
+    Some((iv, TheoGreeks {
+        theo: g.price,
+        delta: g.delta,
+        theta: g.theta,
+        vega: g.vega,
+    }))
 }
 
 /// Convert a YYYYMMDD expiry string to time-to-expiry in years.
@@ -1013,12 +1113,41 @@ mod tests {
     }
 
     #[test]
-    fn delta_kill_blocks_all() {
+    fn delta_ceiling_high_blocks_sell_put_allows_buy_put() {
+        // §25 improving-only — puts side, integration test that
+        // exercises the full decide_on_tick path including
+        // `improving_passes`. delta>+ceiling: need to DECREASE
+        // portfolio delta. BUY put adds NEGATIVE delta (improving).
+        // SELL put adds POSITIVE delta (worsens). This integration
+        // test pins the §22 latent puts-direction bug fix; the
+        // exhaustive gate-logic enumeration is in
+        // `improving_passes_truth_table`.
         let state = fresh_state(6.0);
         {
             let mut sc = state.scalars.lock();
-            sc.delta_kill = 5.0;
-            sc.risk_effective_delta = Some(5.0);
+            sc.delta_ceiling = 3.0;
+            sc.risk_effective_delta = Some(3.5);
+            sc.skip_if_spread_over_edge_mul = 0.0;
+        }
+        install_svi_surface(&state, "20260526", 'P');
+        let counters = DecisionCounters::default();
+        let tick = make_tick(6.0, "20260526", "P", 0.10, 0.12);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let _ = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+        // BUY put allowed (improving), SELL put blocked.
+        assert_eq!(counters.risk_block_buy.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.risk_block_sell.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn margin_breach_blocks_all() {
+        // §25: margin breach (soft ceiling) is hard halt — no
+        // improving exception.
+        let state = fresh_state(6.0);
+        {
+            let mut sc = state.scalars.lock();
+            sc.margin_ceiling_pct = 0.50;
+            sc.risk_margin_pct = Some(0.55);
         }
         install_svi_surface(&state, "20260526", 'C');
         let counters = DecisionCounters::default();
@@ -1030,22 +1159,41 @@ mod tests {
     }
 
     #[test]
-    fn theta_kill_blocks_all() {
-        // 2026-05-05 incident regression test: theta of -850 with
-        // theta_kill at -500 must block placements, not fall through.
-        let state = fresh_state(6.0);
-        {
-            let mut sc = state.scalars.lock();
-            sc.theta_kill = -500.0;
-            sc.risk_theta = Some(-850.0);
+    fn improving_passes_truth_table() {
+        // Exhaustive enumeration of the per-fill gate sign table
+        // (CLAUDE.md §25) on synthetic greeks. Validates the four
+        // (right, side) × four breach states matrix.
+        let g_call = TheoGreeks { theo: 0.10, delta: 0.5, theta: -10.0, vega: 5.0 };
+        let g_put  = TheoGreeks { theo: 0.10, delta: -0.5, theta: -10.0, vega: 5.0 };
+
+        let no_breach = RiskGates::default();
+        let theta_b = RiskGates { theta_breach: true, ..RiskGates::default() };
+        let delta_hi = RiskGates { delta_breach_dir: Some(1), ..RiskGates::default() };
+        let delta_lo = RiskGates { delta_breach_dir: Some(-1), ..RiskGates::default() };
+
+        // No breach → all combos pass
+        for r in &['C', 'P'] {
+            for s in &[Side::Buy, Side::Sell] {
+                let gx = if *r == 'C' { g_call } else { g_put };
+                assert!(improving_passes(&no_breach, *r, *s, gx),
+                    "no breach should pass: {:?}/{:?}", r, s);
+            }
         }
-        install_svi_surface(&state, "20260526", 'C');
-        let counters = DecisionCounters::default();
-        let tick = make_tick(6.0, "20260526", "C", 0.10, 0.12);
-        let expiry_arc = state.intern_expiry(&tick.expiry);
-        let decisions = run_decide(&state, &counters, &tick, &expiry_arc, 1_000_000_000, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
-        assert!(decisions.is_empty());
-        assert_eq!(counters.risk_block.load(Ordering::Relaxed), 2);
+        // Theta breach: SELL passes both rights, BUY blocked both
+        assert!(!improving_passes(&theta_b, 'C', Side::Buy,  g_call));
+        assert!( improving_passes(&theta_b, 'C', Side::Sell, g_call));
+        assert!(!improving_passes(&theta_b, 'P', Side::Buy,  g_put));
+        assert!( improving_passes(&theta_b, 'P', Side::Sell, g_put));
+        // Delta high (need to DECREASE delta): SELL call passes, BUY put passes; mirror blocked
+        assert!(!improving_passes(&delta_hi, 'C', Side::Buy,  g_call));
+        assert!( improving_passes(&delta_hi, 'C', Side::Sell, g_call));
+        assert!( improving_passes(&delta_hi, 'P', Side::Buy,  g_put));   // §22 fix
+        assert!(!improving_passes(&delta_hi, 'P', Side::Sell, g_put));   // §22 fix
+        // Delta low (need to INCREASE delta): mirror image
+        assert!( improving_passes(&delta_lo, 'C', Side::Buy,  g_call));
+        assert!(!improving_passes(&delta_lo, 'C', Side::Sell, g_call));
+        assert!(!improving_passes(&delta_lo, 'P', Side::Buy,  g_put));
+        assert!( improving_passes(&delta_lo, 'P', Side::Sell, g_put));
     }
 
     #[test]
@@ -1151,8 +1299,12 @@ mod tests {
             .map(|e| *e.value())
             .collect();
         assert_eq!(cache_entries.len(), 1, "expected exactly one cache entry");
-        let (theo_at_fit, delta_at_fit) = cache_entries[0];
+        let gx = cache_entries[0];
+        let theo_at_fit = gx.theo;
+        let delta_at_fit = gx.delta;
         assert!(theo_at_fit > 0.0, "theo_at_fit must be positive: {}", theo_at_fit);
+        assert!(gx.vega >= 0.0, "vega must be non-negative: {}", gx.vega);
+        assert!(gx.theta <= 0.0, "theta must be non-positive (long-position decay): {}", gx.theta);
         // Slightly-OTM call (K=6.05 vs F=6.0) → delta in (0, 0.5).
         assert!(
             delta_at_fit > 0.0 && delta_at_fit < 0.5,

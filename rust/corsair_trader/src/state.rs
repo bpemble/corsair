@@ -92,6 +92,25 @@ pub type VolSurfaceKey = (Arc<str>, char);
 pub type TheoCacheKey = (i64, Arc<str>, char, u64);
 pub type OurOrderKey = (i64, Arc<str>, char, char);
 
+/// Per-strike greeks at fit-time forward, multiplier=1.0. Cached in
+/// `theo_cache` keyed by (strike, expiry, right, fit_ts_ns).
+///
+/// Sign convention mirrors Black-76 long-position greeks:
+///   - delta:  +ve calls, -ve puts
+///   - theta:  -ve both rights (long position decays)
+///   - vega:   +ve both rights (per 1% vol move)
+///
+/// To convert to portfolio-greek change for a single-contract fill:
+///   - BUY  → +1 × greek × multiplier  (adds long position)
+///   - SELL → -1 × greek × multiplier  (adds short position)
+#[derive(Debug, Clone, Copy)]
+pub struct TheoGreeks {
+    pub theo: f64,
+    pub delta: f64,
+    pub theta: f64,
+    pub vega: f64,
+}
+
 /// Histograms behind their own mutex. Hot path pushes one sample;
 /// telemetry sorts a snapshot every 10s.
 ///
@@ -153,12 +172,18 @@ pub struct ScalarState {
     pub min_edge_ticks: i32,
     pub tick_size: f64,
     pub delta_ceiling: f64,
-    pub delta_kill: f64,
     /// Theta breach threshold (negative; 0 disables). From broker hello.
+    /// As of CLAUDE.md §25 (improving-only gating), the trader is the
+    /// authoritative theta gate — broker no longer fires a theta kill.
     pub theta_kill: f64,
-    /// Vega breach threshold (positive; 0 disables). From broker hello.
+    /// Vega breach threshold (positive; 0 disables). Currently 0 per
+    /// CLAUDE.md §13. Trader-side improving-only gating as of §25.
     pub vega_kill: f64,
     pub margin_ceiling_pct: f64,
+    /// Contract multiplier (HG=25_000, ETH=50). Scales per-strike
+    /// Black-76 greeks (cached at multiplier=1.0) to dollar terms for
+    /// improving-only gate post-fill greek change. From broker hello.
+    pub contract_multiplier: f64,
     pub weekend_paused: bool,
     /// Quote-lifetime config from broker hello. Defaults match
     /// CLAUDE.md §16 Layer 6 throttling chain — replaced by broker
@@ -183,10 +208,10 @@ impl ScalarState {
             min_edge_ticks: 2,
             tick_size: 0.0005,
             delta_ceiling: 3.0,
-            delta_kill: 5.0,
             theta_kill: -500.0,
             vega_kill: 0.0,
             margin_ceiling_pct: 0.50,
+            contract_multiplier: 25_000.0,  // HG default; broker hello overrides
             weekend_paused: false,
             // Defaults match the broker's QuotingSection defaults
             // (corsair_broker/src/config.rs::default_*). When the
@@ -216,10 +241,10 @@ impl ScalarState {
             min_edge_ticks: self.min_edge_ticks,
             tick_size: self.tick_size,
             delta_ceiling: self.delta_ceiling,
-            delta_kill: self.delta_kill,
             theta_kill: self.theta_kill,
             vega_kill: self.vega_kill,
             margin_ceiling_pct: self.margin_ceiling_pct,
+            contract_multiplier: self.contract_multiplier,
             weekend_paused: self.weekend_paused,
             gtd_lifetime_s: self.gtd_lifetime_s,
             gtd_refresh_lead_s: self.gtd_refresh_lead_s,
@@ -242,10 +267,15 @@ pub struct ScalarSnapshot {
     pub min_edge_ticks: i32,
     pub tick_size: f64,
     pub delta_ceiling: f64,
-    pub delta_kill: f64,
     pub theta_kill: f64,
     pub vega_kill: f64,
     pub margin_ceiling_pct: f64,
+    /// Snapshot of `ScalarState::contract_multiplier`. Currently only
+    /// snapshotted for completeness; `improving_passes` evaluates sign
+    /// only and so doesn't need the magnitude. Kept so future
+    /// "improving by ≥ N% of breach" gating lands without re-plumbing.
+    #[allow(dead_code)]
+    pub contract_multiplier: f64,
     pub weekend_paused: bool,
     pub gtd_lifetime_s: f64,
     pub gtd_refresh_lead_s: f64,
@@ -277,17 +307,20 @@ pub struct SharedState {
     pub vol_surfaces: DashMap<VolSurfaceKey, Arc<VolSurfaceEntry>>,
 
     /// Optimization #3 — SVI/SABR theo cache, keyed by
-    /// (strike_bits, expiry, right_char, fit_ts_ns). Stores the pair
-    /// (theo_at_fit, delta_at_fit), both pure functions of
-    /// (fit_forward, strike, tte, params, right); within a single fit
-    /// cycle the only changing input is tte, which moves less than 1
-    /// tick over a 60s fit window. We invalidate the entry when
+    /// (strike_bits, expiry, right_char, fit_ts_ns). Stores
+    /// `TheoGreeks` (theo, delta, theta, vega) at fit-time forward,
+    /// all pure functions of (fit_forward, strike, tte, params, right).
+    /// Within a single fit cycle the only changing input is tte, which
+    /// moves less than 1 tick over a 60s fit window. Invalidated when
     /// fit_ts_ns changes (new SABR fit landed). Saves ~80µs per tick
     /// (SVI/SABR + Black76 + greeks) in the steady-state amend loop.
-    /// Delta is cached alongside theo so the Taylor reprice path
-    /// (theo + delta × (spot − fit_forward)) doesn't recompute greeks
-    /// on the hot path.
-    pub theo_cache: DashMap<TheoCacheKey, (f64, f64)>,
+    ///
+    /// Delta drives the Taylor reprice (theo + delta × (spot − fit_forward));
+    /// theta and vega drive the improving-only risk gates (CLAUDE.md
+    /// §25). Greeks are stored at multiplier=1.0; gates scale by
+    /// `scalars.contract_multiplier` to compare against dollar-denominated
+    /// portfolio greeks from `risk_state`.
+    pub theo_cache: DashMap<TheoCacheKey, TheoGreeks>,
 
     /// Resting orders we've placed, keyed by
     /// (strike-bits, expiry, right-char, side-char).

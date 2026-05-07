@@ -402,22 +402,29 @@ fn snapshot_chain(
         if !take_this {
             continue;
         }
-        // Microprice for IV inversion (Rec 2 expanded, 2026-05-05).
         // Skip dark / one-sided / inverted books — also strikes with
         // zero size on either side, since the displayed mid is stale
         // (no recent two-sided quote means the price isn't anchored
         // to live liquidity). Stale strikes were pulling fits high
         // during fast spot moves, contributing to the 5.90 P /
         // 6.05 C accumulation incident on 2026-05-05.
+        //
+        // 2026-05-07: switched from microprice
+        // ((bid·ask_size + ask·bid_size)/total) to plain mid for IV
+        // inversion. HG OTM strikes routinely show one-lot bids/asks
+        // that don't reflect true liquidity, and the size weighting
+        // pulled IVs systematically toward bid on puts and toward ask
+        // on calls — producing theos 1-3 ticks below mid on puts and
+        // 1 tick above mid on calls even though parity was clean.
+        // The two-sided / non-zero-size guards above remain; only the
+        // price formula changes.
         if opt.bid <= 0.0 || opt.ask <= 0.0 || opt.bid >= opt.ask {
             continue;
         }
         if opt.bid_size == 0 || opt.ask_size == 0 {
             continue;
         }
-        let total = (opt.bid_size + opt.ask_size) as f64;
-        let price =
-            (opt.bid * (opt.ask_size as f64) + opt.ask * (opt.bid_size as f64)) / total;
+        let price = (opt.bid + opt.ask) / 2.0;
         if price <= 0.0 {
             continue;
         }

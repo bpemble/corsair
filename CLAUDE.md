@@ -92,7 +92,8 @@ current operational config.
 | Operational kills (RMSE/latency/fill-rate) | required (§7) | not implemented in Rust runtime | §15 |
 | `quoting.dead_band_ticks` | unspecified | 2 ticks ($0.001 on HG); 20× tighter than legacy paper config | §16 |
 | `hedging.ioc_tick_offset` | unspecified | 4 (bumped 2→4 on 2026-05-04) | §10 |
-| Tiered improving-fill exceptions | tier-1 margin escape + tier-2 per-constraint improving (margin/delta/theta), carried over from `src/constraint_checker.py` | not wired to live order path — trader uses simpler `compute_risk_gates` with only per-side delta blocking; `ConstraintChecker::check()` exists but is dead code | §22 |
+| Tiered improving-fill exceptions | tier-1 margin escape + tier-2 per-constraint improving (margin/delta/theta), carried over from `src/constraint_checker.py` | margin = hard halt (no improving exception); theta = improving-only via trader (§25); delta_kill removed (hedge owns it) | §22, §25 |
+| Strategy-kill controller | broker-side risk_monitor fires delta/theta/vega kills | trader-centric: improving-only gates in `compute_risk_gates`, broker keeps only operational + margin + daily_pnl + new `trader_silent` watchdog | §25 |
 
 ETH is tabled (config products list is HG-only) but the multi-product
 architecture is preserved — re-enabling ETH is a matter of un-commenting
@@ -1384,3 +1385,303 @@ can be folded into the new structure cleanly.
   puts right but doesn't add improving-fill exceptions ships
   inconsistent semantics. Either do the full §22 work or leave it
   documented as latent.
+
+## 23. Host CPU isolation — keep crowsnest off the corsair cpuset (2026-05-07)
+
+Trader pinning is necessary but not sufficient. The trader's hot
+loop busy-spins on cpu 8; cpu 9 is the SMT sibling (same physical
+P-core), so any work scheduled on cpu 9 steals pipeline execution
+units from `corsair-hot` and produces multi-millisecond TTT p99
+outliers that don't show up in p50 or p99 of the broker-side
+histogram (which only sees the broker's own work).
+
+The first incarnation of this bug was the trader's OWN background
+threads (jsonl writers, fallback tokio worker) landing on cpu 9 —
+fixed in commit `4503cb3` (May 6) by pinning each thread to a
+specific cpu and preferring cross-physical-core fallbacks.
+
+**The second incarnation is host-side**: the `crowsnest.slice`
+(bitstamp/coinbase/dydx/etc. data collectors, ~14 services) ran
+with affinity `0xffffffff` and the kernel scheduler placed dozens
+of Python threads on cpus 8 and 9 (and 12-15 where the broker's
+tokio workers live). Symptom on 2026-05-07: trader `ttt_p99_ns`
+clustered at 5.4ms / 6.9ms / 8ms across 21+ telemetry windows
+even though steady-state p99 is ~90µs.
+
+### Topology (i9-14900K, SMT enabled)
+
+```
+cpus  0-15  → 8 P-cores HT (each P-core = 2 logical cpus)
+              (cpus 8,9 = P-core 4; cpus 10,11 = P-core 5; etc.)
+cpus 16-31  → 16 E-cores (1 logical cpu each)
+
+corsair containers:
+  trader → cpus 8-11   (P-cores 4 and 5)
+  broker → cpus 12-15  (P-cores 6 and 7)
+
+trader thread layout:
+  cpu 8   → corsair-hot std::thread (busy-spin, hot path)
+  cpu 9   → SMT sibling of cpu 8 — DELIBERATELY EMPTY
+  cpu 10  → tokio-rt-worker (parked)
+  cpu 11  → corsair-bg + jsonl-trader_events + jsonl-trader_decisions
+```
+
+### The fix
+
+`AllowedCPUs=0-7,16-31` on the slice would be cleanest, but
+`user@1000.service` does not have the `cpuset` controller
+delegated (only `cpu memory pids`), so cgroup-level cpuset
+constraints silently no-op. Two paths:
+
+**Option A (cleanest, requires sudo)** — delegate cpuset:
+
+```ini
+# /etc/systemd/system/user@.service.d/delegate.conf
+[Service]
+Delegate=cpu cpuset memory pids
+```
+
+Then `sudo systemctl daemon-reload && sudo systemctl restart user@1000.service`
+(this kills the user session). The existing
+`crowsnest.slice.d/cpus.conf` would then take effect.
+
+**Option B (no sudo, what we shipped)** — per-service
+`CPUAffinity` drop-ins. CPUAffinity uses `sched_setaffinity`
+directly and bypasses cpuset delegation. Drop-ins live at
+`~/.config/systemd/user/<svc>.service.d/cpus.conf`:
+
+```ini
+[Service]
+CPUAffinity=0-7 16-31
+```
+
+Applied to all 14 crowsnest services on 2026-05-07. The
+slice-level `AllowedCPUs` override is also in place so that
+delegation, if enabled later, will pin the slice without a
+second pass.
+
+### Verification
+
+```bash
+# 1. Slice config visible to systemd
+systemctl --user show crowsnest.slice | grep AllowedCPUs
+
+# 2. Per-service kernel-level affinity (the load-bearing one)
+PID=$(systemctl --user show bitstamp-collector -P MainPID)
+grep Cpus_allowed_list /proc/$PID/status
+# expected: 0-7,16-31
+
+# 3. Live thread placement — no crowsnest threads on 8-15
+ps -eLo psr,cgroup | awk '$1 >= 8 && $1 <= 15' | grep -c crowsnest
+# expected: 0
+```
+
+### Why this matters
+
+The trader's own pinning gets you to "no contention from your own
+threads". This change gets you to "no contention from anything
+else on the host". On Alabaster (former host) the kernel cmdline
+included `isolcpus=8-11` which solved the same problem at boot
+time; on the current i9-14900K we don't `isolcpus` because we
+want the corsair cpuset to participate in housekeeping (kworkers
+etc.). Per-cgroup affinity is the substitute.
+
+### Don't
+
+- **Don't pin everything to a single cpu** ("everyone goes to
+  cpu 0"). The kernel uses cpu 0 for many default-affinity
+  housekeeping paths (timer ticks, default IRQ handling) — moving
+  ALL userspace there creates contention with the kernel itself.
+  `0-7` plus E-cores spreads load across multiple physical cores.
+- **Don't think `systemctl show ... | grep AllowedCPUs` proves the
+  pin works.** That only shows what systemd was TOLD; if cpuset
+  isn't delegated, the directive is silently dropped at the
+  cgroup level. Always verify at `/proc/<pid>/status`
+  Cpus_allowed_list.
+- **Don't restrict the slice tighter than CPUQuota allows.**
+  `crowsnest.slice` has `CPUQuota=1600%` (16 cores). The
+  `0-7,16-31` mask has 24 logical cpus = ample room.
+
+## 24. SABR IV inversion uses mid, not microprice (2026-05-07)
+
+`vol_surface.rs::snapshot_chain` previously computed the input
+price for IV inversion via microprice:
+
+```rust
+price = (bid * ask_size + ask * bid_size) / (bid_size + ask_size)
+```
+
+That formula is informative when displayed sizes track real
+liquidity. On HG OTM strikes they don't — bids and asks frequently
+display 1-lot resting orders that pull the formula toward
+whichever side has the smaller quote. The result was systematic
+side-asymmetric bias visible in production:
+
+- OTM puts: bid_size often 1, ask_size 16-33 → microprice tilted
+  toward bid → IV inversion underestimated → put theos
+  systematically 1-3 ticks BELOW mid
+- OTM calls: mirror image → call theos 1 tick ABOVE mid
+
+Put-call parity on the theo side was clean (`theo_C - theo_P + K
+= F` consistent across strikes), so the issue wasn't a fit bug —
+the inputs were biased. Switched to plain `(bid + ask) / 2.0`.
+The two-sided / non-zero-size guards above the price line stay in
+place; only the formula changed.
+
+A size-floor compromise (`bs ≥ 3 && as ≥ 3`) was considered and
+rejected — it would have cut the put input set from 7 strikes to
+2 on the inspected snapshot, leaving the fit underdetermined on
+the put side.
+
+### Why microprice was originally chosen
+
+The 2026-05-05 cleanup pass bundled microprice with the
+zero-size / one-sided / inverted-book skip checks under "Rec 2
+expanded" remediation of the 5.90 P / 6.05 C accumulation
+incident. The skip checks did the load-bearing work (excluding
+stale strikes during fast spot moves); the microprice tweak rode
+along. Removing the formula keeps the load-bearing guards.
+
+### How to revert
+
+If a future regime change makes microprice signal load-bearing
+again (e.g., HG flow gets deep enough that displayed sizes
+genuinely reflect demand asymmetry), revert to the size-weighted
+formula at `snapshot_chain`. Don't half-measure with a size
+floor unless you've checked that the post-floor strike set is
+big enough to fit (≥4-5 points per side after the OTM-only
+filter).
+
+## 25. Trader-centric kill controller — improving-only gates + watchdog (2026-05-07)
+
+Aligned the kill stack with v1.4 spec §6.2 by making the trader
+the authoritative strategy-kill controller. Spec language for
+delta_kill ("Halt new opens, force-hedge to 0") and theta_kill
+("Halt new opens") IS improving-only quoting; the broker's
+prior block-all behavior was over-conservative. The Python
+predecessor's tier-1 margin-improving exception (CLAUDE.md §22)
+is intentionally NOT carried over — margin breach stays as
+hard halt per operator preference.
+
+### What changed
+
+| Where | Before | After |
+|---|---|---|
+| Margin breach | broker block_all + trader block_all | unchanged (margin stays broker hard halt) |
+| Theta breach | broker fires `THETA HALT` (block_all) | trader gates per-side: BUYs blocked, SELLs allowed |
+| Delta_ceiling breach | trader block per-side, sign-bug latent on puts | trader gates per-(right, side) sign-aware via cached `gx.delta` |
+| Delta_kill (5.0 hard) | broker fires `DELTA KILL` + force-hedge | **REMOVED** — hedge engine owns the delta control loop |
+| Vega | disabled (vega_kill=0) | unchanged (improving-only is hard to define for vega; if re-enabled it stays as block_all) |
+| daily_pnl_halt | broker | unchanged (P&L tracking lives in broker) |
+| Operational kills (gateway, calibration, recon) | broker | unchanged |
+
+The §22 latent puts-direction bug is fixed as part of this work
+— `improving_passes` reads the signed `gx.delta` (positive for
+calls, negative for puts) so all four (right, side) combinations
+are gated correctly.
+
+### How "improving-only" works (the load-bearing part)
+
+For a single-contract fill of qty=1:
+
+| Action | Δ portfolio_delta | Δ portfolio_theta |
+|---|---|---|
+| BUY call  | +call_delta (+0.x) | +call_theta (negative) |
+| SELL call | −call_delta (−0.x) | −call_theta (positive) |
+| BUY put   | +put_delta (−0.x)  | +put_theta (negative) |
+| SELL put  | −put_delta (+0.x)  | −put_theta (positive) |
+
+Read off:
+- **Theta breach** (theta < theta_kill) → improve = increase
+  theta → allow SELLs (collect decay), block BUYs. Right-agnostic.
+- **Delta breach high** (eff > +ceiling) → improve = decrease
+  delta → allow SELL call + BUY put. Block BUY call + SELL put.
+- **Delta breach low** (eff < −ceiling) → mirror image.
+
+Implementation: `corsair_trader/src/decision.rs::improving_passes`.
+Truth table enumerated exhaustively in
+`improving_passes_truth_table` test. ~1-2 ns per gate per side
+(below the §21 noise floor).
+
+### Greek cache extension
+
+`theo_cache` was previously `(theo, delta)` per-strike per-fit.
+Now stores full `TheoGreeks { theo, delta, theta, vega }` (still
+at multiplier=1.0). Caching all four together costs ~5 extra
+fp64s of memory per strike (44 strikes × 32 bytes = 1.4 KB) and
+no extra compute on the hot path — `compute_theo` already calls
+Black76 via SVI/SABR; the same call now returns all greeks via
+`black76_greeks`. Theta + vega drive `improving_passes`; delta
+still drives Taylor reprice.
+
+### Trader watchdog (broker-side)
+
+With strategy kills gone, a trader crash leaves the broker with
+no per-strike protection. Mitigated by a 1Hz heartbeat from
+trader → broker plus a watchdog task on the broker:
+
+- Trader publishes `heartbeat` msgpack frame every 1s on the
+  commands ring.
+- Broker's `dispatch_commands` updates `Runtime::last_trader_msg_ns`
+  on EVERY received frame (place / cancel / modify / telemetry /
+  heartbeat / welcome). Active markets keep the watchdog warm
+  via order traffic; calm markets rely on the heartbeat.
+- `trader_watchdog` task runs 1Hz, fires `trader_silent` kill if
+  the gap exceeds `CORSAIR_TRADER_WATCHDOG_TIMEOUT_S` (default 5s).
+- `trader_silent` is a sticky `KillSource` — operator must
+  `docker compose restart corsair-broker-rs` after investigating
+  the underlying trader fault. Auto-resume on heartbeat is
+  deliberately NOT supported — a trader stuck in crash-restart
+  would silently mask itself.
+
+### Hello rehydration
+
+`HelloMsg` now carries `active_kills: Vec<String>`. When the
+trader reconnects (after crash/restart), the broker emits its
+current active kill set in `hello`; the trader populates its
+local `kills` map from the list and stays out of the market
+until the operator clears via broker restart. Closes a window
+where a restarted trader could resume quoting against a broker
+still holding `trader_silent` from the prior trader.
+
+### Why margin stays at broker
+
+P&L tracking, position state, margin computation all live in
+the broker (broker owns IBKR fills + portfolio state). Moving
+margin/daily_pnl to the trader would be a multi-week refactor
+(trader needs its own portfolio state). For now: margin and
+daily_pnl_halt stay broker-side; everything else moves to
+trader. Operational kills (gateway disconnect, calibration
+RMSE, fill rate per spec §7) also stay broker-side because
+they're infrastructure responses, not strategy policy.
+
+### Verification
+
+- `improving_passes_truth_table` test: enumerates all 4 (right ×
+  side) × 4 (breach states) = 16 cases. Sign tables documented
+  inline.
+- `delta_ceiling_high_blocks_sell_put_allows_buy_put` integration
+  test: drives the full `decide_on_tick` flow with a put tick at
+  delta breach, confirms BUY allowed + SELL blocked. Pins the §22
+  puts-direction fix.
+- Live verification (2026-05-07 deploy): trader hit theta breach
+  (theta=-523 vs theta_kill=-500), `risk_block_buy` counter
+  climbed to 11k+ over a few minutes (BUYs blocked); `place`
+  counter still incremented for SELLs. Behavior matches design.
+
+### Don't
+
+- **Don't add delta_kill back to the broker.** Hedge engine
+  controls delta; a separate hard halt is redundant and fires
+  spuriously when hedge is mid-rebalance.
+- **Don't auto-resume on trader heartbeat.** Sticky kill is
+  load-bearing — auto-resume would mask crash loops.
+- **Don't shorten the watchdog timeout below 3s.** GTD-5s on
+  every order is the safety floor; 5s timeout means at most
+  one expiry window of unmanaged orders. Tighter than that
+  risks false-positive on 1-2s GC pauses.
+- **Don't sprinkle `improving_passes` calls anywhere else.** The
+  per-side gate runs ONCE in `decide_on_tick` per side per tick,
+  exactly where the place/modify decision is being made. Adding
+  it elsewhere (e.g. staleness loop) would either re-block
+  already-resting orders (operator-confusing) or no-op.

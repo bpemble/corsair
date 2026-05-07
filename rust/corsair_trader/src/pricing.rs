@@ -19,19 +19,47 @@ fn standard_normal() -> &'static Normal {
     N.get_or_init(|| Normal::new(0.0, 1.0).expect("standard normal init"))
 }
 
-/// Black-76 option price. Mirrors corsair_pricing::black76_price.
-pub fn black76_price(f: f64, k: f64, t: f64, sigma: f64, r: f64, right: char) -> f64 {
-    black76_price_and_delta(f, k, t, sigma, r, right).0
-}
-
-/// Black-76 option price + delta in one pass. Both share the d1/d2 +
-/// CDF computation, so combining saves one norm_cdf vs two separate
-/// calls. Used by the trader's Taylor reprice path: theo at fit-time
-/// forward and delta at fit-time forward are cached together; current
-/// theo = cached_theo + cached_delta × (spot − fit_forward).
+/// Convenience accessor: just price + delta from `black76_greeks`.
+/// Used only by pricing.rs unit tests; production code calls
+/// `black76_greeks` directly via `compute_theo`.
+#[cfg(test)]
 pub fn black76_price_and_delta(
     f: f64, k: f64, t: f64, sigma: f64, r: f64, right: char,
 ) -> (f64, f64) {
+    let g = black76_greeks(f, k, t, sigma, r, right);
+    (g.price, g.delta)
+}
+
+/// Test-only price-only convenience.
+#[cfg(test)]
+pub fn black76_price(f: f64, k: f64, t: f64, sigma: f64, r: f64, right: char) -> f64 {
+    black76_greeks(f, k, t, sigma, r, right).price
+}
+
+/// Black-76 price + all four greeks in one pass. d1/d2 + CDFs are
+/// computed once; theta and vega need additional terms beyond price+
+/// delta. Per-contract values at multiplier=1.0 (callers scale to
+/// dollar terms by multiplying portfolio multiplier).
+///
+/// Sign convention:
+/// - delta: +ve for calls, -ve for puts (long position)
+/// - theta: -ve for both calls and puts (long position decays)
+/// - vega:  +ve for both (per 1% vol move; long position gains in vol)
+///
+/// Used by the per-strike greek cache (CLAUDE.md §25 — improving-only
+/// gating reads cached theta/vega to compute post-fill portfolio
+/// greek change on the hot path).
+#[derive(Debug, Clone, Copy)]
+pub struct BlackGreeks {
+    pub price: f64,
+    pub delta: f64,
+    pub theta: f64,
+    pub vega: f64,
+}
+
+pub fn black76_greeks(
+    f: f64, k: f64, t: f64, sigma: f64, r: f64, right: char,
+) -> BlackGreeks {
     let is_call = right == 'C' || right == 'c';
     if t <= 0.0 || sigma <= 0.0 || f <= 0.0 || k <= 0.0 {
         let price = if is_call { (f - k).max(0.0) } else { (k - f).max(0.0) };
@@ -40,26 +68,36 @@ pub fn black76_price_and_delta(
         } else {
             if f > k { 0.0 } else if f < k { -1.0 } else { -0.5 }
         };
-        return (price, delta);
+        return BlackGreeks { price, delta, theta: 0.0, vega: 0.0 };
     }
     let sqrt_t = t.sqrt();
     let d1 = ((f / k).ln() + 0.5 * sigma * sigma * t) / (sigma * sqrt_t);
     let d2 = d1 - sigma * sqrt_t;
     let n = standard_normal();
-    // Bundle 6K (2026-05-06): r=0.0 in production (corsair never
-    // configures a non-zero rate). Skip the `exp` call when so;
-    // disc=1.0 collapses the multiply chain. ~10 ns saved per
-    // Black-76 call when r==0.
     let disc = if r == 0.0 { 1.0 } else { (-r * t).exp() };
     let n_d1 = n.cdf(d1);
+    let pdf_d1 = (-0.5 * d1 * d1).exp() / (2.0_f64 * std::f64::consts::PI).sqrt();
+    // Vega per 1% vol move (matches corsair_pricing::greeks convention):
+    //   ∂V/∂σ × 0.01 = f * disc * φ(d1) * sqrt(t) / 100
+    let vega = f * disc * pdf_d1 * sqrt_t / 100.0;
+    // Theta in dollar/day (matches corsair_pricing::greeks convention):
+    //   ∂V/∂T = -f * disc * φ(d1) * σ / (2*sqrt(t))  [no rate term when r=0]
+    //   /365 for per-day. Both rights share the σ-decay term; the rate
+    //   term diverges by sign for calls vs puts but vanishes when r=0.
+    let common = -disc * f * pdf_d1 * sigma / (2.0 * sqrt_t);
+    let theta = if is_call {
+        (common - r * k * disc * n.cdf(d2)) / 365.0
+    } else {
+        (common + r * k * disc * n.cdf(-d2)) / 365.0
+    };
     if is_call {
         let price = disc * (f * n_d1 - k * n.cdf(d2));
         let delta = disc * n_d1;
-        (price, delta)
+        BlackGreeks { price, delta, theta, vega }
     } else {
         let price = disc * (k * n.cdf(-d2) - f * (1.0 - n_d1));
         let delta = disc * (n_d1 - 1.0);
-        (price, delta)
+        BlackGreeks { price, delta, theta, vega }
     }
 }
 
