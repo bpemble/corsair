@@ -366,15 +366,15 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                 _ = sigint.recv() => log::warn!("graceful_shutdown: SIGINT"),
             }
             // Latency-harness hook: if `CORSAIR_TRADER_HIST_DUMP_PATH`
-            // is set, dump the in-memory ipc_us / ttt_us samples to a
+            // is set, dump the in-memory ipc_ns / ttt_ns samples to a
             // JSON file before doing any cancel work. The
             // corsair_tick_replay orchestrator reads this file as the
             // raw sample input for KS/bootstrap A/B comparison.
             if let Ok(path) = std::env::var("CORSAIR_TRADER_HIST_DUMP_PATH") {
                 let h = state_sd.histograms.lock();
                 let dump = serde_json::json!({
-                    "ipc_us": h.ipc_us.iter().copied().collect::<Vec<_>>(),
-                    "ttt_us": h.ttt_us.iter().copied().collect::<Vec<_>>(),
+                    "ipc_ns": h.ipc_ns.iter().copied().collect::<Vec<_>>(),
+                    "ttt_ns": h.ttt_ns.iter().copied().collect::<Vec<_>>(),
                 });
                 drop(h);
                 match std::fs::write(&path, dump.to_string()) {
@@ -476,13 +476,13 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                 ring.write_frame(&frame);
                 drop(ring);
                 log::info!(
-                    "telemetry: events={} ipc_p50={:?} ipc_p99={:?} ttt_p50={:?} ttt_p99={:?} \
+                    "telemetry: events={} ipc_p50_ns={:?} ipc_p99_ns={:?} ttt_p50_ns={:?} ttt_p99_ns={:?} \
                      opts={} orders={} hedge={:?} cmd_drops={} decisions={}",
                     n_events,
-                    tel.ipc_p50_us,
-                    tel.ipc_p99_us,
-                    tel.ttt_p50_us,
-                    tel.ttt_p99_us,
+                    tel.ipc_p50_ns,
+                    tel.ipc_p99_ns,
+                    tel.ttt_p50_ns,
+                    tel.ttt_p99_ns,
                     tel.n_options,
                     tel.n_active_orders,
                     tel.risk_hedge_delta,
@@ -697,13 +697,14 @@ fn process_event(
     });
 
     if let Some(emit_ns) = header_ts_ns {
-        let lat = recv_wall_ns.saturating_sub(emit_ns) / 1000;
-        if lat < 5_000_000 {
+        let lat = recv_wall_ns.saturating_sub(emit_ns);
+        // Outlier guard: same threshold as before but in ns now (5s).
+        if lat < 5_000_000_000 {
             let mut h = state.histograms.lock();
             let cap = h.ipc_cap;
-            h.ipc_us.push_back(lat);
-            if h.ipc_us.len() > cap {
-                h.ipc_us.pop_front();
+            h.ipc_ns.push_back(lat);
+            if h.ipc_ns.len() > cap {
+                h.ipc_ns.pop_front();
             }
         }
     }
@@ -1324,13 +1325,14 @@ fn on_tick(
     // TTT histogram push — separate parking_lot mutex so the bg
     // telemetry sort doesn't block this tiny (~50ns) push.
     if let Some(emit_ns) = tick.ts_ns {
-        let lat = send_ns_wall_after_write.saturating_sub(emit_ns) / 1000;
-        if lat < 5_000_000 {
+        let lat = send_ns_wall_after_write.saturating_sub(emit_ns);
+        // Outlier guard: same threshold as before but in ns now (5s).
+        if lat < 5_000_000_000 {
             let mut h = state.histograms.lock();
             let cap = h.ttt_cap;
-            h.ttt_us.push_back(lat);
-            if h.ttt_us.len() > cap {
-                h.ttt_us.pop_front();
+            h.ttt_ns.push_back(lat);
+            if h.ttt_ns.len() > cap {
+                h.ttt_ns.pop_front();
             }
         }
     }
@@ -1594,8 +1596,8 @@ fn build_telemetry(
     // sort so the hot path can keep pushing while we sort the copy.
     let (mut ipc_sorted, mut ttt_sorted) = {
         let h = state.histograms.lock();
-        let ipc: Vec<u64> = h.ipc_us.iter().copied().collect();
-        let ttt: Vec<u64> = h.ttt_us.iter().copied().collect();
+        let ipc: Vec<u64> = h.ipc_ns.iter().copied().collect();
+        let ttt: Vec<u64> = h.ttt_ns.iter().copied().collect();
         (ipc, ttt)
     };
     ipc_sorted.sort_unstable();
@@ -1622,11 +1624,11 @@ fn build_telemetry(
             ts_ns: now_ns_wall(),
             events: serde_json::json!({}),
             decisions: counters.to_json(),
-            ipc_p50_us: pct(&ipc_sorted, 0.50),
-            ipc_p99_us: pct(&ipc_sorted, 0.99),
+            ipc_p50_ns: pct(&ipc_sorted, 0.50),
+            ipc_p99_ns: pct(&ipc_sorted, 0.99),
             ipc_n: ipc_sorted.len(),
-            ttt_p50_us: pct(&ttt_sorted, 0.50),
-            ttt_p99_us: pct(&ttt_sorted, 0.99),
+            ttt_p50_ns: pct(&ttt_sorted, 0.50),
+            ttt_p99_ns: pct(&ttt_sorted, 0.99),
             ttt_n: ttt_sorted.len(),
             n_options: state.options.len(),
             n_active_orders: state.our_orders.len(),

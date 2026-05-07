@@ -292,6 +292,11 @@ pub fn decide_on_tick(
         return out;
     }
 
+    // Quantize strike once and reuse across all key tuples below
+    // (theo_key, buy_key, sell_key, per-side place key) — saves
+    // 3 redundant int-mul+round+cast calls (~6ns total).
+    let sk = SharedState::strike_key(strike);
+
     // Theo cache (optimization #3). Within a single fit window
     // (60s), theo is a pure function of (forward, strike, tte,
     // params, right). The only mover is tte and it shifts <1µs/sec
@@ -299,7 +304,7 @@ pub fn decide_on_tick(
     // and invalidate only when a new fit lands. Saves ~80µs per
     // tick on the SVI implied_vol + Black76 chain in the amend loop.
     let theo_key = (
-        SharedState::strike_key(strike),
+        sk,
         Arc::clone(expiry_arc),
         r_char,
         vp_msg.fit_ts_ns,
@@ -362,18 +367,8 @@ pub fn decide_on_tick(
 
     // Look up our resting orders (used by both the L2-aware path and
     // the depth-1 self-fill fallback below).
-    let buy_key = (
-        SharedState::strike_key(strike),
-        Arc::clone(expiry_arc),
-        r_char,
-        'B',
-    );
-    let sell_key = (
-        SharedState::strike_key(strike),
-        Arc::clone(expiry_arc),
-        r_char,
-        'S',
-    );
+    let buy_key = (sk, Arc::clone(expiry_arc), r_char, 'B');
+    let sell_key = (sk, Arc::clone(expiry_arc), r_char, 'S');
     let our_bid = state.our_orders.get(&buy_key).map(|r| r.value().price);
     let our_ask = state.our_orders.get(&sell_key).map(|r| r.value().price);
 
@@ -545,12 +540,7 @@ pub fn decide_on_tick(
 
         // Compact key: strike-bits + expiry-arc + right-char +
         // side-char. Arc bump per clone, no String alloc.
-        let key = (
-            SharedState::strike_key(strike),
-            Arc::clone(expiry_arc),
-            r_char,
-            side.as_char(),
-        );
+        let key = (sk, Arc::clone(expiry_arc), r_char, side.as_char());
 
         // Dead-band + GTD-refresh check.
         let existing = state.our_orders.get(&key).map(|r| r.value().clone());

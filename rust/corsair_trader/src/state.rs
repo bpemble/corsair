@@ -5,9 +5,12 @@
 //!     internally shards by key hash so the 10Hz staleness sweep and
 //!     the 10s telemetry snapshot can iterate one shard while the hot
 //!     loop inserts into another shard without contention.
-//!   - Histograms (`ipc_us`, `ttt_us`) live behind their own
+//!   - Histograms (`ipc_ns`, `ttt_ns`) live behind their own
 //!     `parking_lot::Mutex`. The telemetry sort is ~ms; isolating the
 //!     histograms keeps that work off the hot path's lock budget.
+//!     Samples stored in nanoseconds (switched 2026-05-06 from µs to
+//!     resolve sub-µs A/B comparisons; integer-truncated µs lost
+//!     5–20% of the dynamic range we needed to measure).
 //!   - Scalars (config, risk_state, underlying_price, weekend_paused)
 //!     live behind a small `parking_lot::Mutex`. Hot path snapshots
 //!     them once per tick into a stack-local view; broker-event
@@ -99,8 +102,8 @@ pub type OurOrderKey = (i64, Arc<str>, char, char);
 /// run captures every sample for KS/bootstrap comparison; production
 /// stays at the smaller caps so the telemetry snapshot stays cheap.
 pub struct Histograms {
-    pub ipc_us: VecDeque<u64>,
-    pub ttt_us: VecDeque<u64>,
+    pub ipc_ns: VecDeque<u64>,
+    pub ttt_ns: VecDeque<u64>,
     pub ipc_cap: usize,
     pub ttt_cap: usize,
 }
@@ -108,8 +111,8 @@ pub struct Histograms {
 impl Default for Histograms {
     fn default() -> Self {
         Self {
-            ipc_us: VecDeque::new(),
-            ttt_us: VecDeque::new(),
+            ipc_ns: VecDeque::new(),
+            ttt_ns: VecDeque::new(),
             ipc_cap: env_usize("CORSAIR_TRADER_HIST_IPC_CAP", 2000),
             ttt_cap: env_usize("CORSAIR_TRADER_HIST_TTT_CAP", 500),
         }

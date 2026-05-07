@@ -2,7 +2,10 @@
 """A/B compare two trader histogram dumps from the replay harness.
 
 The harness leaves a JSON file with two arrays:
-    {"ipc_us": [...], "ttt_us": [...]}
+    {"ipc_ns": [...], "ttt_ns": [...]}
+
+Samples are nanoseconds (switched 2026-05-06 from µs to resolve sub-µs
+A/B comparisons; integer-truncated µs lost 5–20% of dynamic range).
 
 This script loads two such files and reports:
   - Per-percentile distribution stats (p50/p90/p99/p99.9/max) with bootstrap 95% CI
@@ -17,7 +20,7 @@ Verdict rules (defaults; tune via flags):
   INCONCLUSIVE: change is within noise on both sides — no signal either way.
 
 Usage:
-    scripts/compare_latency.py before.json after.json [--metric ttt_us|ipc_us]
+    scripts/compare_latency.py before.json after.json [--metric ttt_ns|ipc_ns]
 """
 from __future__ import annotations
 
@@ -66,10 +69,13 @@ def ks_2sample(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
     return d, p
 
 
-def fmt_us(v: float) -> str:
-    if v < 1000:
-        return f"{v:7.1f} us"
-    return f"{v / 1000:6.2f} ms"
+def fmt_ns(v: float) -> str:
+    """Format a nanosecond value as a human-friendly string."""
+    if v < 1_000:
+        return f"{v:7.0f} ns"
+    if v < 1_000_000:
+        return f"{v / 1_000:7.2f} us"
+    return f"{v / 1_000_000:6.2f} ms"
 
 
 def main():
@@ -77,8 +83,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("before", help="histogram JSON from the baseline run")
     ap.add_argument("after", help="histogram JSON from the candidate run")
-    ap.add_argument("--metric", default="ttt_us", choices=("ttt_us", "ipc_us"),
-                    help="which latency series to compare (default ttt_us)")
+    ap.add_argument("--metric", default="ttt_ns", choices=("ttt_ns", "ipc_ns"),
+                    help="which latency series to compare (default ttt_ns)")
     ap.add_argument("--noise-floor-p50-ns", type=int, default=1000,
                     help="p50 threshold in nanoseconds; 1000ns = 2x observed "
                          "baseline-to-baseline envelope (default 1000)")
@@ -117,15 +123,15 @@ def main():
         a, a_lo, a_hi = percentile_with_ci(after, q)
         d = a - b
         deltas[name] = d
-        b_str = f"{fmt_us(b)} [{fmt_us(b_lo).strip()}, {fmt_us(b_hi).strip()}]"
-        a_str = f"{fmt_us(a)} [{fmt_us(a_lo).strip()}, {fmt_us(a_hi).strip()}]"
+        b_str = f"{fmt_ns(b)} [{fmt_ns(b_lo).strip()}, {fmt_ns(b_hi).strip()}]"
+        a_str = f"{fmt_ns(a)} [{fmt_ns(a_lo).strip()}, {fmt_ns(a_hi).strip()}]"
         d_pct = (100.0 * d / b) if b > 0 else 0.0
         print(f"{name:<6} | {b_str:>30} | {a_str:>30} | "
-              f"{fmt_us(d) if d >= 0 else '-' + fmt_us(-d).strip()} ({d_pct:+5.1f}%)")
+              f"{fmt_ns(d) if d >= 0 else '-' + fmt_ns(-d).strip()} ({d_pct:+5.1f}%)")
     b_max = float(np.max(before))
     a_max = float(np.max(after))
-    print(f"{'max':<6} | {fmt_us(b_max):>30} | {fmt_us(a_max):>30} | "
-          f"{fmt_us(a_max - b_max) if a_max >= b_max else '-' + fmt_us(b_max - a_max).strip()}")
+    print(f"{'max':<6} | {fmt_ns(b_max):>30} | {fmt_ns(a_max):>30} | "
+          f"{fmt_ns(a_max - b_max) if a_max >= b_max else '-' + fmt_ns(b_max - a_max).strip()}")
 
     ks_d, ks_p = ks_2sample(before, after)
     print(f"\nKS two-sample: D={ks_d:.4f}, p={ks_p:.4g}")
@@ -136,7 +142,8 @@ def main():
     else:
         print("  → distributions are statistically indistinguishable")
 
-    p50_d_ns = deltas["p50"] * 1000.0
+    # Histograms are already in nanoseconds (switch 2026-05-06).
+    p50_d_ns = float(deltas["p50"])
     b_p99 = float(np.percentile(before, 99))
     p99_d_pct = (100.0 * deltas["p99"] / b_p99) if b_p99 > 0 else 0.0
 

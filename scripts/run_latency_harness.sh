@@ -9,8 +9,8 @@
 #   2. corsair_trader_rust — connects, busy-polls, dumps histograms
 #      to a shared volume on SIGTERM.
 #
-# Output: a JSON file with {"ipc_us": [...], "ttt_us": [...]} that
-# scripts/compare_latency.py can ingest.
+# Output: a JSON file with {"ipc_ns": [...], "ttt_ns": [...]} that
+# scripts/compare_latency.py can ingest. Samples are nanoseconds.
 #
 # IMPORTANT: by default the harness pins both containers to cpuset
 # 4,5 (free P-cores between gateway and broker on i9-13900K). The
@@ -177,10 +177,10 @@ TRADER_LOG="${ABS_OUT%.json}.trader.log"
 docker logs "$TRADER_NAME" > "$TRADER_LOG" 2>&1 || true
 REPLAY_LOG="${ABS_OUT%.json}.replay.log"
 docker logs "$REPLAY_NAME" > "$REPLAY_LOG" 2>&1 || true
-N_TTT=$(python3 -c "import json; print(len(json.load(open('$ABS_OUT')).get('ttt_us',[])))")
-N_IPC=$(python3 -c "import json; print(len(json.load(open('$ABS_OUT')).get('ipc_us',[])))")
+N_TTT=$(python3 -c "import json; print(len(json.load(open('$ABS_OUT')).get('ttt_ns',[])))")
+N_IPC=$(python3 -c "import json; print(len(json.load(open('$ABS_OUT')).get('ipc_ns',[])))")
 
 echo
 echo "harness: histograms saved to $OUT"
-echo "  ttt_us samples: $N_TTT"
-echo "  ipc_us samples: $N_IPC"
+echo "  ttt_ns samples: $N_TTT"
+echo "  ipc_ns samples: $N_IPC"

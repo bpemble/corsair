@@ -1167,3 +1167,73 @@ time series over 1-2 weeks of clean live data.
   the complete §16/§19 followup record. Newtype refactor (audit
   Option A) is the next downstream item; tracked separately as task
   #16 in the spike's task list.
+
+## 21. Trader latency micro-opt audit — noise floor + ship/defer (2026-05-06)
+
+Followup to §17/§18. A four-candidate audit looked for sub-µs hot-path
+wins on top of the already-shipped Rust trader (TTT p50 ~50µs prior).
+Scoreboard:
+
+| Candidate | Predicted gain | Single-run Δ | Multi-run verdict |
+|---|---|---|---|
+| `wire_buf` thread-local | 50ns p50 / 200ns p99 | −272ns p50 | NOISE |
+| `arc_dedup` (hoist `strike_key`, share `sk`) | 5–10ns | −741ns p50 | NOT SIGNIFICANT (p≈0.36); shipped as refactor |
+| `ringbuf` histogram (replace VecDeque) | 100–200ns | −373ns p50 | NOISE |
+| `price_eq` (drop abs+epsilon, use exact f64==) | 2ns × N | −288ns p50 | NOISE |
+
+### What we learned about measurement
+
+The original `compare_latency.py` thresholds (1000ns p50 noise floor)
+were sized for the µs-precision histogram era, when integer-truncated µs
+gave ±200% per-arm variance. Neither precision nor threshold survives
+under modern N=100k IPC + N=2.7k TTT samples per 600s run.
+
+After switching the trader histogram to **nanosecond storage**
+(`state.rs::Histograms::ipc_ns` / `ttt_ns`, dump JSON keys `ipc_ns` /
+`ttt_ns`, telemetry print line `_ns` suffix), single-run noise floor at
+TTT p50 is ~280ns. Looked like a credible threshold to gate against.
+
+**It wasn't.** The 280ns "noise" was almost entirely the FIRST run after
+a fresh container — cold-start: cold mimalloc, cold page cache, JIT-
+equivalent warmup in the busy-poll path. After 5 baseline runs:
+
+```
+warm baselines:  [4529, 4537, 4550, 4559]   sd = 13ns,  spread = 30ns
+baseline_1 (cold): 5392ns                                              ← +860ns outlier
+arc_dedup all:   [4302, 4492, 4532, 4599, 4718]   sd = 153ns,  spread = 416ns
+```
+
+Warm-state TTT p50 reproducibility is **±15ns** — order of magnitude
+tighter than I assumed before measuring it. arc_dedup vs warm baselines
+mean Δ = −15ns. arc_dedup's intrinsic spread is 12× warm-baseline's
+spread; the previously-observed single-run wins (−272 to −741ns) were
+the cold-start in baseline drawing into the wrong arm.
+
+### Ship rules going forward
+
+- **Trader histogram is in nanoseconds.** Don't revert to µs without
+  also bumping `compare_latency.py --noise-floor-p50-ns` back to its
+  µs-era default (which is wrong for ns inputs by a factor of 1000).
+  The dashboard reads broker-side `ttt_us` from snapshot — that's a
+  separate measurement and stays in µs.
+- **A single-run A/B at this latency scale is dominated by cold-start
+  noise.** Always do at least 5+5 interleaved runs (use
+  `--image <tag>` flag with two pre-built tags) before claiming a win.
+  Drop the first run of each arm if it's >300ns slower than the rest
+  of the arm — that's the cold-start tell.
+- **Effect sizes need to be ≥45ns p50 (3σ on the warm noise floor)
+  with N=5 each to be detectable.** The four candidates' true effects
+  are below this threshold; conclusions about whether they "work"
+  require either much larger N or microbenchmarks (criterion in
+  `rust/perf_bench/`) that bypass the IPC path.
+- **`arc_dedup` was shipped anyway** as a code-quality refactor: a DRY
+  hoist with no behavior change and zero risk. It does NOT claim a
+  measurable latency win. Future readers should not treat the §17 /
+  §18 "list of optimizations" lineage as having a §21 entry.
+
+### Followup if anyone wants to revisit
+
+Microbench in `rust/perf_bench/` for `decide_on_tick`'s key construction
+loop. That bypasses the IPC + tokio scheduler noise that dominates the
+600s harness. Predicted 5–10ns gain on `arc_dedup` should be cleanly
+visible in a tight criterion benchmark even if it's invisible end-to-end.
