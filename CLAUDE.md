@@ -92,6 +92,7 @@ current operational config.
 | Operational kills (RMSE/latency/fill-rate) | required (§7) | not implemented in Rust runtime | §15 |
 | `quoting.dead_band_ticks` | unspecified | 2 ticks ($0.001 on HG); 20× tighter than legacy paper config | §16 |
 | `hedging.ioc_tick_offset` | unspecified | 4 (bumped 2→4 on 2026-05-04) | §10 |
+| Tiered improving-fill exceptions | tier-1 margin escape + tier-2 per-constraint improving (margin/delta/theta), carried over from `src/constraint_checker.py` | not wired to live order path — trader uses simpler `compute_risk_gates` with only per-side delta blocking; `ConstraintChecker::check()` exists but is dead code | §22 |
 
 ETH is tabled (config products list is HG-only) but the multi-product
 architecture is preserved — re-enabling ETH is a matter of un-commenting
@@ -1295,3 +1296,91 @@ Stop chasing local-path code optimization at the current scale. The
 remaining items in `rust/corsair_broker/` are research-grade
 observations, not actionable optimizations. Moving the actual
 bottleneck requires architectural changes.
+
+## 22. Tiered improving-fill exceptions — preserved in code, not wired (deviation noted 2026-05-07)
+
+The Python predecessor (`src/constraint_checker.py`) had a tiered
+constraint-gating system that allowed quotes/fills to proceed even at
+risk-threshold breach, provided the fill *reduced* the breach:
+
+- **Tier 1 (margin priority escape)**: at `cur_margin > margin_ceiling`,
+  accept any fill where `post_margin < cur_margin` — even if it
+  incidentally drifts delta/theta. Rationale: margin is solvency-
+  critical; small delta/theta drift is operationally recoverable, but
+  a margin breach risks broker-forced liquidation. Margin always
+  takes priority over delta/theta hygiene.
+- **Tier 2 (per-constraint improving)**: at any individual ceiling
+  breach (margin, delta, theta), accept fills that reduce that
+  specific constraint, with sign-flip protection on delta to prevent
+  rotation through zero into the opposite extreme.
+- **Tier 0 (always block)**: hard kills (`margin_kill`, `delta_kill`,
+  `theta_kill`) reject unconditionally, no exceptions.
+
+The Rust port faithfully preserves this in
+`corsair_constraint::ConstraintChecker::check()`
+(`rust/corsair_constraint/src/checker.rs:183-352`), including the
+sign-flip fix from §18. **However, `check()` is never called on the
+live order path.** The trader's `decision::compute_risk_gates`
+(`rust/corsair_trader/src/decision.rs:645`) implements only per-side
+delta blocking at `delta_ceiling`, and ALL-blocks at `margin_ceiling`,
+`theta_kill`, `vega_kill`, `delta_kill`. The constraint instance is
+held in `runtime.constraint` but only used for `ibkr_scale()`
+(snapshot rendering) and `update_cached_margin()` (calibration).
+
+### Operational impact
+
+When the trader hits margin or theta breach, all quoting halts until
+the operator manually unwinds. The original tier-1/tier-2 logic would
+have allowed the bot to self-unwind by accepting only improving fills.
+24h live `risk_block` counter ≈115 events (≈1% of decisions). Real
+gap during pickoff recovery scenarios where margin drifts up; not
+catastrophic.
+
+### Bug noted while documenting (2026-05-07)
+
+`compute_risk_gates` assumes BUY adds delta and SELL subtracts. True
+for CALLS, **false for PUTS** (buying a put subtracts delta, selling
+a put adds delta). At `delta_ceiling` breach, the gate currently
+blocks the wrong side for puts. Latent under the OTM-only short-
+strangle config (puts contribute negative delta on either book
+direction); a future product config that quotes long puts would
+expose it.
+
+### Re-implementation plan (when prioritized)
+
+Two options, increasing scope:
+
+1. **Trader-side per-(right, side, strike) gates with improving
+   exceptions for delta and theta**. Data is already in `theo_cache`
+   modulo exposing theta. Margin improving requires position state
+   from the broker (new IPC field or per-strike publish). ~150 LOC,
+   no broker latency cost.
+2. **Broker-side `ConstraintChecker.check()` wired into
+   `handle_place`** — most faithful to the Python lineage, reuses the
+   existing tested checker. Adds ~1µs to broker TTT for the SPAN math
+   per place (the hot path is already at 27µs broker TTT; this is a
+   ~4% increase). ~50 LOC at the call site plus a small data-flow
+   piece to feed `cur_long_premium` and friends.
+
+Deferred 2026-05-07 because:
+- Latency cost of (2) is unwelcome on the broker hot path; (1)
+  requires non-trivial scoping (per-strike position IPC)
+- Operational impact (~1% block rate) is real but not blocking
+- The §18 history of improving-fill bugs (sign-flip) suggests the
+  feature deserves careful design, not a quick reimplementation
+
+Pre-FIX migration is the natural moment to tackle this — the broker
+hot path gets reorganized then anyway, and the constraint-check call
+can be folded into the new structure cleanly.
+
+### What NOT to do
+
+- **Don't delete `corsair_constraint::ConstraintChecker::check()` as
+  dead code.** It captures the Python algorithm including the
+  sign-flip fix; deleting forfeits years of operational learning.
+  Keep it as the reference implementation pending the wire-up.
+- **Don't "fix" the puts-direction bug in `compute_risk_gates`
+  without re-thinking the whole gate.** A partial fix that makes
+  puts right but doesn't add improving-fill exceptions ships
+  inconsistent semantics. Either do the full §22 work or leave it
+  documented as latent.
