@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::messages::{TickMsg, VolParams};
 use crate::pricing::{black76_price_and_delta, sabr_implied_vol, svi_implied_vol};
 use crate::state::{DecisionCounters, ScalarSnapshot, SharedState};
+use crate::types::FitForward;
 
 // Constants matching Python's src/trader/main.py.
 // 0.25 = ATM + 5 OTM strikes per side (spec §3.3, asym ATM+OTM).
@@ -182,23 +183,26 @@ pub fn decide_on_tick(
             return out;
         }
     };
-    let pricing_forward = vp_msg.forward;
+    let pricing_forward: FitForward = vp_msg.forward;
 
     // Compute risk-gate values once per tick.
     let (risk_buy, risk_sell, risk_all) = compute_risk_gates(&snap, now_monotonic_ns);
 
     // ATM-window restriction — anchored on PRICING forward (Rec 3).
-    if (strike - pricing_forward).abs() > MAX_STRIKE_OFFSET_USD {
+    // `.raw()` boundary: comparison is against the f64 value of the
+    // fit-time forward; the type wrapper has done its job once we know
+    // we're using `pricing_forward` rather than current spot.
+    if (strike - pricing_forward.raw()).abs() > MAX_STRIKE_OFFSET_USD {
         counters.skip_off_atm.fetch_add(1, Ordering::Relaxed);
         return out;
     }
 
     // OTM-only restriction (CLAUDE.md §12) — anchored on PRICING forward.
-    if r_char == 'C' && strike < pricing_forward - ATM_TOL_USD {
+    if r_char == 'C' && strike < pricing_forward.raw() - ATM_TOL_USD {
         counters.skip_itm.fetch_add(1, Ordering::Relaxed);
         return out;
     }
-    if r_char == 'P' && strike > pricing_forward + ATM_TOL_USD {
+    if r_char == 'P' && strike > pricing_forward.raw() + ATM_TOL_USD {
         counters.skip_itm.fetch_add(1, Ordering::Relaxed);
         return out;
     }
@@ -285,7 +289,7 @@ pub fn decide_on_tick(
     // from the comparison and changes the gate's semantics in a
     // direction-asymmetric way that can mask stale-fit conditions.
     // See audits/sections-16-19-audit.md §1.4.
-    let drift = (spot - pricing_forward).abs();
+    let drift = (spot - pricing_forward.raw()).abs();
     let max_drift = MAX_FORWARD_DRIFT_TICKS as f64 * snap.tick_size;
     if drift > max_drift {
         counters.skip_forward_drift.fetch_add(1, Ordering::Relaxed);
@@ -352,7 +356,7 @@ pub fn decide_on_tick(
     // Bounded below at 1¢ (mirrors Python). Gamma curvature dominates
     // beyond ~50 ticks of drift; the MAX_FORWARD_DRIFT_TICKS gate
     // upstream catches that regime so this stays a safe first-order.
-    let theo = (theo_at_fit + delta_at_fit * (spot - vp_msg.spot_at_fit)).max(0.01);
+    let theo = (theo_at_fit + delta_at_fit * (spot - vp_msg.spot_at_fit.raw())).max(0.01);
 
     // Bid/ask + sizes for the dark-book guards.
     let raw_bid = tick.bid.unwrap_or(0.0);
@@ -727,18 +731,21 @@ pub fn compute_risk_gates(snap: &ScalarSnapshot, now_monotonic_ns: u64) -> (bool
 /// MUCH less than put price), making us SELL puts BELOW the bid
 /// and BUY puts ABOVE the ask.
 pub fn compute_theo(
-    forward: f64,
+    forward: FitForward,
     strike: f64,
     tte: f64,
     right: char,
     params: &VolParams,
 ) -> Option<(f64, f64, f64)> {
-    if forward <= 0.0 || strike <= 0.0 || tte <= 0.0 {
+    // `.raw()` boundary: we have a typed FitForward, the call site
+    // chose it deliberately. From here, pricing math is pure-f64.
+    let f = forward.raw();
+    if f <= 0.0 || strike <= 0.0 || tte <= 0.0 {
         return None;
     }
     let iv = match params.model.as_str() {
         "svi" => svi_implied_vol(
-            forward,
+            f,
             strike,
             tte,
             params.a?,
@@ -748,7 +755,7 @@ pub fn compute_theo(
             params.sigma?,
         ),
         "sabr" => sabr_implied_vol(
-            forward,
+            f,
             strike,
             tte,
             params.alpha?,
@@ -761,7 +768,7 @@ pub fn compute_theo(
     if iv <= 0.0 || iv.is_nan() {
         return None;
     }
-    let (theo, delta) = black76_price_and_delta(forward, strike, tte, iv, 0.0, right);
+    let (theo, delta) = black76_price_and_delta(f, strike, tte, iv, 0.0, right);
     if theo <= 0.0 {
         return None;
     }
@@ -833,7 +840,7 @@ mod tests {
         state.vol_surfaces.insert(
             (expiry_arc, side),
             Arc::new(VolSurfaceEntry {
-                forward: 6.0,
+                forward: crate::types::FitForward(6.0),
                 params: VolParams {
                     model: "svi".to_string(),
                     a: Some(0.005),
@@ -855,7 +862,7 @@ mod tests {
                 // so existing tests continue to assert against fit-frozen
                 // theo, isolating each gate. The Taylor-specific test
                 // exercises a non-zero (spot − spot_at_fit) explicitly.
-                spot_at_fit: 6.0,
+                spot_at_fit: crate::types::SpotAtFit(6.0),
             }),
         );
     }
