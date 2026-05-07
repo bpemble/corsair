@@ -233,7 +233,9 @@ print(f'  Tail events (>1ms) inside capture window: {len(tail_events)}')
 for td, lat, oid, side, strike in tail_events:
     import datetime
     dt = datetime.datetime.fromtimestamp(td/1e9)
-    print(f'    {dt.strftime(\"%H:%M:%S.%f\")[:-3]}  oid={oid}  {side} K={strike:.3f}  tick→decide={lat:.0f}us')
+    side_s = side if side is not None else '?'
+    strike_s = f'{strike:.3f}' if strike is not None else '?'
+    print(f'    {dt.strftime(\"%H:%M:%S.%f\")[:-3]}  oid={oid}  {side_s} K={strike_s}  tick→decide={lat:.0f}us')
 "
     else
         echo "  (no wire_timing-${DAY}.jsonl found)"

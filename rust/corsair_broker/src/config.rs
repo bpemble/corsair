@@ -253,6 +253,14 @@ impl BrokerDaemonConfig {
         if self.products.is_empty() {
             return Err(ConfigError::Validation("at least one product required".into()));
         }
+        if !self.products.iter().any(|p| p.enabled) {
+            // All products disabled would silently boot a broker with
+            // zero quoting instruments — operationally visible only via
+            // the absence of subscriptions. Audit round 2.
+            return Err(ConfigError::Validation(
+                "at least one product must be enabled".into(),
+            ));
+        }
         if self.broker.kind != "ibkr" && self.broker.kind != "ilink" {
             return Err(ConfigError::Validation(format!(
                 "broker.kind must be 'ibkr' or 'ilink', got {}",
@@ -393,5 +401,17 @@ hedging:
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(bad.as_bytes()).unwrap();
         assert!(BrokerDaemonConfig::load(f.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_all_products_disabled() {
+        let bad = SAMPLE_YAML.replace("enabled: true", "enabled: false");
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(bad.as_bytes()).unwrap();
+        let err = BrokerDaemonConfig::load(f.path())
+            .err()
+            .expect("expected validation error");
+        let msg = format!("{err}");
+        assert!(msg.contains("enabled"), "got: {msg}");
     }
 }

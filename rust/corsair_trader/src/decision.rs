@@ -789,6 +789,16 @@ pub fn compute_risk_gates(
 /// included for clarity and so that a future "improving by ≥ N%"
 /// extension lands cleanly.
 pub fn improving_passes(g: &RiskGates, _right: char, side: Side, gx: TheoGreeks) -> bool {
+    // Fail-closed on non-finite greeks. NaN/Inf comparisons silently
+    // return false, so the `theta_change <= 0.0` and
+    // `(dir as f64) * delta_change > 0.0` checks below would FALL
+    // THROUGH on NaN and incorrectly allow the order. Reject when any
+    // gate-relevant greek is non-finite. compute_theo's upstream
+    // `iv.is_nan()` check catches the input case but defense-in-depth
+    // protects against any future cache-fill path that bypasses it.
+    if !gx.theta.is_finite() || !gx.delta.is_finite() {
+        return false;
+    }
     let qty_signed = if side == Side::Buy { 1.0 } else { -1.0 };
     if g.theta_breach {
         // Portfolio theta < theta_kill (too negative). Need post-fill
@@ -868,7 +878,15 @@ pub fn compute_theo(
         return None;
     }
     let g = crate::pricing::black76_greeks(forward, strike, tte, iv, 0.0, right);
-    if g.price <= 0.0 {
+    // `<= 0.0` doesn't catch NaN (NaN comparisons are false). Make
+    // this fail-closed on any non-finite greek so `improving_passes`
+    // never sees NaN cached values; delta is the Taylor reprice
+    // anchor, theta + vega drive improving-only gates.
+    if !(g.price > 0.0)
+        || !g.delta.is_finite()
+        || !g.theta.is_finite()
+        || !g.vega.is_finite()
+    {
         return None;
     }
     Some((iv, TheoGreeks {

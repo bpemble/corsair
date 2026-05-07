@@ -146,7 +146,14 @@ pub fn sabr_implied_vol(
     let xz = if z.abs() < EPS {
         1.0
     } else {
-        let sqrt_term = (1.0 - 2.0 * rho * z + z * z).sqrt();
+        // Mirror §18 corsair_pricing fix: clamp the radicand at 0
+        // before sqrt. With rho near ±1 and large |z| (extreme
+        // out-of-fit-range strikes), floating arithmetic can produce
+        // a tiny-negative argument and `sqrt` returns NaN, which then
+        // propagates through. Clamp here so the function never
+        // returns NaN from the radicand.
+        let radicand = (1.0 - 2.0 * rho * z + z * z).max(0.0);
+        let sqrt_term = radicand.sqrt();
         z / ((sqrt_term + z - rho) / (1.0 - rho)).ln()
     };
 
@@ -158,7 +165,17 @@ pub fn sabr_implied_vol(
     let p1 = one_minus_beta_sq / 24.0 * alpha_sq / fk.powf(one_minus_beta);
     let p2 = 0.25 * rho * beta * nu * alpha / fk_beta;
 
-    (alpha / denom1) * xz * (1.0 + (p1 + p2 + p3) * t)
+    let result = (alpha / denom1) * xz * (1.0 + (p1 + p2 + p3) * t);
+    // Mirror §18: if any intermediate term went non-finite (NaN/inf),
+    // fall back to alpha (the ATM short-leg vol) as a conservative
+    // substitute. compute_theo's `iv.is_nan()` check will still bail
+    // out the call on NaN, but a finite fallback gives the gate a
+    // sane default for the rare valid-but-degenerate inputs.
+    if result.is_finite() && result > 0.0 {
+        result
+    } else {
+        alpha.max(0.001)
+    }
 }
 
 /// SVI raw total variance. Mirrors svi_total_variance in src/sabr.py.

@@ -923,6 +923,28 @@ async fn handle_cancel(runtime: &Arc<Runtime>, body: &[u8]) {
         log::info!("ipc cancel_order (SHADOW; not cancelling): order_id={}", cmd.order_id);
         return;
     }
+    // Stale-cancel short-circuit (2026-05-07). If pump_status has already
+    // observed a terminal status for this orderId, dispatching to IBKR
+    // would just hit code 104/106 and burn the 500ms ack timeout. Drop
+    // locally and bump the counter — the trader's our_orders entry will
+    // be cleared by its own order_status handler on the same status
+    // event we recorded. See runtime.rs::recently_terminated and
+    // CLAUDE.md §22-style stale-amend behavior.
+    if runtime
+        .recently_terminated
+        .lock()
+        .unwrap()
+        .contains_key(&OrderId(cmd.order_id))
+    {
+        runtime
+            .stale_cancel_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::debug!(
+            "ipc cancel_order: dropping stale (orderId={}) — already terminal",
+            cmd.order_id
+        );
+        return;
+    }
     let result = {
         let b = runtime.broker.clone();
         b.cancel_order(OrderId(cmd.order_id)).await
@@ -943,6 +965,46 @@ async fn handle_modify(runtime: &Arc<Runtime>, body: &[u8]) {
     };
     if matches!(runtime.mode, crate::runtime::RuntimeMode::Shadow) {
         log::info!("ipc modify_order (SHADOW; not modifying): order_id={}", cmd.order_id);
+        return;
+    }
+    // Stale-modify short-circuit (2026-05-07). See `handle_cancel` for
+    // the same pattern. Writes a synthetic wire_timing row with
+    // outcome="rejected_stale" so the dashboard / log analysis sees the
+    // dropped command, but skips the IBKR round-trip + 500ms ack timeout
+    // that was producing multi-ms tail events in tick→trader_decide
+    // when fills raced trader amends.
+    if runtime
+        .recently_terminated
+        .lock()
+        .unwrap()
+        .contains_key(&OrderId(cmd.order_id))
+    {
+        runtime
+            .stale_modify_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = now_ns();
+        let row = serde_json::json!({
+            "schema": "wire_timing/v2",
+            "kind": "modify",
+            "ts_ns": now,
+            "outcome": "rejected_stale",
+            "order_id": cmd.order_id,
+            "price": cmd.price,
+            "triggering_tick_broker_recv_ns": cmd.triggering_tick_broker_recv_ns,
+            "trader_decide_ts_ns": cmd.ts_ns,
+            "broker_order_recv_ns": broker_order_recv_ns,
+            "broker_order_send_ns": now,
+            "broker_order_ack_ns": now,
+            "broker_order_send_marker_ns": now,
+            "broker_order_ack_marker_ns": now,
+            "send_ns_precise": false,
+            "ack_ns_precise": false,
+        });
+        runtime.wire_timing.write(row);
+        log::debug!(
+            "ipc modify_order: dropping stale (orderId={}) — already terminal",
+            cmd.order_id
+        );
         return;
     }
     let req = ModifyOrderReq {

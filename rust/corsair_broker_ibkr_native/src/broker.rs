@@ -1356,11 +1356,16 @@ impl Broker for NativeBroker {
         }
 
         // Wait briefly for OpenOrder ack OR Error rejection. IBKR is
-        // typically <100ms for the first response. Beyond 2s we
-        // assume the gateway is wedged and surface a timeout — caller
-        // can retry. CLAUDE.md doesn't pin this latency; 2s is the
-        // same conservative budget the Python broker used.
-        match tokio::time::timeout(Duration::from_secs(2), rx).await {
+        // typically <100ms for the first response; place_rtt p99 ~1s
+        // under healthy conditions per `wire_timing` analysis. 500ms
+        // covers steady-state with margin while capping the worst-case
+        // stall when the recently_terminated cache misses (orderId
+        // terminated within the last few µs but pump_status hasn't
+        // run yet). Reduced from 2s 2026-05-07 in conjunction with
+        // the broker-side terminal cache — see
+        // `corsair_broker::runtime::Runtime::recently_terminated`
+        // and `docs/HANDOFF_LATENCY_LEDGER.md` §3.2.
+        match tokio::time::timeout(Duration::from_millis(500), rx).await {
             Ok(Ok(Ok(()))) => Ok(OrderId(order_id as u64)),
             Ok(Ok(Err(broker_err))) => Err(broker_err),
             Ok(Err(_dropped)) => Err(BrokerError::Internal(
@@ -1528,12 +1533,14 @@ impl Broker for NativeBroker {
             return Err(Self::map_native_err(e));
         }
 
-        // Permissive 2s wait — same shape as place_order. The
-        // dispatcher resolves on any accept-state signal. The honest
-        // amend RTT (if any) is observed separately by the
-        // dispatcher via `strict_ack_ns` and exposed through
-        // `drain_strict_amend_us`.
-        match tokio::time::timeout(Duration::from_secs(2), rx).await {
+        // 500ms wait — same shape as place_order. The dispatcher
+        // resolves on any accept-state signal. The honest amend RTT
+        // (if any) is observed separately by the dispatcher via
+        // `strict_ack_ns` and exposed through `drain_strict_amend_us`.
+        // Reduced from 2s 2026-05-07 alongside the broker-side
+        // recently_terminated cache; see place_order above for the
+        // rationale.
+        match tokio::time::timeout(Duration::from_millis(500), rx).await {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(broker_err))) => Err(broker_err),
             Ok(Err(_dropped)) => Err(BrokerError::Internal(
@@ -1821,6 +1828,11 @@ impl Broker for NativeBroker {
     async fn subscribe_ticks(&self, sub: TickSubscription) -> BResult<TickStreamHandle> {
         let req_id = self.alloc_req_id();
         let handle = self.alloc_handle();
+        // Insert routing state BEFORE the send so any inbound tick
+        // arriving on this req_id is dispatchable. On send failure we
+        // unwind the state below — without that cleanup, the maps
+        // accumulate orphan entries on every TCP write error.
+        // Audit round 2.
         {
             let mut s = self.state.lock();
             s.tick_routes.insert(req_id, sub.instrument_id);
@@ -1852,10 +1864,13 @@ impl Broker for NativeBroker {
         // Without this list, reqMktData only returns BBO + last —
         // dashboard shows blank OI/volume columns.
         let frame = req_mkt_data(req_id, &cr, "100,101", false, false);
-        self.client
-            .send_raw(&frame)
-            .await
-            .map_err(Self::map_native_err)?;
+        if let Err(e) = self.client.send_raw(&frame).await {
+            let mut s = self.state.lock();
+            s.tick_routes.remove(&req_id);
+            s.tick_route_right.remove(&req_id);
+            s.handle_to_req_id.remove(&handle);
+            return Err(Self::map_native_err(e));
+        }
         Ok(handle)
     }
 
@@ -1865,6 +1880,10 @@ impl Broker for NativeBroker {
             let req_id = s.handle_to_req_id.remove(&h);
             if let Some(rid) = req_id {
                 s.tick_routes.remove(&rid);
+                // Audit round 2: drop the option-Right entry too.
+                // Previously leaked, accumulating across long-running
+                // sessions that rotate strike subscriptions.
+                s.tick_route_right.remove(&rid);
             }
             req_id
         };
@@ -1896,10 +1915,12 @@ impl Broker for NativeBroker {
         };
         cr.con_id = sub.instrument_id.0 as i64;
         let frame = req_mkt_depth(req_id, &cr, num_rows);
-        self.client
-            .send_raw(&frame)
-            .await
-            .map_err(Self::map_native_err)?;
+        if let Err(e) = self.client.send_raw(&frame).await {
+            let mut s = self.state.lock();
+            s.depth_routes.remove(&req_id);
+            s.handle_to_depth_req_id.remove(&handle);
+            return Err(Self::map_native_err(e));
+        }
         Ok(handle)
     }
 

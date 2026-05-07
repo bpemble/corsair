@@ -42,8 +42,64 @@ pub fn spawn_all(runtime: Arc<Runtime>) -> Vec<tokio::task::JoinHandle<()>> {
     handles.push(tokio::spawn(daily_halt_rollover(runtime.clone())));
     handles.push(tokio::spawn(periodic_tick_type_hist(runtime.clone())));
     handles.push(tokio::spawn(trader_watchdog(runtime.clone())));
+    handles.push(tokio::spawn(periodic_terminated_evict(runtime.clone())));
 
     handles
+}
+
+/// TTL for entries in `Runtime::recently_terminated`. 60s is far longer
+/// than any plausible window between a terminal status arriving and the
+/// trader queueing a doomed amend (the trader removes the orderId from
+/// its own state on terminal-status receipt, so by 60s out it cannot
+/// retry against a stale id under any realistic IPC delay). Sized to
+/// bound memory at <500 entries even under heavy fill churn.
+const RECENTLY_TERMINATED_TTL_NS: u64 = 60_000_000_000;
+
+/// Periodically evict aged-out entries from `recently_terminated` so
+/// the cache doesn't grow unbounded across a long session. Cadence is
+/// 10s — well below the TTL, so worst-case memory overshoot is one
+/// session's worth of fills/cancels in a 10s window. Each entry is
+/// 8 bytes (OrderId u64) + 8 bytes (ts_ns) + map overhead = ~32 bytes,
+/// so even 10k orderIds is ~320 KB — bounded.
+async fn periodic_terminated_evict(runtime: Arc<Runtime>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut prev_modify: u64 = 0;
+    let mut prev_cancel: u64 = 0;
+    loop {
+        interval.tick().await;
+        let now = crate::time::now_ns();
+        let (size, evicted) = {
+            let mut map = runtime.recently_terminated.lock().unwrap();
+            let before = map.len();
+            map.retain(|_, ts| now.saturating_sub(*ts) < RECENTLY_TERMINATED_TTL_NS);
+            (map.len(), before.saturating_sub(map.len()))
+        };
+        let mod_total = runtime
+            .stale_modify_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let cncl_total = runtime
+            .stale_cancel_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mod_delta = mod_total.saturating_sub(prev_modify);
+        let cncl_delta = cncl_total.saturating_sub(prev_cancel);
+        prev_modify = mod_total;
+        prev_cancel = cncl_total;
+        // Only emit when interesting (cache non-empty, dropped this
+        // window, or evictions happened) — keeps quiet sessions quiet.
+        if size > 0 || evicted > 0 || mod_delta > 0 || cncl_delta > 0 {
+            log::info!(
+                "recently_terminated: size={} evicted_10s={} stale_modify_10s={} \
+                 stale_cancel_10s={} (totals: mod={} cncl={})",
+                size,
+                evicted,
+                mod_delta,
+                cncl_delta,
+                mod_total,
+                cncl_total
+            );
+        }
+    }
 }
 
 /// §25 trader watchdog. 1Hz check that the trader is still emitting
@@ -333,6 +389,19 @@ async fn pump_status(runtime: Arc<Runtime>) {
                         !seen.insert(update.order_id)
                     }
                 };
+                // Record terminal orderIds so handle_modify / handle_cancel
+                // can short-circuit on stale targets — eliminates the IBKR
+                // round-trip + 2s ack timeout that previously stalled the
+                // broker pipeline when fills/cancels raced trader-side
+                // amends. Fix shipped 2026-05-07; see
+                // `docs/HANDOFF_LATENCY_LEDGER.md` §3.2.
+                if terminal {
+                    runtime
+                        .recently_terminated
+                        .lock()
+                        .unwrap()
+                        .insert(update.order_id, crate::time::now_ns());
+                }
                 if !already_seen {
                     log::debug!(
                         "status update for unknown orderId {}: {:?}",
@@ -1330,6 +1399,8 @@ fn build_chain_payload(
             use corsair_broker_api::OrderStatus;
             let mut our_bid: Option<f64> = None;
             let mut our_ask: Option<f64> = None;
+            let mut our_bid_qty: u64 = 0;
+            let mut our_ask_qty: u64 = 0;
             let mut bid_live = false;
             let mut ask_live = false;
             for o in open_orders.iter().filter(|o| {
@@ -1346,13 +1417,20 @@ fn build_chain_payload(
                     // = gateway-accepted but exchange not yet confirmed
                     // (yellow on the dashboard).
                     let live = matches!(o.status, OrderStatus::Submitted);
+                    // remaining_qty after partial fills, not original qty.
+                    // Production places qty=1 (CLAUDE.md §17) so the two
+                    // are equal in practice, but threading remaining_qty
+                    // keeps the L2-strip correct for any future multi-lot.
+                    let qty = o.remaining_qty as u64;
                     match o.side {
                         Side::Buy => {
                             our_bid = Some(p);
+                            our_bid_qty = qty;
                             bid_live = live;
                         }
                         Side::Sell => {
                             our_ask = Some(p);
+                            our_ask_qty = qty;
                             ask_live = live;
                         }
                     }
@@ -1365,8 +1443,12 @@ fn build_chain_payload(
             // we're inside the spread or matching it. Falls back to
             // raw L1 (= 0.0) on strikes outside the L2-rotator window;
             // dashboard's `_fmt_side` then displays raw_bid/raw_ask.
-            let ext_bid = opt.depth.external_best_bid(our_bid, 1);
-            let ext_ask = opt.depth.external_best_ask(our_ask, 1);
+            // Pass our actual resting qty so the depth filter doesn't
+            // assume 1-lot. Production currently quotes 1-lot
+            // (CLAUDE.md §17), but threading the real qty here keeps
+            // the L2-strip math correct if multi-lot ships later.
+            let ext_bid = opt.depth.external_best_bid(our_bid, our_bid_qty);
+            let ext_ask = opt.depth.external_best_ask(our_ask, our_ask_qty);
             let side = SideBlockSnapshot {
                 market_bid: if ext_bid > 0.0 { ext_bid } else { opt.bid },
                 market_ask: if ext_ask > 0.0 { ext_ask } else { opt.ask },

@@ -84,6 +84,34 @@ pub struct Runtime {
     /// clientIds on the FA-master clientId=0 connection. Inlined
     /// 2026-05-07 from the retired `corsair_oms` crate.
     pub seen_orders: Mutex<std::collections::HashSet<corsair_broker_api::OrderId>>,
+
+    /// OrderIds that hit a terminal status (Filled/Cancelled/Rejected/
+    /// Inactive). Inserted by `pump_status`; consulted by
+    /// `handle_modify` and `handle_cancel` to drop stale operations
+    /// locally instead of round-tripping to IBKR for a known-failing
+    /// command. The IBKR error path on a terminated order is "code 104
+    /// Cannot modify a filled order" + 2s ack timeout, which under
+    /// live load (a few fills per minute on a single-pumped task)
+    /// produces multi-ms tail events in tick→trader_decide.
+    ///
+    /// Value is the terminal `now_ns()` timestamp; entries are evicted
+    /// after `RECENTLY_TERMINATED_TTL_NS` (60s) by
+    /// `periodic_terminated_evict` in `tasks.rs`. Cache hits bump
+    /// `stale_modify_dropped` / `stale_cancel_dropped` so telemetry
+    /// can surface the rate.
+    ///
+    /// Added 2026-05-07 — see `docs/HANDOFF_LATENCY_LEDGER.md` §3.2
+    /// for the diagnosis. IBKR doesn't reuse OrderIds within a
+    /// session, so there's no false-positive risk on a fresh order
+    /// landing on a previously-terminal id.
+    pub recently_terminated:
+        Mutex<std::collections::HashMap<corsair_broker_api::OrderId, u64>>,
+    /// Cache hits — modify_order dropped because target was already
+    /// terminal. Bumped from `handle_modify`. Surfaced in broker
+    /// telemetry alongside other counters.
+    pub stale_modify_dropped: std::sync::atomic::AtomicU64,
+    /// Same as above for cancel_order.
+    pub stale_cancel_dropped: std::sync::atomic::AtomicU64,
     pub market_data: Mutex<MarketDataState>,
     pub snapshot: Mutex<SnapshotPublisher>,
 
@@ -275,6 +303,9 @@ impl Runtime {
             constraint: Mutex::new(constraint),
             hedge: Mutex::new(hedge),
             seen_orders: Mutex::new(std::collections::HashSet::new()),
+            recently_terminated: Mutex::new(std::collections::HashMap::new()),
+            stale_modify_dropped: std::sync::atomic::AtomicU64::new(0),
+            stale_cancel_dropped: std::sync::atomic::AtomicU64::new(0),
             market_data: Mutex::new(market_data),
             snapshot: Mutex::new(snapshot),
             qualified_contracts: Mutex::new(std::collections::HashMap::new()),

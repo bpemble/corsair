@@ -483,8 +483,15 @@ pub fn calibrate_svi(
         [atm_var * 0.3, 0.2, -0.5, 0.0, 0.6],
     ];
 
-    let lb = [0.0_f64, 0.0001, -0.999, -1.0, 0.0001];
-    let ub = [5.0_f64, 5.0, 0.999, 1.0, 2.0];
+    // Audit round 2: tighten SVI rho bound to ±0.99 to match the SABR
+    // calibrator (commit 6807447, §18). SVI's xz formula doesn't have
+    // the SABR `1/(1-rho)` divergence, but at |rho|=0.999 Gatheral's
+    // no-arbitrage condition `b*(1+|rho|) ≤ 4/T` gets harder to
+    // satisfy and degenerate fits become more likely. ±0.99 gives
+    // the LM headroom without crowding the constraint, keeping the
+    // bound consistent across SABR and SVI.
+    let lb = [0.0_f64, 0.0001, -0.99, -1.0, 0.0001];
+    let ub = [5.0_f64, 5.0, 0.99, 1.0, 2.0];
 
     let mkt = market_ivs.to_vec();
     let w_local = w.clone();

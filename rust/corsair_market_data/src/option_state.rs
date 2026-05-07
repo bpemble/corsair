@@ -64,16 +64,22 @@ impl DepthBook {
         let pos = position as usize;
         match op {
             0 => {
-                // Insert: only valid if pos <= book.len() and book
-                // hasn't already hit max depth (5 levels).
-                if pos <= book.len() && book.len() < 5 {
-                    book.insert(pos, DepthLevel { price, size });
-                } else if pos == book.len() && book.len() == 5 {
-                    // Special case: insert at tail when full evicts oldest.
-                    book.pop();
-                    book.push(DepthLevel { price, size });
+                // IBKR L2 spec: insert a new level at `position`;
+                // existing levels at and below shift down. On a full
+                // book (5 levels), the deepest falls off the end.
+                //
+                // Pre-2026-05-07: only insert-at-tail (`pos == 5`) was
+                // handled when the book was full; insert at pos < 5 on
+                // a full book silently dropped the update — losing new
+                // best-bid arrivals during fast moves. Audit round 2.
+                if pos > 5 {
+                    return; // genuinely out of range
                 }
-                // else: pathological; drop.
+                if book.len() == 5 {
+                    book.pop();
+                }
+                let target = pos.min(book.len());
+                book.insert(target, DepthLevel { price, size });
             }
             1 => {
                 if pos < book.len() {
@@ -152,5 +158,83 @@ impl OptionTick {
     /// mid → last → 0.
     pub fn current_price(&self) -> f64 {
         self.mid().unwrap_or(if self.last > 0.0 { self.last } else { 0.0 })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn full_bid_book() -> DepthBook {
+        let mut b = DepthBook::default();
+        // Build a 5-level bid book descending: 100..96.
+        for (i, p) in [100.0, 99.0, 98.0, 97.0, 96.0].iter().enumerate() {
+            b.apply(true, i as i32, 0, *p, 10);
+        }
+        b
+    }
+
+    #[test]
+    fn insert_top_on_full_book_evicts_deepest() {
+        let mut b = full_bid_book();
+        // New best bid at 101 → insert at pos=0 → 96.0 should fall off.
+        b.apply(true, 0, 0, 101.0, 5);
+        assert_eq!(b.bids.len(), 5);
+        assert_eq!(b.bids[0].price, 101.0);
+        assert_eq!(b.bids[0].size, 5);
+        assert_eq!(b.bids[4].price, 97.0);
+    }
+
+    #[test]
+    fn insert_middle_on_full_book_evicts_deepest() {
+        let mut b = full_bid_book();
+        // Insert at pos=2 (between 99 and 98): shift 98,97,96 down,
+        // drop 96. Result: 100, 99, NEW, 98, 97.
+        b.apply(true, 2, 0, 98.5, 7);
+        assert_eq!(b.bids.len(), 5);
+        assert_eq!(b.bids[2].price, 98.5);
+        assert_eq!(b.bids[3].price, 98.0);
+        assert_eq!(b.bids[4].price, 97.0);
+    }
+
+    #[test]
+    fn insert_partial_book_grows() {
+        let mut b = DepthBook::default();
+        b.apply(true, 0, 0, 100.0, 1);
+        b.apply(true, 1, 0, 99.0, 2);
+        assert_eq!(b.bids.len(), 2);
+        assert_eq!(b.bids[1].price, 99.0);
+    }
+
+    #[test]
+    fn out_of_range_insert_dropped() {
+        let mut b = DepthBook::default();
+        b.apply(true, 6, 0, 100.0, 1); // pos > 5 — drop
+        assert!(b.bids.is_empty());
+    }
+
+    #[test]
+    fn delete_shifts_up() {
+        let mut b = full_bid_book();
+        b.apply(true, 1, 2, 0.0, 0); // delete pos=1 (99.0)
+        assert_eq!(b.bids.len(), 4);
+        assert_eq!(b.bids[0].price, 100.0);
+        assert_eq!(b.bids[1].price, 98.0);
+    }
+
+    #[test]
+    fn external_best_skips_our_full_size() {
+        let b = full_bid_book(); // top: 100 size 10
+        // Our resting bid at 100 size 10 — the level is all ours.
+        let ext = b.external_best_bid(Some(100.0), 10);
+        assert_eq!(ext, 99.0);
+    }
+
+    #[test]
+    fn external_best_keeps_partial_external() {
+        let b = full_bid_book(); // top: 100 size 10
+        // Our resting bid is 1; external owns 9 of the 10 lots.
+        let ext = b.external_best_bid(Some(100.0), 1);
+        assert_eq!(ext, 100.0);
     }
 }
