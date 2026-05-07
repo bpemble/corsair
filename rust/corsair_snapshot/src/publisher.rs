@@ -240,6 +240,23 @@ impl SnapshotPublisher {
         self.last_write_count += 1;
         Ok(())
     }
+
+    /// Lock-free disk write of an already-built `Snapshot`. Caller is
+    /// expected to have built `snap` while holding the relevant
+    /// portfolio/risk/hedge/market_data locks, dropped them, and only
+    /// THEN called this function. Splits the publish path so JSON
+    /// serialization + disk write happen outside the locks — without
+    /// this split, `periodic_snapshot` (4 Hz) was holding `market_data`
+    /// across `f.sync_all()` and stalling the tick fast path's
+    /// `tick_publisher` closure for the duration of the fsync, driving
+    /// trader-side TTT p99 to ~11 ms (audit round 3, 2026-05-07).
+    pub fn write_built(&mut self, snap: &Snapshot) -> std::io::Result<()> {
+        let json = serde_json::to_vec_pretty(snap)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        atomic_write(&self.cfg.snapshot_path, &json)?;
+        self.last_write_count += 1;
+        Ok(())
+    }
 }
 
 fn now_ns() -> u64 {
@@ -294,7 +311,15 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
-        f.sync_all()?;
+        // No `f.sync_all()` — atomicity for the dashboard reader comes
+        // from the `rename` below (POSIX rename is atomic across
+        // open()s). fsync would force a disk flush before rename and
+        // routinely takes 5-15 ms on the host volume; under the locks
+        // held by `periodic_snapshot` (4 Hz) that stall blocked the
+        // broker's tick-publish fast path and drove trader TTT p99 to
+        // ~11 ms. The snapshot is a regenerable observational artifact
+        // — on power loss the next 250 ms tick rewrites it.
+        // Audit round 3, 2026-05-07.
     }
     std::fs::rename(&tmp, path)?;
     Ok(())

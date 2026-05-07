@@ -1196,16 +1196,36 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
                 None
             }
         };
-        let result = {
+        // Audit round 3 (2026-05-07): split build (under locks) from
+        // disk write (lock-free). Previously this scope held all four
+        // state locks across `s.publish(...)` which performed JSON
+        // serialize + `fsync` + rename SYNCHRONOUSLY. The fsync
+        // routinely took 5-15 ms on the host volume; while it ran, the
+        // tick_publisher closure (corsair_broker::ipc:148) was blocked
+        // on `market_data.lock()` for every inbound IBKR tick, driving
+        // trader-side TTT p99 to ~11 ms with ~5 outliers per 150 s
+        // window (one per snapshot whose fsync collided with a tick).
+        // Now: build the in-memory `Snapshot` under locks (CPU-only,
+        // ~50–200 µs), drop the locks, then serialize+write outside
+        // (no other task contends for `snapshot` so its lock is brief).
+        let snap = {
             let p = runtime.portfolio.lock().unwrap();
             let r = runtime.risk.lock().unwrap();
             let h = runtime.hedge.lock().unwrap();
             let md = runtime.market_data.lock().unwrap();
             let chain_build = build_chain_payload(&runtime, &md, &p, &open_orders_snapshot);
-            let mut s = runtime.snapshot.lock().unwrap();
-            s.publish(&p, &r, &h, &*md, acct_payload, chain_build, latency_snapshot)
+            let s = runtime.snapshot.lock().unwrap();
+            s.build(&p, &r, &h, &*md, acct_payload, chain_build, latency_snapshot)
         };
-        if let Err(e) = result {
+        // Locks dropped — disk write happens here without blocking
+        // the tick fast path. fsync was also removed from atomic_write
+        // (atomicity preserved by rename); see corsair_snapshot
+        // publisher.rs.
+        let write_res = {
+            let mut s = runtime.snapshot.lock().unwrap();
+            s.write_built(&snap)
+        };
+        if let Err(e) = write_res {
             log::warn!("snapshot publish failed: {e}");
         }
     }
