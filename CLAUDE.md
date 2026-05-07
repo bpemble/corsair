@@ -91,7 +91,6 @@ current operational config.
 | Hedge near-expiry lockout | 7 days (shared with options engine) | 30 days (hedge-specific knob added 2026-05-01) | §10 |
 | Operational kills (RMSE/latency/fill-rate) | required (§7) | not implemented in Rust runtime | §15 |
 | `quoting.dead_band_ticks` | unspecified | 2 ticks ($0.001 on HG); 20× tighter than legacy paper config | §16 |
-| `hedging.ioc_tick_offset` | unspecified | 4 (bumped 2→4 on 2026-05-04) | §10 |
 | Tiered improving-fill exceptions | tier-1 margin escape + tier-2 per-constraint improving (margin/delta/theta), carried over from `src/constraint_checker.py` | margin = hard halt (no improving exception); theta = improving-only via trader (§25); delta_kill removed (hedge owns it) | §22, §25 |
 | Strategy-kill controller | broker-side risk_monitor fires delta/theta/vega kills | trader-centric: improving-only gates in `compute_risk_gates`, broker keeps only operational + margin + daily_pnl + new `trader_silent` watchdog | §25 |
 
@@ -1685,3 +1684,152 @@ they're infrastructure responses, not strategy policy.
   exactly where the place/modify decision is being made. Adding
   it elsewhere (e.g. staleness loop) would either re-block
   already-resting orders (operator-confusing) or no-op.
+
+## 26. Audit passes 2026-05-07 — 25 fixes across the workspace
+
+Two back-to-back code-quality audit passes shipped 2026-05-07.
+Round 1 (commit `9e5acb9`): 12 fixes. Round 2 (commit `8d7a0a9`):
+13 fixes plus the `recently_terminated` cache. Most are small but
+the load-bearing items below have permanent operator-relevant
+behavior.
+
+### Round 1 (commit 9e5acb9)
+
+**Correctness — silent directional faults**:
+- `corsair_broker::ipc::handle_place` now drops + WARNs on empty
+  `right` or non-`"BUY"`/`"SELL"` `side` instead of silently
+  bucketing as 'C' / Sell. Previously the catch-all clauses would
+  flip direction on any schema drift (lowercase, typo, empty).
+- `PlaceOrder` carries `gtd_seconds`; broker no longer falls
+  through to a hardcoded 30s default. Config knob
+  `quoting.gtd_lifetime_s` now actually drives placed-order
+  lifetime — change the YAML and place GTD changes with it.
+  Prior to this fix, the YAML controlled modify timing only.
+
+**Hardening**:
+- `OutboundLimiter::try_consume` switched to `compare_exchange` —
+  closes a TOCTOU window where hot+staleness could both pass the
+  2-cap. Bound is now strict.
+- `pump_errors` routes `BrokerError::ConnectionLost` and
+  `Protocol{ code: 1100|1102|1300|504, .. }` to a sticky
+  `KillSource::Disconnect` kill so quoting halts even if the
+  connection-event stream is delayed. Cleared on reconnect by the
+  existing `pump_connection` listener.
+- `Runtime::contract_by_key` keys quantized via `strike_key_i64`
+  (`(strike * 10_000).round() as i64`) instead of
+  `f64::to_bits()`. Mirrors §18's trader fix; closes the same
+  bit-precision drift class for any future producer/consumer.
+- §14 stale-hedge WARN re-emits at every power-of-two occurrence
+  (was: self-suppress for the entire process lifetime). Operator
+  sees re-staling weeks later instead of silently degraded gates.
+
+**Cleanup**:
+- `corsair_oms` crate (~120 LOC) deleted, inlined to
+  `Runtime::seen_orders: Mutex<HashSet<OrderId>>`. Drove only
+  one debug log; the crate boundary wasn't earning its keep.
+- `HedgeConfig::ioc_tick_offset` and `hedge_tick_size` removed
+  from the struct + 7 construction sites + `runtime_v3.yaml`.
+  Dead since the 2026-05-04 limit-IOC → market-IOC switch (§10).
+- `ScalarSnapshot::contract_multiplier` removed (dead since §25
+  lock).
+- `processed_exec_ids` collapsed from `HashSet`+`VecDeque` pair
+  to `indexmap::IndexSet` (single-collection FIFO + membership).
+
+### Round 2 (commit 8d7a0a9)
+
+**Correctness**:
+- `DepthBook::apply` now properly evicts the deepest level on a
+  full-book insert at any position (was: only handled the tail).
+  IBKR L2 inserts at pos<5 on a full book were silently dropping
+  new best-bid/ask arrivals during fast moves. Adds 7 unit tests
+  in `corsair_market_data/src/option_state.rs::tests`.
+- Trader's `pricing.rs` gains the §18 NaN guards corsair_pricing
+  already has: SABR radicand `.max(0.0)` clamp + finite-result
+  fallback to alpha. Caught one layer up by `compute_theo`'s
+  `iv.is_nan()` check today, but this is the defense that
+  belongs at the source.
+- `improving_passes` and `compute_theo` fail-closed on non-finite
+  greeks. NaN comparisons silently returned false in the
+  `<= 0.0` and `> 0.0` checks, allowing orders through under
+  degenerate inputs.
+
+**Observability**:
+- JSONL writers re-sync `current_size` from disk metadata on
+  write error so size-based rotation can recover after transient
+  failures (both `corsair_trader::jsonl` and `corsair_broker::
+  jsonl`). Disk-full no longer freezes rotation.
+- `corsair_broker::config::validate` requires at least one
+  product enabled. Previously a YAML with all `enabled: false`
+  would boot a broker with zero quoting instruments, visible only
+  via the absence of subscriptions.
+
+**Hardening**:
+- `corsair_pricing::greeks::norm_cdf` caches the standard normal
+  via `OnceLock` (was: `Normal::new(0.0, 1.0).unwrap()` per call).
+  Mirrors `lib.rs::STD_NORMAL`.
+- `corsair_broker_ibkr_native::broker` cleans up routing state on
+  subscribe `send_raw` failure and on `unsubscribe_ticks` (the
+  `tick_route_right` map was leaked previously). Small per-cycle
+  leak in long sessions, now closed.
+- `corsair_pricing::calibrate` SVI rho bound tightened to ±0.99
+  to match the SABR bound (commit 6807447). Avoids degenerate
+  fits near Gatheral's no-arbitrage boundary.
+- `corsair_broker::tasks::build_chain_payload` passes the resting
+  order's `remaining_qty` to `external_best_bid/ask` instead of
+  hardcoded 1. Inert under qty=1 production but keeps the L2-
+  strip math correct for any future multi-lot path.
+- `corsair_broker::notify::HTTP_CLIENT` switched to
+  `Option<Client>` — a builder failure (broken rustls cert store)
+  now disables Discord cleanly instead of silently falling back
+  to a no-timeout client that could hang fire-and-forget tasks.
+
+**Operator tooling**:
+- `inject_place_order` and `flatten` validate flag bounds —
+  passing a flag without its value now prints a clear usage error
+  instead of panicking on `args[i+1]` index out of bounds.
+- JSONL daily file boundary documented as UTC, not session-CT.
+  Location-independent — survives a colo move (e.g. NYC) and
+  simplifies cross-region post-processing.
+
+### Operator's parallel work bundled into round 2
+
+`Runtime::recently_terminated`: a 60s TTL cache of OrderIds that
+hit a terminal status (Filled/Cancelled/Rejected/Inactive).
+`handle_modify` and `handle_cancel` short-circuit on cache hit
+instead of round-tripping IBKR for the inevitable
+"code 104 cannot modify a filled order" + 2s ack timeout — that
+path was producing multi-ms tail events on tick→trader_decide
+under fill churn (see `docs/HANDOFF_LATENCY_LEDGER.md` §3.2).
+Cache hits bump `stale_modify_dropped` / `stale_cancel_dropped`
+atomics; `periodic_terminated_evict` runs at 10 s emitting a
+status line when activity is non-zero.
+
+IBKR doesn't reuse OrderIds within a session, so there's no
+false-positive risk on a fresh order landing on a previously-
+terminal id. After 60 s any such id has long since left the
+trader's queue too.
+
+### Things NOT changed across the audit passes
+
+- Spec deviations (§7-§25) — all preserved.
+- Trader's hot-loop layout, pinning, mimalloc, busy-poll mode
+  (§17, §23) — untouched.
+- §16 6-layer safety stack — untouched.
+- §10 hedge mode and reconciliation — untouched.
+- §14 effective-delta gating + hedge-staleness fail-closed —
+  the constraint checker's stale-hedge log changed from
+  one-shot to power-of-two re-emit (round 1 #4); the gate
+  semantics didn't change.
+
+### What the new behaviors mean for live debugging
+
+- See `code 104` in IBKR errors? Round 2's `recently_terminated`
+  should suppress most. If it happens anyway, check the cache
+  size in the periodic log line.
+- See `Discord disabled` at boot? Round 2 #13 — rustls/cert store
+  is broken. Notifications drop until restart with a fixed env.
+- See `at least one product must be enabled` from the broker?
+  Your YAML has all products `enabled: false`.
+- See `proposed=N.NNN outside [0.50, 1.25]` from
+  `ibkr_scale recalibrated`? Untouched by the audit; this is
+  §3 behavior and the fallback to scale=1.0 is intended.

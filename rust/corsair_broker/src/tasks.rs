@@ -545,7 +545,23 @@ async fn pump_errors(runtime: Arc<Runtime>) {
     loop {
         match rx.recv().await {
             Ok(err) => {
-                log::warn!("broker error: {err}");
+                // Code 202 = "Order Canceled - reason:..." — IBKR's
+                // generic per-cancel notification. We already see each
+                // cancellation via the order_status terminal-state log
+                // ("order ord#NNNN terminal: Cancelled"); duplicating
+                // it as a WARN here floods the log on broker reconnect
+                // (IBKR cancels every prior resting order) without
+                // adding any actionable information. Trace-level so
+                // it's still grep-able when an operator wants the
+                // raw error stream.
+                if let corsair_broker_api::BrokerError::Protocol {
+                    code: Some(202), ..
+                } = &err
+                {
+                    log::trace!("broker error (lifecycle): {err}");
+                } else {
+                    log::warn!("broker error: {err}");
+                }
                 // Route disconnect-class errors to a Disconnect kill
                 // so quoting halts even when the connection-stream
                 // event is delayed or never fires (rare on partial
