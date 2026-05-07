@@ -1237,3 +1237,61 @@ Microbench in `rust/perf_bench/` for `decide_on_tick`'s key construction
 loop. That bypasses the IPC + tokio scheduler noise that dominates the
 600s harness. Predicted 5–10ns gain on `arc_dedup` should be cleanly
 visible in a tight criterion benchmark even if it's invisible end-to-end.
+
+### 2026-05-07 broker-side followup — three more null results
+
+After the trader-audit lessons above, a follow-up pass examined the
+broker post-trader leg (Broker TTT p50 27µs vs Trader TTT p50 15.5µs;
+the 12µs delta is broker-side work). Two audits + three multi-run A/Bs:
+
+1. **Broker hand-rolled msgpack decoder** for PlaceOrder/Modify/Cancel
+   (mirroring the trader's INBOUND tick decoder). Predicted gain: 1-2µs.
+   Multi-run (3+3 ABABAB at 60s): TTT p50 Δ=−218ns, t=−0.87, INCONCLUSIVE.
+2. **`pump_ticks` batch-drain + parking_lot::Mutex on `market_data`**.
+   N=3 showed apparent t=−2.94 p50 win — but bumping to N=8 revealed
+   that was sample-size artifact (Δ shrank to −63ns, t=−1.28). Tail
+   variance ~doubled (p99 SD 528→1171, p999 SD 956→2090) — the
+   predicted "mid-batch tick arrival waits for entire batch" effect
+   is real, even if mean shift wasn't statistically significant.
+3. **`parking_lot::Mutex` on `market_data` ALONE** (without batch-drain).
+   Multi-run (5+5): t-stats all between −0.27 and +1.26, ALL
+   INCONCLUSIVE. parking_lot's theoretical 30-50ns uncontended-path
+   advantage doesn't materialize because the lock is rarely contended
+   (snapshot at 250ms vs ticks at ~100Hz means a few % contention rate
+   at most). The 30-50ns × low-contention doesn't accumulate.
+
+The broader broker audit before #2 surveyed the entire post-trader
+leg (msgpack decode, validation, IBKR wire encode, socket write,
+async overhead, lock contention with snapshot/risk_state) and found
+the 12µs is **well-distributed across already-optimized small things**
+— TCP_NODELAY ✅, SO_BUSY_POLL=50µs ✅, hand-rolled `place_template`
+encoder ✅, contract HashMap ✅, async wire_timing serialization ✅,
+canonical lock order ✅. No 1-3µs lumps remain.
+
+**Combined record across both audits**: 7 multi-run validations, 6
+INCONCLUSIVE, 1 shipped-as-refactor (arc_dedup). The pattern is
+unambiguous at the current architecture scale: **sub-µs broker/trader
+optimizations don't extract from measurement noise even with disciplined
+N=8 multi-run protocol**.
+
+### Where the bottleneck actually lives
+
+User-visible latency is broker RTT 84ms = 99.97% IBKR network, 0.03%
+broker code. The "broker is the bottleneck" framing is partially
+right — broker has more local time than trader (27µs vs 15.5µs) — but
+the bottleneck *within our code* has been hammered, and the bottleneck
+*overall* is the IBKR connection. Real wins:
+
+- **FIX migration** (~10-30ms via smarter ack semantics, no IBKR API
+  reflection, leaner wire format). Bake the no-reflection-decode
+  pattern into the FIX-side decoder from day one (this audit's
+  msgpack hand-roll work is the proven template; saved to stash).
+- **Colo near IBKR** (~80ms via network distance — order of magnitude
+  on user-visible latency).
+- **FPGA / kernel-bypass** per `docs/fpga_arty_a7_feasibility.md`
+  (~order of magnitude on broker-leg + tighter tail).
+
+Stop chasing local-path code optimization at the current scale. The
+remaining items in `rust/corsair_broker/` are research-grade
+observations, not actionable optimizations. Moving the actual
+bottleneck requires architectural changes.
