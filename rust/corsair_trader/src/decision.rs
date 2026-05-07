@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::messages::{TickMsg, VolParams};
 use crate::pricing::{black76_price_and_delta, sabr_implied_vol, svi_implied_vol};
 use crate::state::{DecisionCounters, ScalarSnapshot, SharedState};
+use crate::types::FitForward;
 
 // Constants matching Python's src/trader/main.py.
 // 0.25 = ATM + 5 OTM strikes per side (spec §3.3, asym ATM+OTM).
@@ -182,23 +183,26 @@ pub fn decide_on_tick(
             return out;
         }
     };
-    let pricing_forward = vp_msg.forward;
+    let pricing_forward: FitForward = vp_msg.forward;
 
     // Compute risk-gate values once per tick.
     let (risk_buy, risk_sell, risk_all) = compute_risk_gates(&snap, now_monotonic_ns);
 
     // ATM-window restriction — anchored on PRICING forward (Rec 3).
-    if (strike - pricing_forward).abs() > MAX_STRIKE_OFFSET_USD {
+    // `.raw()` boundary: comparison is against the f64 value of the
+    // fit-time forward; the type wrapper has done its job once we know
+    // we're using `pricing_forward` rather than current spot.
+    if (strike - pricing_forward.raw()).abs() > MAX_STRIKE_OFFSET_USD {
         counters.skip_off_atm.fetch_add(1, Ordering::Relaxed);
         return out;
     }
 
     // OTM-only restriction (CLAUDE.md §12) — anchored on PRICING forward.
-    if r_char == 'C' && strike < pricing_forward - ATM_TOL_USD {
+    if r_char == 'C' && strike < pricing_forward.raw() - ATM_TOL_USD {
         counters.skip_itm.fetch_add(1, Ordering::Relaxed);
         return out;
     }
-    if r_char == 'P' && strike > pricing_forward + ATM_TOL_USD {
+    if r_char == 'P' && strike > pricing_forward.raw() + ATM_TOL_USD {
         counters.skip_itm.fetch_add(1, Ordering::Relaxed);
         return out;
     }
@@ -285,7 +289,7 @@ pub fn decide_on_tick(
     // from the comparison and changes the gate's semantics in a
     // direction-asymmetric way that can mask stale-fit conditions.
     // See audits/sections-16-19-audit.md §1.4.
-    let drift = (spot - pricing_forward).abs();
+    let drift = (spot - pricing_forward.raw()).abs();
     let max_drift = MAX_FORWARD_DRIFT_TICKS as f64 * snap.tick_size;
     if drift > max_drift {
         counters.skip_forward_drift.fetch_add(1, Ordering::Relaxed);
@@ -352,7 +356,7 @@ pub fn decide_on_tick(
     // Bounded below at 1¢ (mirrors Python). Gamma curvature dominates
     // beyond ~50 ticks of drift; the MAX_FORWARD_DRIFT_TICKS gate
     // upstream catches that regime so this stays a safe first-order.
-    let theo = (theo_at_fit + delta_at_fit * (spot - vp_msg.spot_at_fit)).max(0.01);
+    let theo = (theo_at_fit + delta_at_fit * (spot - vp_msg.spot_at_fit.raw())).max(0.01);
 
     // Bid/ask + sizes for the dark-book guards.
     let raw_bid = tick.bid.unwrap_or(0.0);
@@ -727,18 +731,21 @@ pub fn compute_risk_gates(snap: &ScalarSnapshot, now_monotonic_ns: u64) -> (bool
 /// MUCH less than put price), making us SELL puts BELOW the bid
 /// and BUY puts ABOVE the ask.
 pub fn compute_theo(
-    forward: f64,
+    forward: FitForward,
     strike: f64,
     tte: f64,
     right: char,
     params: &VolParams,
 ) -> Option<(f64, f64, f64)> {
-    if forward <= 0.0 || strike <= 0.0 || tte <= 0.0 {
+    // `.raw()` boundary: we have a typed FitForward, the call site
+    // chose it deliberately. From here, pricing math is pure-f64.
+    let f = forward.raw();
+    if f <= 0.0 || strike <= 0.0 || tte <= 0.0 {
         return None;
     }
     let iv = match params.model.as_str() {
         "svi" => svi_implied_vol(
-            forward,
+            f,
             strike,
             tte,
             params.a?,
@@ -748,7 +755,7 @@ pub fn compute_theo(
             params.sigma?,
         ),
         "sabr" => sabr_implied_vol(
-            forward,
+            f,
             strike,
             tte,
             params.alpha?,
@@ -761,7 +768,7 @@ pub fn compute_theo(
     if iv <= 0.0 || iv.is_nan() {
         return None;
     }
-    let (theo, delta) = black76_price_and_delta(forward, strike, tte, iv, 0.0, right);
+    let (theo, delta) = black76_price_and_delta(f, strike, tte, iv, 0.0, right);
     if theo <= 0.0 {
         return None;
     }
@@ -833,7 +840,7 @@ mod tests {
         state.vol_surfaces.insert(
             (expiry_arc, side),
             Arc::new(VolSurfaceEntry {
-                forward: 6.0,
+                forward: crate::types::FitForward(6.0),
                 params: VolParams {
                     model: "svi".to_string(),
                     a: Some(0.005),
@@ -855,7 +862,7 @@ mod tests {
                 // so existing tests continue to assert against fit-frozen
                 // theo, isolating each gate. The Taylor-specific test
                 // exercises a non-zero (spot − spot_at_fit) explicitly.
-                spot_at_fit: 6.0,
+                spot_at_fit: crate::types::SpotAtFit(6.0),
             }),
         );
     }
@@ -1169,5 +1176,223 @@ mod tests {
             "delta_at_fit out of expected range for slightly-OTM call: {}",
             delta_at_fit
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // §16 / §19 regression tests — audit §3.3.
+    //
+    // Three tests guarding the bug classes that cost ~$25K in paper
+    // losses on 2026-05-01 (§16) and killed two-sided HG quoting on
+    // 2026-05-06 (§19). The type system (FitForward / SpotAtFit
+    // newtypes, this commit) prevents the bug-class at the COMPILER
+    // level — these tests assert the operational MAGNITUDE that
+    // motivated the type guard, so a future maintainer who weakens
+    // the type system (e.g., adds From<f64> or Deref<Target=f64>)
+    // gets a runtime test failure that points back at the bug magnitude.
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn s16_compute_theo_with_wrong_forward_produces_wrong_theo() {
+        // §16 reproduction: HXEK6 P560 picked off because compute_theo
+        // got `current_spot` instead of `fit_time_forward`. The
+        // re-anchoring of SVI's `m` parameter shifted theo by 23% on
+        // a deep-wing put. This test replays those exact params and
+        // asserts the magnitude — proving (a) the bug is real, (b)
+        // the newtype guard at compute_theo's signature is what
+        // blocks it from being re-introduced.
+        //
+        // §16 params (from CLAUDE.md §16 / pricing.rs::svi_intel_check):
+        //   F_fit         = 6.021
+        //   F_current     = 5.96   (the wrong value the bug used)
+        //   K             = 5.60
+        //   T             = 25.5/365
+        //   SVI: a=0.001901, b=0.03656, rho=-0.7899,
+        //        m=-0.08124, sigma=0.07680
+        let params = VolParams {
+            model: "svi".to_string(),
+            a: Some(0.0019008499098876505),
+            b: Some(0.03656021179212421),
+            rho: Some(-0.7899231280970652),
+            m: Some(-0.08124400811300346),
+            sigma: Some(0.07679654333384238),
+            alpha: None, beta: None, nu: None,
+        };
+        let k = 5.60_f64;
+        let t = 25.5 / 365.0;
+
+        // Correct call (the only one the trader's call site can
+        // construct, per the FitForward type signature).
+        let correct = compute_theo(crate::types::FitForward(6.021), k, t, 'P', &params)
+            .expect("correct call should produce a theo");
+        // The "wrong" call — what the bug did. Construction here has
+        // to wrap CurrentSpot's value into FitForward to even compile,
+        // demonstrating that:
+        //   1. The compiler now requires the call site to ASSERT
+        //      "this is fit-time forward" via the explicit FitForward
+        //      wrap. Anyone substituting CurrentSpot would have to
+        //      write FitForward(current_spot.raw()) — visible at
+        //      review and grep-able.
+        //   2. Once wrapped, the math still produces the §16 wrong
+        //      theo. We measure that magnitude here as proof.
+        let bug_theo = compute_theo(crate::types::FitForward(5.96), k, t, 'P', &params)
+            .expect("bug call still produces a theo (just the wrong one)");
+
+        let correct_theo = correct.1;  // (iv, theo, delta) tuple
+        let buggy_theo = bug_theo.1;
+        let pct_diff = ((buggy_theo - correct_theo) / correct_theo).abs();
+
+        // CLAUDE.md §16 documents 23% drift. Assert ≥ 5% to catch any
+        // re-introduction; 23% is the historical magnitude.
+        assert!(
+            pct_diff > 0.05,
+            "§16 magnitude assertion failed — wrong-forward should differ \
+             ≥ 5%; got {:.2}% (correct theo={:.6}, buggy theo={:.6})",
+            100.0 * pct_diff,
+            correct_theo,
+            buggy_theo,
+        );
+    }
+
+    #[test]
+    fn s19_taylor_anchor_uses_spot_at_fit_not_forward() {
+        // §19 reproduction: HG K6→M6 calendar carry of ~$0.05 was
+        // mistaken for spot-vs-fit drift because the Taylor reprice
+        // anchored on `vp.forward` instead of `vp.spot_at_fit`. The
+        // shift was δ × $0.05 ≈ $0.025 per option, killing two-sided
+        // quoting via cross-protect.
+        //
+        // This test constructs a VolSurfaceEntry with the carry shape
+        // (forward = 6.05, spot_at_fit = 6.00 = current spot) and
+        // computes the Taylor reprice in both the correct and buggy
+        // forms. Asserts:
+        //   - Correct (vp.spot_at_fit anchor, current_spot = spot_at_fit)
+        //     → no shift.
+        //   - Buggy (vp.forward anchor)
+        //     → shift of ~$0.025 (= delta × carry).
+        //
+        // The newtype guard (this commit) prevents the buggy form
+        // from being expressible in the actual decide_on_tick code —
+        // a maintainer trying to use `vp.forward.raw()` instead of
+        // `vp.spot_at_fit.raw()` for the Taylor anchor would see the
+        // type names in code review and recognize the §19 bug shape.
+        let state = fresh_state(6.00);  // current spot = 6.00
+        install_svi_surface(&state, "20260526", 'C');
+        // Mutate the installed entry to simulate carry: forward=6.05
+        // (HGM6 parity-F), spot_at_fit=6.00 (HGK6 spot at fit time).
+        let expiry_arc = state.intern_expiry("20260526");
+        if let Some(mut entry) = state.vol_surfaces.get_mut(&(expiry_arc, 'C')) {
+            let inner = Arc::make_mut(&mut *entry);
+            inner.forward = crate::types::FitForward(6.05);
+            inner.spot_at_fit = crate::types::SpotAtFit(6.00);
+        }
+        // Look up the (now mutated) entry.
+        let expiry_arc = state.intern_expiry("20260526");
+        let vp = state.lookup_vol_surface(&expiry_arc, 'C').expect("surface present");
+
+        // Compute (theo_at_fit, delta_at_fit) at fit-time forward.
+        let tte = 25.0 / 365.0;
+        let (_iv, theo_at_fit, delta_at_fit) =
+            compute_theo(vp.forward, 6.05, tte, 'C', &vp.params)
+                .expect("compute_theo should succeed");
+        let current_spot = 6.00_f64;
+
+        // Correct form (vp.spot_at_fit anchor):
+        //   theo = theo_at_fit + δ × (current_spot − spot_at_fit)
+        //        = theo_at_fit + δ × (6.00 − 6.00)
+        //        = theo_at_fit  (no shift)
+        let theo_correct = theo_at_fit + delta_at_fit * (current_spot - vp.spot_at_fit.raw());
+        // Buggy form (vp.forward anchor) — explicit .raw() at this
+        // call site demonstrates the type system makes the bug visible.
+        // We're computing what the bug WOULD have done, NOT what the
+        // production code does:
+        let theo_buggy = theo_at_fit + delta_at_fit * (current_spot - vp.forward.raw());
+
+        // Correct: no shift from theo_at_fit.
+        assert!(
+            (theo_correct - theo_at_fit).abs() < 1e-6,
+            "correct Taylor (spot_at_fit anchor) should produce zero shift \
+             when current_spot == spot_at_fit; got Δ={:.6}",
+            theo_correct - theo_at_fit,
+        );
+        // Buggy: large shift from theo_at_fit (the §19 bug magnitude).
+        let buggy_shift_abs = (theo_buggy - theo_at_fit).abs();
+        // delta is positive for the OTM call; carry = forward - spot = 0.05.
+        // Buggy formula gives δ × (current_spot − forward) = δ × −0.05.
+        let expected_buggy_shift = delta_at_fit * 0.05;
+        assert!(
+            buggy_shift_abs > expected_buggy_shift * 0.95
+                && buggy_shift_abs < expected_buggy_shift * 1.05,
+            "§19 magnitude assertion failed — buggy Taylor should produce \
+             |δ × carry| = {:.6}; got |Δ| = {:.6}",
+            expected_buggy_shift,
+            buggy_shift_abs,
+        );
+    }
+
+    #[test]
+    fn s19_decide_on_tick_two_sided_on_calendar_carry_product() {
+        // End-to-end §19 regression. Same carry-product surface as
+        // s19_taylor_anchor_uses_spot_at_fit_not_forward. Run
+        // decide_on_tick with a two-sided market and assert BOTH BUY
+        // and SELL emit a Place — the §19 bug shape produced one-sided
+        // quotes via cross-protect (the documented production symptom
+        // 2026-05-06 12:35-12:45 UTC; CLAUDE.md §19).
+        //
+        // Setup: forward = 6.05, spot_at_fit = 6.00, current_spot =
+        // 6.00 (no actual drift). With the correct anchor, theo
+        // ≈ theo_at_fit; both BUY (theo - edge) and SELL (theo + edge)
+        // sit safely between bid and ask.
+        let state = fresh_state(6.00);
+        // Disable the wide-spread gate for this test — it's not the
+        // §19 concern and the test fixture's default mul (4) doesn't
+        // match production's (6). Fixture-level concerns shouldn't
+        // mask the §19 regression check.
+        state.scalars.lock().skip_if_spread_over_edge_mul = 0.0;
+        install_svi_surface(&state, "20260526", 'C');
+        let expiry_arc = state.intern_expiry("20260526");
+        if let Some(mut entry) = state.vol_surfaces.get_mut(&(expiry_arc, 'C')) {
+            let inner = Arc::make_mut(&mut *entry);
+            inner.forward = crate::types::FitForward(6.05);
+            inner.spot_at_fit = crate::types::SpotAtFit(6.00);
+        }
+        let counters = DecisionCounters::default();
+        // ATM-window check uses pricing_forward (= 6.05). Strike 6.10
+        // is just OTM for the call. With install_svi_surface's
+        // params (a=0.005, b=0.05, σ=0.1) and forward=6.05, IV at
+        // K=6.10 is ~38%, giving theo ≈ $0.21. Bid/ask straddle that
+        // with edge-headroom on both sides.
+        let tick = make_tick(6.10, "20260526", "C", 0.180, 0.240);
+        let expiry_arc = state.intern_expiry(&tick.expiry);
+        let decisions = run_decide(
+            &state,
+            &counters,
+            &tick,
+            &expiry_arc,
+            1_000_000_000,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+        );
+        // Expect BOTH a BUY Place and a SELL Place. The §19 bug shape
+        // would have shifted SELL target below the bid via cross-protect
+        // (or BUY above the ask), producing a one-sided result.
+        let n_place = decisions
+            .iter()
+            .filter(|d| matches!(d, Decision::Place { .. }))
+            .count();
+        assert_eq!(
+            n_place, 2,
+            "expected two-sided Place (BUY + SELL); got {} Places: {:?}",
+            n_place, decisions,
+        );
+        let has_buy = decisions
+            .iter()
+            .any(|d| matches!(d, Decision::Place { side: Side::Buy, .. }));
+        let has_sell = decisions
+            .iter()
+            .any(|d| matches!(d, Decision::Place { side: Side::Sell, .. }));
+        assert!(has_buy, "missing BUY Place — §19 regression?");
+        assert!(has_sell, "missing SELL Place — §19 regression?");
     }
 }

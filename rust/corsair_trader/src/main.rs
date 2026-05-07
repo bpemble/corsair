@@ -25,6 +25,7 @@ mod msgpack_encode;
 mod pricing;
 mod state;
 mod tte_cache;
+mod types;
 
 // p99-4 (2026-05-04): mimalloc as global allocator. The hot path
 // allocates on tick decode (rmp_serde) and on Decision/CancelOrder
@@ -782,13 +783,17 @@ fn process_event(
                     state.scalars.lock().underlying_price
                 }
             };
+            // Wrap the wire f64 values into typed newtypes here, at
+            // the IPC → trader boundary. From this point onward the
+            // type system rejects cross-substitution between forward
+            // and spot. See crate::types module docs.
             let entry = Arc::new(crate::state::VolSurfaceEntry {
-                forward: vs.forward,
+                forward: crate::types::FitForward(vs.forward),
                 params: vs.params,
                 fit_ts_ns: vs.ts_ns.unwrap_or(0),
                 calibrated_min_k: vs.calibrated_min_k,
                 calibrated_max_k: vs.calibrated_max_k,
-                spot_at_fit,
+                spot_at_fit: crate::types::SpotAtFit(spot_at_fit),
             });
             let expiry_arc = state.intern_expiry(&vs.expiry);
             let side_upper = vs.side.to_ascii_uppercase();
@@ -1464,7 +1469,7 @@ fn staleness_check(
                 Some(v) => v,
                 None => continue,
             };
-        let theo = (theo_at_fit + delta_at_fit * (snap.underlying_price - vp.spot_at_fit)).max(0.01);
+        let theo = (theo_at_fit + delta_at_fit * (snap.underlying_price - vp.spot_at_fit.raw())).max(0.01);
 
         // Stale if our price is too unfavorable vs current theo.
         // Drift > threshold → modify to fresh edge (amend bias).

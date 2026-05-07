@@ -22,6 +22,7 @@
 //! single point of serialization.
 
 use crate::messages::VolParams;
+use crate::types::{FitForward, SpotAtFit};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -49,7 +50,11 @@ pub struct OptionState {
 
 #[derive(Debug, Clone)]
 pub struct VolSurfaceEntry {
-    pub forward: f64,
+    /// Fit-time forward (broker's parity-implied F at calibration).
+    /// Wrapped in `FitForward` so the type system rejects code paths
+    /// that try to substitute current spot for fit-time forward (the
+    /// §16 bug class). See crate::types module docs.
+    pub forward: FitForward,
     pub params: VolParams,
     /// Broker fit timestamp (CLOCK_REALTIME ns). Used to gate quoting
     /// when the surface is stale (HI-002).
@@ -63,7 +68,9 @@ pub struct VolSurfaceEntry {
     /// path: theo += delta × (current_spot − spot_at_fit). Distinct
     /// from `forward` so the static carry between front-month and the
     /// option's underlying month doesn't pollute the Taylor shift.
-    pub spot_at_fit: f64,
+    /// Wrapped in `SpotAtFit` to prevent the §19 bug class — see
+    /// crate::types module docs and CLAUDE.md §19.
+    pub spot_at_fit: SpotAtFit,
 }
 
 /// Per-resting-order metadata; keyed by (strike, expiry, right, side).
