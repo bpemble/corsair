@@ -301,6 +301,33 @@ impl Runtime {
         // ── Seed positions from broker ────────────────────────────
         runtime.seed_positions_from_broker().await?;
 
+        // ── Seed realized_pnl_persisted from IBKR's session total ──
+        //
+        // `Portfolio::new` initializes the accumulator at 0.0 and the
+        // only reset is `daily_halt_rollover` at CME 17:00 CT. Without
+        // a boot seed, every mid-session restart silently re-anchors
+        // the dashboard's "Today's P&L" tile and the −5% daily halt
+        // threshold to boot time, dropping all pre-boot realized P&L
+        // (observed 2026-05-07: IBKR realized_today=$343 vs local
+        // realized_pnl_persisted=−$327 after a 10:00 CT restart that
+        // missed +$673 of pre-boot realized).
+        //
+        // Best-effort: if the account fetch fails, the next
+        // `periodic_account_poll` (15 s cadence) will seed via the
+        // same resync path.
+        match runtime.broker.account_values().await {
+            Ok(snap) => {
+                if let Ok(mut a) = runtime.account.lock() {
+                    *a = snap;
+                }
+                crate::tasks::resync_realized_pnl_from_ibkr(&runtime, "boot");
+            }
+            Err(e) => log::warn!(
+                "boot account_values failed: {e}; realized_pnl_persisted left at 0 \
+                 (next periodic_account_poll will seed within 15s)"
+            ),
+        }
+
         log::warn!("corsair_broker boot complete; tasks will start next");
         Ok(runtime)
     }

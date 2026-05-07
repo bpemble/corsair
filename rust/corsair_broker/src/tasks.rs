@@ -1121,6 +1121,13 @@ async fn periodic_account_poll(runtime: Arc<Runtime>) {
                 if let Ok(mut a) = runtime.account.lock() {
                     *a = snap;
                 }
+                // Resync `realized_pnl_persisted` to IBKR's session-
+                // cumulative number every poll. Closes the prev_avg-VWAP
+                // drift in `Portfolio::add_fill` (IBKR is authoritative
+                // for closed-trade P&L) and keeps the daily_pnl tile +
+                // −5% halt threshold tracking the IBKR session window
+                // even between mid-session restarts.
+                resync_realized_pnl_from_ibkr(&runtime, "periodic");
                 // CLAUDE.md §3: ibkr_scale calibration. Compute the
                 // current raw synthetic SPAN against current positions
                 // and forward, then divide IBKR's MaintMarginReq by it.
@@ -1316,6 +1323,49 @@ fn build_chain_payload(
         atm_strike,
         expiries,
         front_month_expiry,
+    }
+}
+
+/// Resync `Portfolio::realized_pnl_persisted` against IBKR's
+/// session-cumulative `RealizedPnL` so `daily_pnl`
+/// (= realized_pnl_persisted + hedge_realized_total + mtm_pnl) is
+/// anchored on IBKR's session window rather than broker-boot time.
+///
+/// Without this, `Portfolio::new` initializes the accumulator to 0.0
+/// and the only reset is the CME 17:00 CT rollover in
+/// `daily_halt_rollover` — every mid-session broker restart silently
+/// re-anchors the dashboard's "Today's P&L" tile and the −5% daily
+/// halt threshold to boot time, dropping all pre-boot realized P&L.
+/// Periodic invocation also closes the `prev_avg`-VWAP drift in
+/// `Portfolio::add_fill` (see comment at portfolio.rs:163-176).
+///
+/// IBKR's `RealizedPnL` covers the whole account (options + futures
+/// hedges); subtract `hedge_realized_total` so the daily_pnl formula,
+/// which adds hedge realized separately, doesn't double-count.
+pub(crate) fn resync_realized_pnl_from_ibkr(runtime: &Arc<Runtime>, source: &str) {
+    let ibkr_realized = match runtime.account.lock() {
+        Ok(a) => a.realized_pnl_today,
+        Err(_) => return,
+    };
+    let hedge_realized: f64 = {
+        let h = runtime.hedge.lock().unwrap();
+        h.managers().iter().map(|m| m.state().realized_pnl_usd).sum()
+    };
+    let target = ibkr_realized - hedge_realized;
+    let mut p = runtime.portfolio.lock().unwrap();
+    let prev = p.realized_pnl_persisted;
+    p.realized_pnl_persisted = target;
+    let drift = (target - prev).abs();
+    if drift > 10.0 {
+        log::warn!(
+            "resync_realized_pnl ({source}): ibkr=${:.2} \
+             hedge_realized=${:.2} target=${:.2} prev=${:.2} drift=${:.2}",
+            ibkr_realized,
+            hedge_realized,
+            target,
+            prev,
+            drift
+        );
     }
 }
 
