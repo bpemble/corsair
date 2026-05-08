@@ -82,10 +82,22 @@ fn main() {
     let mut passive = false;
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
-            "--data-dir" => { data_dir = PathBuf::from(&args[i+1]); i += 2; }
-            "--snapshot" => { snapshot_path = Some(PathBuf::from(&args[i+1])); i += 2; }
-            "--product" => { product_filter = Some(args[i+1].clone()); i += 2; }
+        let key = args[i].as_str();
+        // Helper: take the next arg as the value; bail with a clear
+        // usage error instead of panicking on index out of bounds when
+        // a flag is passed without its value.
+        let take_value = |key: &str, i: usize| -> &str {
+            if i + 1 >= args.len() {
+                eprintln!("flatten: missing value for {key}");
+                print_usage();
+                std::process::exit(2);
+            }
+            args[i + 1].as_str()
+        };
+        match key {
+            "--data-dir" => { data_dir = PathBuf::from(take_value(key, i)); i += 2; }
+            "--snapshot" => { snapshot_path = Some(PathBuf::from(take_value(key, i))); i += 2; }
+            "--product" => { product_filter = Some(take_value(key, i).to_string()); i += 2; }
             "--all-products" => { product_filter = None; i += 1; }
             "--dry-run" => { dry_run = true; i += 1; }
             "--passive" => { passive = true; i += 1; }

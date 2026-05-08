@@ -7,6 +7,18 @@ edition = "2021"
 name = "corsair_trader"
 path = "src/main.rs"
 
+# Library facade exists so `benches/*.rs` can reference pub items like
+# `decision::compute_risk_gates` without `#[path]` indirection. The bin
+# and lib compile the same source files independently — see src/lib.rs
+# for the full rationale.
+[lib]
+name = "corsair_trader"
+path = "src/lib.rs"
+
+[[bench]]
+name = "decision_gates"
+harness = false
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "sync", "fs", "net", "signal"] }
 rmp-serde = "1.3"
@@ -37,5 +49,12 @@ parking_lot = "0.12"
 # src/ipc/ module now re-exports from corsair_ipc so both broker
 # and trader use one source of truth for the wire format.
 corsair_ipc = { path = "../corsair_ipc" }
+
+[dev-dependencies]
+# Sub-µs gate-cost microbench (CLAUDE.md §21 / §25 follow-up). Criterion
+# uses TSC-based sampling and statistical aggregation that resolves
+# noise floors well below what the production replay harness can.
+# Dev-dep only; no production image impact.
+criterion = "0.5"
 
 # [profile.release] removed — workspace root owns release profile.

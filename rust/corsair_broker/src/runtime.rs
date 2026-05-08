@@ -13,7 +13,6 @@ use corsair_broker_ibkr_native::{
 use corsair_constraint::{ConstraintChecker, ConstraintConfig};
 use corsair_hedge::{HedgeConfig, HedgeFanout, HedgeManager, HedgeMode};
 use corsair_market_data::MarketDataState;
-use corsair_oms::OrderBook;
 use corsair_position::{PortfolioState, ProductInfo, ProductRegistry};
 use corsair_risk::{RiskConfig, RiskMonitor};
 use corsair_snapshot::{SnapshotConfig, SnapshotPublisher};
@@ -78,7 +77,41 @@ pub struct Runtime {
     pub risk: Mutex<RiskMonitor>,
     pub constraint: Mutex<ConstraintChecker>,
     pub hedge: Mutex<HedgeFanout>,
-    pub oms: Mutex<OrderBook>,
+    /// Set of OrderIds we've observed at least one OrderStatus for.
+    /// `pump_status` inserts on first sight and removes on terminal.
+    /// Used only to drive a debug log for "status update for orderId
+    /// we never tracked" — which surfaces stray statuses from other
+    /// clientIds on the FA-master clientId=0 connection. Inlined
+    /// 2026-05-07 from the retired `corsair_oms` crate.
+    pub seen_orders: Mutex<std::collections::HashSet<corsair_broker_api::OrderId>>,
+
+    /// OrderIds that hit a terminal status (Filled/Cancelled/Rejected/
+    /// Inactive). Inserted by `pump_status`; consulted by
+    /// `handle_modify` and `handle_cancel` to drop stale operations
+    /// locally instead of round-tripping to IBKR for a known-failing
+    /// command. The IBKR error path on a terminated order is "code 104
+    /// Cannot modify a filled order" + 2s ack timeout, which under
+    /// live load (a few fills per minute on a single-pumped task)
+    /// produces multi-ms tail events in tick→trader_decide.
+    ///
+    /// Value is the terminal `now_ns()` timestamp; entries are evicted
+    /// after `RECENTLY_TERMINATED_TTL_NS` (60s) by
+    /// `periodic_terminated_evict` in `tasks.rs`. Cache hits bump
+    /// `stale_modify_dropped` / `stale_cancel_dropped` so telemetry
+    /// can surface the rate.
+    ///
+    /// Added 2026-05-07 — see `docs/HANDOFF_LATENCY_LEDGER.md` §3.2
+    /// for the diagnosis. IBKR doesn't reuse OrderIds within a
+    /// session, so there's no false-positive risk on a fresh order
+    /// landing on a previously-terminal id.
+    pub recently_terminated:
+        Mutex<std::collections::HashMap<corsair_broker_api::OrderId, u64>>,
+    /// Cache hits — modify_order dropped because target was already
+    /// terminal. Bumped from `handle_modify`. Surfaced in broker
+    /// telemetry alongside other counters.
+    pub stale_modify_dropped: std::sync::atomic::AtomicU64,
+    /// Same as above for cancel_order.
+    pub stale_cancel_dropped: std::sync::atomic::AtomicU64,
     pub market_data: Mutex<MarketDataState>,
     pub snapshot: Mutex<SnapshotPublisher>,
 
@@ -93,7 +126,7 @@ pub struct Runtime {
         Mutex<std::collections::HashMap<corsair_broker_api::InstrumentId, corsair_broker_api::Contract>>,
 
     /// Fast-path contract lookup for `handle_place` / `handle_modify`,
-    /// keyed by (strike-bits, expiry-YYYYMMDD, right-char).
+    /// keyed by (strike-quantized-i64, expiry-YYYYMMDD, right-char).
     ///
     /// Replaces the O(N×M) scan over `MarketDataState::options_for_
     /// product` that handle_place used to do — that scan included a
@@ -103,8 +136,16 @@ pub struct Runtime {
     /// `qualified_contracts`) so the hot path can resolve a contract
     /// in a single `HashMap::get`. Bounded by quoted strikes
     /// (~30 in production) so memory is trivial.
+    ///
+    /// Strike is quantized via `strike_key_i64` (matches the trader's
+    /// `SharedState::strike_key` defense from §18). Both producer
+    /// (subscribe_strike) and consumer (handle_place) within the
+    /// broker derive strike from the same f64s today, but a future
+    /// path computing strike from arithmetic (e.g. `atm + n * tick`)
+    /// would silently miss the cache under bit-precision drift —
+    /// quantization closes that class entirely.
     pub contract_by_key:
-        Mutex<std::collections::HashMap<(u64, String, char), corsair_broker_api::Contract>>,
+        Mutex<std::collections::HashMap<(i64, String, char), corsair_broker_api::Contract>>,
 
     /// Cached account snapshot from `Broker::account_values()`. Updated
     /// every ~5min by `periodic_account_poll`. Read by
@@ -152,6 +193,18 @@ pub struct Runtime {
     /// through the dispatch path). Set during corsair_broker::ipc::
     /// spawn just after server creation; None until then.
     pub ipc_server: Mutex<Option<Arc<corsair_ipc::SHMServer>>>,
+
+    /// §25 trader watchdog: wall-clock ns of the most recent commands-
+    /// ring frame received from the trader. Updated on every command
+    /// dispatch (place / cancel / modify / telemetry / heartbeat /
+    /// welcome). The watchdog task (`trader_watchdog` in `tasks.rs`)
+    /// reads this 1Hz and fires `trader_silent` if the gap exceeds
+    /// `CORSAIR_TRADER_WATCHDOG_TIMEOUT_S` (default 5s).
+    ///
+    /// Atomic so the dispatch path doesn't need to take a lock; the
+    /// watchdog reads with `Acquire` to pair with the dispatcher's
+    /// `Release`.
+    pub last_trader_msg_ns: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -234,7 +287,6 @@ impl Runtime {
         // is enabled.
         let hedge = build_hedge_fanout(&cfg);
 
-        let oms = OrderBook::new();
         let market_data = MarketDataState::new();
 
         let snapshot_cfg = SnapshotConfig {
@@ -250,7 +302,10 @@ impl Runtime {
             risk: Mutex::new(risk),
             constraint: Mutex::new(constraint),
             hedge: Mutex::new(hedge),
-            oms: Mutex::new(oms),
+            seen_orders: Mutex::new(std::collections::HashSet::new()),
+            recently_terminated: Mutex::new(std::collections::HashMap::new()),
+            stale_modify_dropped: std::sync::atomic::AtomicU64::new(0),
+            stale_cancel_dropped: std::sync::atomic::AtomicU64::new(0),
             market_data: Mutex::new(market_data),
             snapshot: Mutex::new(snapshot),
             qualified_contracts: Mutex::new(std::collections::HashMap::new()),
@@ -258,6 +313,7 @@ impl Runtime {
             latency_samples: Mutex::new(crate::latency::LatencySamples::new()),
             vol_surface_cache: Mutex::new(Arc::new(std::collections::HashMap::new())),
             ipc_server: Mutex::new(None),
+            last_trader_msg_ns: std::sync::atomic::AtomicU64::new(0),
             account: Mutex::new(corsair_broker_api::AccountSnapshot {
                 net_liquidation: 0.0,
                 maintenance_margin: 0.0,
@@ -300,6 +356,33 @@ impl Runtime {
 
         // ── Seed positions from broker ────────────────────────────
         runtime.seed_positions_from_broker().await?;
+
+        // ── Seed realized_pnl_persisted from IBKR's session total ──
+        //
+        // `Portfolio::new` initializes the accumulator at 0.0 and the
+        // only reset is `daily_halt_rollover` at CME 17:00 CT. Without
+        // a boot seed, every mid-session restart silently re-anchors
+        // the dashboard's "Today's P&L" tile and the −5% daily halt
+        // threshold to boot time, dropping all pre-boot realized P&L
+        // (observed 2026-05-07: IBKR realized_today=$343 vs local
+        // realized_pnl_persisted=−$327 after a 10:00 CT restart that
+        // missed +$673 of pre-boot realized).
+        //
+        // Best-effort: if the account fetch fails, the next
+        // `periodic_account_poll` (15 s cadence) will seed via the
+        // same resync path.
+        match runtime.broker.account_values().await {
+            Ok(snap) => {
+                if let Ok(mut a) = runtime.account.lock() {
+                    *a = snap;
+                }
+                crate::tasks::resync_realized_pnl_from_ibkr(&runtime, "boot");
+            }
+            Err(e) => log::warn!(
+                "boot account_values failed: {e}; realized_pnl_persisted left at 0 \
+                 (next periodic_account_poll will seed within 15s)"
+            ),
+        }
 
         log::warn!("corsair_broker boot complete; tasks will start next");
         Ok(runtime)
@@ -713,12 +796,6 @@ fn build_hedge_fanout(cfg: &BrokerDaemonConfig) -> HedgeFanout {
             rebalance_cadence_sec: cfg.hedging.rebalance_cadence_sec,
             include_in_daily_pnl: cfg.hedging.include_in_daily_pnl,
             flatten_on_halt_enabled: cfg.hedging.flatten_on_halt,
-            // Dead — hedge orders are MARKET-IOC since 2026-05-04
-            // (CLAUDE.md §10). The corsair_hedge::HedgeConfig struct
-            // still carries these fields for back-compat; we pass
-            // arbitrary placeholders.
-            ioc_tick_offset: 0,
-            hedge_tick_size: 0.0,
             lockout_days: cfg.hedging.hedge_lockout_days,
         }));
     }

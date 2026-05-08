@@ -69,6 +69,13 @@ async fn writer_task(
     let mut line_buf: Vec<u8> = Vec::with_capacity(1024);
 
     while let Some(value) = rx.recv().await {
+        // Daily file boundary is UTC, NOT the CME session-anchored
+        // 17:00 CT rollover. UTC is location-independent — the day
+        // boundary stays stable if the service relocates (e.g., NYC
+        // colo, off-hours batch reprocessing across regions). Session-
+        // local groupings (CT for CME audit trails, ET for NYC
+        // operations) are produced downstream by post-processors that
+        // know their own timezone.
         let today = Utc::now();
         let day_str = format!(
             "{:04}-{:02}-{:02}",
@@ -127,6 +134,11 @@ async fn writer_task(
             line_buf.push(b'\n');
             if let Err(e) = w.write_all(&line_buf) {
                 log::warn!("jsonl: write failed: {}", e);
+                // Re-sync `current_size` from disk so size-based
+                // rotation can still fire after transient write errors.
+                if let Ok(meta) = w.get_ref().metadata() {
+                    current_size = meta.len();
+                }
             } else {
                 current_size += line_buf.len() as u64;
             }

@@ -26,11 +26,12 @@ requirements.txt. The PyO3 bridge crate (`corsair_broker_ibkr`) was
 deleted in Phase 6.11. The legacy Python broker entry point
 (`src.main`) was deleted in Phase 6.8a.
 
-Sections written for the Python broker era are marked
-**[HISTORIC]** below where the underlying behavior no longer
-applies (e.g. §2 ib_insync openTrades quirks, §5 lean connect
-bypass). The lessons are preserved as context for postmortems
-but should not guide live debugging.
+Sections written for the Python broker era have been deleted as
+part of the 2026-05-07 trim pass; section numbers are preserved
+with gaps so cross-references in §10–§26 still resolve. The
+ib_insync archaeology (openTrades orphan-Trade dispatch quirk,
+lean connectAsync bypass) lives in `git log` for postmortem
+context — search for commits before Phase 6.7 (2026-05-02).
 
 Active config for the Rust runtime: `config/runtime_v3.yaml`.
 The legacy `config/hg_v1_4_paper.yaml` and `config/corsair_v2_config.yaml`
@@ -91,7 +92,8 @@ current operational config.
 | Hedge near-expiry lockout | 7 days (shared with options engine) | 30 days (hedge-specific knob added 2026-05-01) | §10 |
 | Operational kills (RMSE/latency/fill-rate) | required (§7) | not implemented in Rust runtime | §15 |
 | `quoting.dead_band_ticks` | unspecified | 2 ticks ($0.001 on HG); 20× tighter than legacy paper config | §16 |
-| `hedging.ioc_tick_offset` | unspecified | 4 (bumped 2→4 on 2026-05-04) | §10 |
+| Tiered improving-fill exceptions | tier-1 margin escape + tier-2 per-constraint improving (margin/delta/theta), carried over from `src/constraint_checker.py` | margin = hard halt (no improving exception); theta = improving-only via trader (§25); delta_kill removed (hedge owns it) | §22, §25 |
+| Strategy-kill controller | broker-side risk_monitor fires delta/theta/vega kills | trader-centric: improving-only gates in `compute_risk_gates`, broker keeps only operational + margin + daily_pnl + new `trader_silent` watchdog | §25 |
 
 ETH is tabled (config products list is HG-only) but the multi-product
 architecture is preserved — re-enabling ETH is a matter of un-commenting
@@ -161,32 +163,6 @@ master-client mode to function.
 `account=self._account` in `quote_engine._send_or_update`). Without it, IBKR
 returns Error 436 "You must specify an allocation."
 
-## 2. `openTrades()` returns multiple Trade objects per orderId  **[HISTORIC — ib_insync only]**
-
-This was an ib_insync wrapper bug. The Rust native client doesn't
-have a Trade-object abstraction — orderId → state mapping is direct.
-Preserved for postmortem context.
-
-ib_insync sometimes constructs a NEW Trade object when an `openOrder`
-callback fires (notably after `reqAutoOpenOrders` adopts an order on
-clientId=0). The Trade returned by `placeOrder` becomes an **orphan** that
-nobody updates. Meanwhile, the canonical Trade — the one that ib_insync
-mutates in place on every status event — is a separate instance with the
-same `orderId`.
-
-**Result:** `ib.openTrades()` can return BOTH the orphan AND the canonical
-Trade for the same orderId. Iterating it naively and returning early on the
-first match will hand back the orphan, which stays at PendingSubmit forever.
-
-**Rule:** in `quote_engine._canonical_trade(order_id)`, walk the entire
-openTrades list and return the **last** match. The dict-comprehension idiom
-`{t.order.orderId: t for t in ib.openTrades()}` works the same way (last
-write wins) and is what `_build_our_prices_index` uses.
-
-**Don't** cache the placeOrder return value in a local dict — that's the
-orphan. Always re-resolve from `_canonical_idx` (which `_build_our_prices_index`
-populates) or fall back to walking openTrades.
-
 ## 3. Synthetic SPAN runs ~25-30% high vs IBKR for short strangles
 
 Our `synthetic_span.py` is calibrated against single-leg naked shorts and
@@ -229,34 +205,6 @@ The system will resume quoting automatically when options reopen at 17:00 CT.
 If you see `bid=-1` from a probe, just wait for the reopen. If the futures
 tick stream ALSO died, that's a real problem and the watchdog should be
 flapping.
-
-## 5. Lean connect bypass (don't let ib_insync's stock connectAsync run)  **[HISTORIC — ib_insync only]**
-
-The native Rust client's connect path doesn't go through ib_insync,
-so the per-FA-account bootstrap timeout is structurally avoided.
-NativeBroker boot ~50ms (vs 30-90s for the lean Python bypass).
-Preserved for postmortem context — if we ever revert to PyO3+ib_insync
-for any reason, this is the gotcha.
-
-ib_insync's `IB.connectAsync` issues a long list of initializing requests
-in parallel after the API handshake: positions, open orders, **completed
-orders**, **executions**, account updates, **and per-sub-account multi-account
-updates** for every account on the FA login. On a paper login with 6
-sub-accounts and a heavy overnight order history, this bootstrap consistently
-times out — completed orders alone can take 60+ seconds.
-
-**Our `connection.py` replaces it with a hand-rolled bootstrap** that issues
-only the four requests we actually need:
-1. `client.connectAsync` — TCP/API handshake
-2. `reqPositionsAsync` — to seed our position book
-3. `reqOpenOrdersAsync` — to know what's resting from prior runs
-4. `reqAccountUpdatesAsync` — for cash/margin/balance state
-
-Plus `reqAutoOpenOrders(True)` if `client_id == 0`.
-
-This brings the connect from ~33-90s down to ~0.3-1s. **Do not switch back
-to `ib.connectAsync`** unless you've also fixed all the bloat-request
-timeouts upstream.
 
 ## 6. ETH option contract multiplier is 50, not 100
 
@@ -329,27 +277,35 @@ and induced-test parity.
 
 ## 9. v1.4 induced kill-switch tests (Gate 0)
 
-Every v1.4 Tier-1 kill must pass an induced-breach test before Stage 1
-launch (§9.4). Induce via sentinel file:
+Per spec §9.4, every Tier-1 kill must pass an induced-breach test
+before Stage 1 launch. In the Rust runtime, **only `daily_pnl` and
+`margin` are induceable via sentinel** (delta/theta/vega were
+removed in §25 — strategy gating moved to the trader and is
+exercised by driving theta/effective_delta out-of-bounds via test
+fills, not sentinels). The induceable set is canonical at
+`rust/corsair_risk/src/sentinel.rs::INDUCED_SENTINELS`.
 
 ```bash
-docker compose exec corsair python scripts/induce_kill_switch.py --switch daily_pnl
-docker compose exec corsair python scripts/induce_kill_switch.py --switch margin
-docker compose exec corsair python scripts/induce_kill_switch.py --switch delta
-docker compose exec corsair python scripts/induce_kill_switch.py --switch theta
-docker compose exec corsair python scripts/induce_kill_switch.py --switch vega
+docker compose exec corsair-broker-rs scripts/induce_kill_switch.py --switch daily_pnl
+docker compose exec corsair-broker-rs scripts/induce_kill_switch.py --switch margin
 ```
 
-The script writes `/tmp/corsair_induce_<switch>`; `RiskMonitor.check()`
-picks it up on the next cycle, fires the matching kill through its real
-path (cancel + flatten/halt + paper log), and deletes the sentinel.
-Induced kills carry `source="induced_<source>"` in
-`kill_switch-YYYY-MM-DD.jsonl` so reconciliation can distinguish them
-from genuine breaches.
+The script (still Python — it's just an `open(...).write("induced\n")`,
+no runtime needed) writes `/tmp/corsair_induce_<switch>` inside the
+container. The broker's risk monitor picks it up on the next cycle,
+fires the matching kill through its real path, and deletes the
+sentinel. Induced kills carry `source="induced_<source>"` in
+`kill_switch-YYYY-MM-DD.jsonl`.
 
-Non-daily_halt induced kills are sticky — `docker compose restart corsair`
-to clear. daily_halt induced kills auto-clear at the next CME session
-rollover (17:00 CT).
+Both `margin` and `daily_pnl` fire as `kill_type="halt"` per
+operator overrides §7 / §8 — positions are NOT flattened. The
+induce script's docstring still says "flatten" for some kills;
+that's stale, the runtime is halt-only.
+
+Non-`daily_halt` induced kills are sticky:
+`docker compose restart corsair-broker-rs` to clear.
+`daily_halt` induced kills auto-clear at the next CME session
+rollover (17:00 CT) via `risk.clear_daily_halt()`.
 
 ## 10. Hedge mode: execute (re-enabled 2026-04-26 after Phase 0 fix)
 
@@ -804,216 +760,96 @@ for tuning:
 should investigate. High `staleness_cancel_dark` rate means liquidity
 is thin; consider tightening `MIN_BBO_SIZE`.
 
-## 17. Rust trader binary (cleanup pass 7-onwards, 2026-05-01)
+## 17. Rust trader (architecture + debugging)
 
-Full Rust port of `src/trader/main.py` lives at
-`rust/corsair_trader/`. The Python trader still works; the Rust
-binary is selected at runtime via env var.
+The trader is a 9.8 MB native binary at
+`/usr/local/bin/corsair_trader_rust`, source `rust/corsair_trader/`.
+There is no Python trader anymore (deleted Phase 6.8a, no
+`CORSAIR_TRADER_LANG=python` path). The binary **requires**
+`CORSAIR_IPC_TRANSPORT=shm` — hard exit otherwise.
 
-### What it is
+### Architecture (cross-referenced by §21, §23, §25, §26)
 
-A 9.8 MB native binary baked into the corsair docker image at
-`/usr/local/bin/corsair_trader_rust`. Same protocol on the wire
-(msgpack frames over SHM rings + FIFO notify), same env-var
-conventions, same JSONL output format. Drop-in replacement for the
-Python trader.
+- Single tokio multi-thread runtime (2 workers). Hot loop,
+  staleness task, telemetry task, JSONL writers share it.
+  mimalloc as the global allocator. `corsair-hot` thread pinned to
+  cpu 8 (busy-spin); see §23 for the cross-process pinning regime.
+- `state::SharedState` is lock-sharded. Heavy maps (`options`,
+  `our_orders`, `orderid_to_key`, `vol_surfaces`, `theo_cache`,
+  `expiry_intern`, `kills`) are `dashmap::DashMap` — the 10 Hz
+  staleness sweep iterates one shard while the hot loop inserts to
+  others without blocking. Scalars + histograms behind
+  `parking_lot::Mutex`; counters are `AtomicU64`; `kills` carries a
+  parallel `kills_count: AtomicUsize` so the per-tick "any kills?"
+  gate is one Relaxed load. Hot path holds at most one state lock
+  at a time — no deadlocks possible.
+- HashMap keys use `char` for `right`/`side` (not `String`).
+  `OptionState` is Copy-only (no `TickMsg` clone bloat).
 
-Feature parity: full 6-layer safety stack, dead-band, GTD-refresh,
-cancel-before-replace + skip-near-GTD, tick-jumping with edge
-constraint, staleness loop with dark-book on-rest guard, all 6
-decision counters, place_ack handling, kill/resume, JSONL streams
-(trader_events + trader_decisions, 256 MB rotation), uvloop-
-equivalent (tokio multi-thread). SVI + SABR pricing via the
-existing `corsair_pricing` Rust crate (Hagan SABR + SVI implied
-vol + Black76).
+### Debugging
 
-### How to run
+- `docker compose logs -f trader`
+- Telemetry every 10s: `[corsair_trader] telemetry:` line with
+  full counter dict (decision reasons, latency histograms).
+- JSONL streams in `logs-paper/`: `trader_events-YYYY-MM-DD.jsonl`
+  (one line per inbound IPC event), `trader_decisions-YYYY-MM-DD.jsonl`
+  (one line per place outcome).
+- **SHM ring drop monitor** warns every 10s if `frames_dropped` grew
+  on either ring. Critical safety signal — if the trader is too
+  slow to drain, the broker drops events including `kill`
+  messages. Never ignore.
 
-Selection is at runtime via `CORSAIR_TRADER_LANG`:
+### Rollback + limits
 
-```bash
-# Python trader (default — backward compat)
-CORSAIR_BROKER_MODE=1 CORSAIR_TRADER_PLACES_ORDERS=1 \
-    CORSAIR_IPC_TRANSPORT=shm \
-    docker compose --profile broker-split up -d --force-recreate trader
+No in-place runtime fallback. To roll back: `git revert` Phase 6.7+
+commits and rebuild. To temporarily stop quoting: stop the trader
+container — the broker stays connected and snapshot/risk continue.
 
-# Rust trader (recommended — faster hot path)
-CORSAIR_BROKER_MODE=1 CORSAIR_TRADER_PLACES_ORDERS=1 \
-    CORSAIR_IPC_TRANSPORT=shm CORSAIR_TRADER_LANG=rust \
-    docker compose --profile broker-split up -d --force-recreate trader
-```
-
-The Rust trader **requires** `CORSAIR_IPC_TRANSPORT=shm` — it does
-not implement the legacy Unix-socket transport. Hard exit otherwise.
-
-### Latency improvement vs Python trader
-
-Measured 2026-05-01 in steady-state cut-over:
-
-| Metric | Python trader | Rust trader | Δ |
-|---|---|---|---|
-| TTT p50 | ~380 μs | ~50 μs | 7.6× |
-| TTT p99 | ~5.6 ms | ~1-3 ms | 2-5× |
-| IPC p50 | ~110 μs | ~80 μs | 1.4× |
-| Compute p50 | ~270 μs | ~10 μs | 27× |
-
-The compute portion is sub-microsecond in Rust — the entire 6-gate
-stack + decide_quote + cancel-before-replace logic runs faster than
-1 μs end-to-end. Tail latency (TTT p99) is now dominated by tokio
-scheduler interactions rather than Python orchestration.
-
-### Architecture notes
-
-- Single tokio multi-thread runtime (2 workers). Hot loop, staleness
-  task, telemetry task, JSONL writers all share the runtime. No
-  uvloop on the trader despite uvloop being faster on the broker
-  (tested 2026-05-01: uvloop INCREASED trader's TTT p50 because
-  libuv's scheduler gives more time to non-hot-path tasks; default
-  asyncio's tighter `sleep(0)` semantics happens to be optimal here).
-- `state::SharedState` is lock-sharded (Priority 1, 2026-05-04).
-  Heavy maps (`options`, `our_orders`, `orderid_to_key`,
-  `vol_surfaces`, `theo_cache`, `expiry_intern`, `kills`) live in
-  `dashmap::DashMap` so the 10 Hz staleness sweep iterates one
-  shard while the hot loop inserts to others without blocking.
-  Histograms (`ipc_us`, `ttt_us`) and scalars (config + risk +
-  underlying + weekend_paused) each live behind their own
-  `parking_lot::Mutex`; the hot path snapshots scalars once per
-  tick into a stack-local `ScalarSnapshot`. `DecisionCounters`
-  fields are `AtomicU64` — counter bumps are wait-free. `kills`
-  also has a parallel `kills_count: AtomicUsize` so the per-tick
-  "any kills?" gate is one Relaxed load instead of an
-  `is_empty()` that touches every DashMap shard. No deadlocks —
-  the hot path holds at most one state lock at a time.
-- `tte_cache` module memoizes parsed expiry datetimes per-thread
-  (production has ~4 unique expiries; cache is essentially immortal
-  after warmup).
-- HashMap keys use `char` for `right` and `side` instead of
-  `String`. Saves ~80% of hot-path heap allocations.
-- `OptionState` is a slim Copy-only struct stored in the `options`
-  dict instead of full `TickMsg` clones (which would carry redundant
-  expiry/right strings).
-
-### Where to look when debugging
-
-- Container logs: `docker compose logs -f trader`
-- Telemetry every 10s with full counter dict (search for
-  `[corsair_trader] telemetry:`)
-- JSONL streams in `logs-paper/`:
-  `trader_events-YYYY-MM-DD.jsonl` (one line per inbound IPC event)
-  `trader_decisions-YYYY-MM-DD.jsonl` (one line per place outcome)
-- SHM ring drop monitor warns every 10s if `frames_dropped` grew
-  on either ring (events or commands). Critical safety signal —
-  if trader is too slow to drain, broker drops events including
-  `kill` messages.
-
-### Rollback
-
-There is no in-place runtime fallback. The Python trader was deleted
-in Phase 6.8a (no `CORSAIR_TRADER_LANG=python` path remains) and the
-Python-vs-Rust parity scripts were removed in the 2026-05-05 cleanup.
-To roll back: `git revert` the Phase 6.7+ commits and rebuild the
-image. To temporarily stop quoting: stop the trader container — the
-broker stays connected and snapshot/risk continue.
-
-### Known limitations
-
-- No partial-fill handling. Production places `qty=1` orders so
-  partial fills are impossible; if that ever changes, the
-  order_ack handler needs updating.
+No partial-fill handling. Production places `qty=1` so partials
+are impossible; if that invariant ever changes, the order_ack
+handler needs updating first.
 
 ## 18. Code-quality cleanup pass (2026-05-05)
 
-A full audit + cleanup pass landed 2026-05-05 (one commit per group).
-Highlights worth knowing about when debugging:
+A broad audit + cleanup landed 2026-05-05. Most items are
+git-log territory; the entries below have permanent operator
+value (don't revert these without thinking) or are the
+canonical anchor for cross-references elsewhere in this doc.
+For the full record: `git log --oneline 2026-05-04..2026-05-06`.
 
-### Correctness fixes
-- **IPC ring memory ordering** (`corsair_ipc/src/ring.rs`): producer/
-  consumer offsets now use `AtomicU64` with explicit `Acquire`/`Release`
-  pairs. The prior plain `from_le_bytes`/`copy_from_slice` allowed the
-  compiler to reorder data writes past the offset publish — silent
-  cross-process data race under load.
-- **Hedge-staleness fail-closed** in RiskMonitor + ConstraintChecker
-  per §14 above. This was the long-standing live-deployment hard
-  prerequisite from the 2026-04-27 effective-delta-gating change.
-- **Realized P&L VWAP** (`corsair_position/src/portfolio.rs`):
-  `add_fill` now blends same-direction fills via running absolute-qty
-  VWAP. Previously each open overwrote `avg_fill_price` with the most
-  recent fill, miscalculating realized P&L between IBKR reconciles.
-- **`update_ask` updates `hedge_underlying`** (`corsair_market_data`):
-  was bid/last only, leaving hedge mark unset on ask-first sequences.
-- **Improving-delta sign-flip** (`corsair_constraint`): the "improving"
-  exception used to fire when post-fill delta crossed zero with smaller
-  abs(); now requires `sign(post) == sign(cur)` for the bypass.
-- **NaN guards in pricing**: SABR `(1−2ρz+z²).max(0).sqrt()` clamp,
-  finite-result fallback to alpha; SVI surfaces a counter on negative-
-  variance floor; Brent returns `None` on non-convergence (was masking
-  with last `b`).
-- **Trader risk-gate margin None**: previously fail-closed only on
-  `effective_delta = None`; now also on `margin_pct = None`.
-- **`KillMsg.source` defaulting to `"?"`**: removed; unparseable kill/
-  resume messages are now dropped + counted (was masking errors via a
-  self-cancelling `"?"` kill/resume cycle).
-- **MissedTickBehavior::Skip** on every broker `tokio::time::interval`
-  (was default Burst — could fire several risk checks back-to-back on
-  worker recovery).
-- **`cancel_all_resting` join_all**: previously sequential await per
-  cancel — O(N) RTT on the kill path; now concurrent.
-
-### Performance
-- **SVI fit `spawn_blocking`** (`vol_surface.rs`): the 5-50ms LM solve
-  no longer blocks the runtime worker.
-- **Vol-surface cache Arc-swap**: `vol_surface_cache` is now
-  `Mutex<Arc<HashMap>>` — readers Arc-clone instead of cloning the full
-  map every 250 ms snapshot tick.
-- **Trader `PlaceOrder<'a>`**: borrows `expiry`/`right`; `side` is
-  `&'static str`. Eliminates 3-4 String allocations per place.
-- **Trader rings → `parking_lot::Mutex`** (was `std::sync::Mutex`).
-- **`numerical_jacobian` pre-alloc** in calibrate.rs (was allocating
-  `vec![vec![0.0; n]; m]` per LM iter).
-- **`reqwest::Client` reused via `OnceLock`** in notify.rs.
-- **`open_orders` snapshot cache** with 1s TTL on the snapshot path.
-
-### Dead code purged
-- Python: `src/sabr.py`, `src/pricing.py`, `src/trader/` deleted (broken
-  imports — `backmonth_surface`/`utils` modules didn't exist).
-- Scripts: `scripts/flatten.py`, `reconcile_positions.py`,
-  `capture_place_order_bytes.py`, `parity_compare.py`,
-  `rust_trader_parity.py` deleted (broken `ib_insync` imports).
-  `scripts/flatten_persistent.py` was also broken (ib_insync) and
-  was deleted on 2026-05-06; replaced by the `corsair_flatten` Rust
-  binary (`rust/corsair_ipc/examples/flatten.rs`).
-- Tests: `test_sabr.py`, `test_calibrate_parity.py`, `test_pricing_parity.py`,
-  `test_decide_quote.py` — all unimportable. Only `test_ipc_protocol.py`
-  remains.
-- Configs: `config/hg_v1_4_paper.yaml`, `config/corsair_v2_config.yaml` —
-  no longer loaded by any service.
-- `requirements.txt`: `docker>=7.0` dropped (no Python imports it).
-- Dockerfile: `COPY src/ tests/` removed (Rust services don't need them).
-- Rust: `corsair_oms` shrunk from ~330 LOC of orphaned abstractions to
-  ~70 (only `OrderBook::new` and `apply_status` are used). Trader
-  `Decision::Skip`, `replace_cancel` counter, vestigial `OurOrder.send_ns`
-  / `OptionState.{strike,ts_ns,broker_recv_ns}` all removed. Broker
-  `pub type AsyncMutex<T>`, `with_market_view`, dead `ioc_tick_offset` /
-  `hedge_tick_size` config knobs deleted.
-- Cargo deps dropped: `smallvec`, `dashmap` from corsair_broker_ibkr_native;
-  `log` and `chrono` from corsair_oms; `sync` feature from corsair_tick_replay.
-- IBKR client `recvmsg_with_kernel_ts` (and the `SO_TIMESTAMPNS`
-  enable) deleted. `requests::place_order` slow path marked
-  `#[deprecated]` (production goes through `place_template::place_order_fast`).
-
-### Cleanups
-- `now_ns()` hoisted to `corsair_broker/src/time.rs` (was duplicated
-  in 3 modules).
-- Trader vol-surface lookup chain extracted to `state.lookup_vol_surface()`.
-- Trader msgpack-decode parse-error pattern collapsed into a `decode_msg<T>`
-  helper (was 9 sites).
-- Trader `strike_key` switched from `f64::to_bits()` → quantized `i64`
-  (`(s*10_000).round() as i64`) — fixes a latent bug where
-  `6.025` and `6.0250000001` would hash to different bins.
-- Default broker mode is now `Live` (was `Shadow`); flip
-  `CORSAIR_BROKER_SHADOW=1` to opt-in.
-- Stale Phase / ib_insync / PyO3 / "Mirrors X.py" comments removed
-  throughout the broker and broker_api crates.
+- **IPC ring memory ordering** (`corsair_ipc/src/ring.rs`):
+  producer/consumer offsets use `AtomicU64` with explicit
+  `Acquire`/`Release` pairs. The prior plain
+  `from_le_bytes`/`copy_from_slice` allowed the compiler to
+  reorder data writes past the offset publish — silent
+  cross-process data race under load. Don't revert.
+- **NaN guards in pricing**: SABR `(1−2ρz+z²).max(0).sqrt()`
+  clamp, finite-result fallback to alpha; SVI counter on
+  negative-variance floor; Brent returns `None` on
+  non-convergence (was masking with last `b`). §26 mirrors
+  the SABR clamp into the trader's local `pricing.rs`.
+- **Improving-delta sign-flip** (`corsair_constraint`): the
+  "improving" exception now requires
+  `sign(post) == sign(cur)` for the bypass — was firing on
+  zero-crossings with smaller abs(), allowing rotation
+  through zero into the opposite extreme. §22 references
+  this when discussing the deferred re-implementation.
+- **`MissedTickBehavior::Skip`** on every broker
+  `tokio::time::interval` (was default `Burst` — could fire
+  several risk checks back-to-back on worker recovery).
+  Apply to any new interval added to the broker.
+- **SVI fit `spawn_blocking`** (`vol_surface.rs`): the 5-50ms
+  LM solve runs on the blocking pool. If anyone moves it
+  back onto a worker, expect 50ms TTT spikes every fit cycle.
+- **Trader `strike_key`** quantized to `i64` via
+  `(s*10_000).round() as i64` (was `f64::to_bits()`). Fixed
+  a latent bug where `6.025` and `6.0250000001` would hash
+  to different bins. The broker mirrors this in §26
+  (`strike_key_i64`); both producer and consumer must agree.
+- **Default broker mode is `Live`** (was `Shadow`). Flip
+  `CORSAIR_BROKER_SHADOW=1` to opt back into shadow mode.
+  Forgetting this on a fresh deploy means the broker
+  silently doesn't place orders.
 
 ## 19. Taylor reprice — anchor on `spot_at_fit`, NOT `forward` (2026-05-06)
 
@@ -1167,3 +1003,526 @@ time series over 1-2 weeks of clean live data.
   the complete §16/§19 followup record. Newtype refactor (audit
   Option A) is the next downstream item; tracked separately as task
   #16 in the spike's task list.
+
+## 21. Latency micro-opt audit — stop chasing sub-µs (2026-05-06/07)
+
+Combined record across two audit waves (4 trader candidates +
+3 broker candidates): 7 multi-run validations, 6 INCONCLUSIVE,
+1 shipped-as-refactor (`arc_dedup` — DRY hoist, zero behavior
+change, no measurable latency claim). At the current
+architecture scale, **sub-µs broker/trader optimizations don't
+extract from measurement noise even with a disciplined N=8
+multi-run protocol**.
+
+### Operationally load-bearing rules
+
+- **Trader histogram is in nanoseconds**
+  (`state.rs::Histograms::ipc_ns` / `ttt_ns`, telemetry line
+  suffix `_ns`). Don't revert to µs without also fixing
+  `compare_latency.py --noise-floor-p50-ns` (the µs-era default
+  is wrong by 1000× for ns inputs). The dashboard reads
+  broker-side `ttt_us` from snapshot — separate, stays in µs.
+- **Warm-state TTT p50 reproducibility is ±15ns.** Detection
+  threshold (3σ, N=5+5 interleaved) is ~45ns. Anything smaller
+  needs a criterion microbench in `rust/perf_bench/`, not the
+  600s end-to-end harness.
+- **Always 5+5 interleaved runs minimum.** The first run of
+  each arm is a cold-start outlier (cold mimalloc, cold page
+  cache, busy-poll warmup) — drop it if >300ns slower than the
+  rest of its arm.
+
+### Where the real wins live
+
+User-visible latency is 84ms broker RTT = 99.97% IBKR network,
+0.03% broker code. The bottleneck within our code has been
+hammered to ~12µs broker / ~15.5µs trader and is well-distributed
+(TCP_NODELAY ✅, SO_BUSY_POLL=50µs ✅, hand-rolled
+`place_template` encoder ✅, lock-sharded state ✅). Order-of-
+magnitude wins require architectural change:
+
+- **FIX migration** (~10-30ms via smarter ack semantics, no IBKR
+  API reflection, leaner wire format). The msgpack hand-roll
+  template from this audit is in stash for re-use.
+- **Colo near IBKR** (~80ms via network distance).
+- **FPGA / kernel-bypass** per `docs/fpga_arty_a7_feasibility.md`.
+
+Stop chasing local-path code optimization. Remaining items in
+`rust/corsair_broker/` are research-grade observations.
+
+## 22. Tiered improving-fill exceptions — preserved in code, not wired (deviation noted 2026-05-07)
+
+The Python predecessor (`src/constraint_checker.py`) had a tiered
+constraint-gating system that allowed quotes/fills to proceed even at
+risk-threshold breach, provided the fill *reduced* the breach:
+
+- **Tier 1 (margin priority escape)**: at `cur_margin > margin_ceiling`,
+  accept any fill where `post_margin < cur_margin` — even if it
+  incidentally drifts delta/theta. Rationale: margin is solvency-
+  critical; small delta/theta drift is operationally recoverable, but
+  a margin breach risks broker-forced liquidation. Margin always
+  takes priority over delta/theta hygiene.
+- **Tier 2 (per-constraint improving)**: at any individual ceiling
+  breach (margin, delta, theta), accept fills that reduce that
+  specific constraint, with sign-flip protection on delta to prevent
+  rotation through zero into the opposite extreme.
+- **Tier 0 (always block)**: hard kills (`margin_kill`, `delta_kill`,
+  `theta_kill`) reject unconditionally, no exceptions.
+
+The Rust port faithfully preserves this in
+`corsair_constraint::ConstraintChecker::check()`
+(`rust/corsair_constraint/src/checker.rs:183-352`), including the
+sign-flip fix from §18. **However, `check()` is never called on the
+live order path.** The trader's `decision::compute_risk_gates`
+(`rust/corsair_trader/src/decision.rs:645`) implements only per-side
+delta blocking at `delta_ceiling`, and ALL-blocks at `margin_ceiling`,
+`theta_kill`, `vega_kill`, `delta_kill`. The constraint instance is
+held in `runtime.constraint` but only used for `ibkr_scale()`
+(snapshot rendering) and `update_cached_margin()` (calibration).
+
+### Operational impact
+
+When the trader hits margin or theta breach, all quoting halts until
+the operator manually unwinds. The original tier-1/tier-2 logic would
+have allowed the bot to self-unwind by accepting only improving fills.
+24h live `risk_block` counter ≈115 events (≈1% of decisions). Real
+gap during pickoff recovery scenarios where margin drifts up; not
+catastrophic.
+
+### Bug noted while documenting (2026-05-07)
+
+`compute_risk_gates` assumes BUY adds delta and SELL subtracts. True
+for CALLS, **false for PUTS** (buying a put subtracts delta, selling
+a put adds delta). At `delta_ceiling` breach, the gate currently
+blocks the wrong side for puts. Latent under the OTM-only short-
+strangle config (puts contribute negative delta on either book
+direction); a future product config that quotes long puts would
+expose it.
+
+### Re-implementation plan (when prioritized)
+
+Two options, increasing scope:
+
+1. **Trader-side per-(right, side, strike) gates with improving
+   exceptions for delta and theta**. Data is already in `theo_cache`
+   modulo exposing theta. Margin improving requires position state
+   from the broker (new IPC field or per-strike publish). ~150 LOC,
+   no broker latency cost.
+2. **Broker-side `ConstraintChecker.check()` wired into
+   `handle_place`** — most faithful to the Python lineage, reuses the
+   existing tested checker. Adds ~1µs to broker TTT for the SPAN math
+   per place (the hot path is already at 27µs broker TTT; this is a
+   ~4% increase). ~50 LOC at the call site plus a small data-flow
+   piece to feed `cur_long_premium` and friends.
+
+Deferred 2026-05-07 because:
+- Latency cost of (2) is unwelcome on the broker hot path; (1)
+  requires non-trivial scoping (per-strike position IPC)
+- Operational impact (~1% block rate) is real but not blocking
+- The §18 history of improving-fill bugs (sign-flip) suggests the
+  feature deserves careful design, not a quick reimplementation
+
+Pre-FIX migration is the natural moment to tackle this — the broker
+hot path gets reorganized then anyway, and the constraint-check call
+can be folded into the new structure cleanly.
+
+### What NOT to do
+
+- **Don't delete `corsair_constraint::ConstraintChecker::check()` as
+  dead code.** It captures the Python algorithm including the
+  sign-flip fix; deleting forfeits years of operational learning.
+  Keep it as the reference implementation pending the wire-up.
+- **Don't "fix" the puts-direction bug in `compute_risk_gates`
+  without re-thinking the whole gate.** A partial fix that makes
+  puts right but doesn't add improving-fill exceptions ships
+  inconsistent semantics. Either do the full §22 work or leave it
+  documented as latent.
+
+## 23. Host CPU isolation — keep crowsnest off the corsair cpuset (2026-05-07)
+
+Trader pinning is necessary but not sufficient. The trader's hot
+loop busy-spins on cpu 8; cpu 9 is the SMT sibling (same physical
+P-core), so any work scheduled on cpu 9 steals pipeline execution
+units from `corsair-hot` and produces multi-millisecond TTT p99
+outliers that don't show up in p50 or p99 of the broker-side
+histogram (which only sees the broker's own work).
+
+The first incarnation of this bug was the trader's OWN background
+threads (jsonl writers, fallback tokio worker) landing on cpu 9 —
+fixed in commit `4503cb3` (May 6) by pinning each thread to a
+specific cpu and preferring cross-physical-core fallbacks.
+
+**The second incarnation is host-side**: the `crowsnest.slice`
+(bitstamp/coinbase/dydx/etc. data collectors, ~14 services) ran
+with affinity `0xffffffff` and the kernel scheduler placed dozens
+of Python threads on cpus 8 and 9 (and 12-15 where the broker's
+tokio workers live). Symptom on 2026-05-07: trader `ttt_p99_ns`
+clustered at 5.4ms / 6.9ms / 8ms across 21+ telemetry windows
+even though steady-state p99 is ~90µs.
+
+### Topology (i9-14900K, SMT enabled)
+
+```
+cpus  0-15  → 8 P-cores HT (each P-core = 2 logical cpus)
+              (cpus 8,9 = P-core 4; cpus 10,11 = P-core 5; etc.)
+cpus 16-31  → 16 E-cores (1 logical cpu each)
+
+corsair containers:
+  trader → cpus 8-11   (P-cores 4 and 5)
+  broker → cpus 12-15  (P-cores 6 and 7)
+
+trader thread layout:
+  cpu 8   → corsair-hot std::thread (busy-spin, hot path)
+  cpu 9   → SMT sibling of cpu 8 — DELIBERATELY EMPTY
+  cpu 10  → tokio-rt-worker (parked)
+  cpu 11  → corsair-bg + jsonl-trader_events + jsonl-trader_decisions
+```
+
+### The fix
+
+`AllowedCPUs=0-7,16-31` on the slice would be cleanest, but
+`user@1000.service` does not have the `cpuset` controller
+delegated (only `cpu memory pids`), so cgroup-level cpuset
+constraints silently no-op. Two paths:
+
+**Option A (cleanest, requires sudo)** — delegate cpuset:
+
+```ini
+# /etc/systemd/system/user@.service.d/delegate.conf
+[Service]
+Delegate=cpu cpuset memory pids
+```
+
+Then `sudo systemctl daemon-reload && sudo systemctl restart user@1000.service`
+(this kills the user session). The existing
+`crowsnest.slice.d/cpus.conf` would then take effect.
+
+**Option B (no sudo, what we shipped)** — per-service
+`CPUAffinity` drop-ins. CPUAffinity uses `sched_setaffinity`
+directly and bypasses cpuset delegation. Drop-ins live at
+`~/.config/systemd/user/<svc>.service.d/cpus.conf`:
+
+```ini
+[Service]
+CPUAffinity=0-7 16-31
+```
+
+Applied to all 14 crowsnest services on 2026-05-07. The
+slice-level `AllowedCPUs` override is also in place so that
+delegation, if enabled later, will pin the slice without a
+second pass.
+
+### Verification
+
+```bash
+# 1. Slice config visible to systemd
+systemctl --user show crowsnest.slice | grep AllowedCPUs
+
+# 2. Per-service kernel-level affinity (the load-bearing one)
+PID=$(systemctl --user show bitstamp-collector -P MainPID)
+grep Cpus_allowed_list /proc/$PID/status
+# expected: 0-7,16-31
+
+# 3. Live thread placement — no crowsnest threads on 8-15
+ps -eLo psr,cgroup | awk '$1 >= 8 && $1 <= 15' | grep -c crowsnest
+# expected: 0
+```
+
+### Why this matters
+
+The trader's own pinning gets you to "no contention from your own
+threads". This change gets you to "no contention from anything
+else on the host". On Alabaster (former host) the kernel cmdline
+included `isolcpus=8-11` which solved the same problem at boot
+time; on the current i9-14900K we don't `isolcpus` because we
+want the corsair cpuset to participate in housekeeping (kworkers
+etc.). Per-cgroup affinity is the substitute.
+
+### Don't
+
+- **Don't pin everything to a single cpu** ("everyone goes to
+  cpu 0"). The kernel uses cpu 0 for many default-affinity
+  housekeeping paths (timer ticks, default IRQ handling) — moving
+  ALL userspace there creates contention with the kernel itself.
+  `0-7` plus E-cores spreads load across multiple physical cores.
+- **Don't think `systemctl show ... | grep AllowedCPUs` proves the
+  pin works.** That only shows what systemd was TOLD; if cpuset
+  isn't delegated, the directive is silently dropped at the
+  cgroup level. Always verify at `/proc/<pid>/status`
+  Cpus_allowed_list.
+- **Don't restrict the slice tighter than CPUQuota allows.**
+  `crowsnest.slice` has `CPUQuota=1600%` (16 cores). The
+  `0-7,16-31` mask has 24 logical cpus = ample room.
+
+## 24. SABR IV inversion uses mid, not microprice (2026-05-07)
+
+`vol_surface.rs::snapshot_chain` previously computed the input
+price for IV inversion via microprice:
+
+```rust
+price = (bid * ask_size + ask * bid_size) / (bid_size + ask_size)
+```
+
+That formula is informative when displayed sizes track real
+liquidity. On HG OTM strikes they don't — bids and asks frequently
+display 1-lot resting orders that pull the formula toward
+whichever side has the smaller quote. The result was systematic
+side-asymmetric bias visible in production:
+
+- OTM puts: bid_size often 1, ask_size 16-33 → microprice tilted
+  toward bid → IV inversion underestimated → put theos
+  systematically 1-3 ticks BELOW mid
+- OTM calls: mirror image → call theos 1 tick ABOVE mid
+
+Put-call parity on the theo side was clean (`theo_C - theo_P + K
+= F` consistent across strikes), so the issue wasn't a fit bug —
+the inputs were biased. Switched to plain `(bid + ask) / 2.0`.
+The two-sided / non-zero-size guards above the price line stay in
+place; only the formula changed.
+
+A size-floor compromise (`bs ≥ 3 && as ≥ 3`) was considered and
+rejected — it would have cut the put input set from 7 strikes to
+2 on the inspected snapshot, leaving the fit underdetermined on
+the put side.
+
+### Why microprice was originally chosen
+
+The 2026-05-05 cleanup pass bundled microprice with the
+zero-size / one-sided / inverted-book skip checks under "Rec 2
+expanded" remediation of the 5.90 P / 6.05 C accumulation
+incident. The skip checks did the load-bearing work (excluding
+stale strikes during fast spot moves); the microprice tweak rode
+along. Removing the formula keeps the load-bearing guards.
+
+### How to revert
+
+If a future regime change makes microprice signal load-bearing
+again (e.g., HG flow gets deep enough that displayed sizes
+genuinely reflect demand asymmetry), revert to the size-weighted
+formula at `snapshot_chain`. Don't half-measure with a size
+floor unless you've checked that the post-floor strike set is
+big enough to fit (≥4-5 points per side after the OTM-only
+filter).
+
+## 25. Trader-centric kill controller — improving-only gates + watchdog (2026-05-07)
+
+Aligned the kill stack with v1.4 spec §6.2 by making the trader
+the authoritative strategy-kill controller. Spec language for
+delta_kill ("Halt new opens, force-hedge to 0") and theta_kill
+("Halt new opens") IS improving-only quoting; the broker's
+prior block-all behavior was over-conservative. The Python
+predecessor's tier-1 margin-improving exception (CLAUDE.md §22)
+is intentionally NOT carried over — margin breach stays as
+hard halt per operator preference.
+
+### What changed
+
+| Where | Before | After |
+|---|---|---|
+| Margin breach | broker block_all + trader block_all | unchanged (margin stays broker hard halt) |
+| Theta breach | broker fires `THETA HALT` (block_all) | trader gates per-side: BUYs blocked, SELLs allowed |
+| Delta_ceiling breach | trader block per-side, sign-bug latent on puts | trader gates per-(right, side) sign-aware via cached `gx.delta` |
+| Delta_kill (5.0 hard) | broker fires `DELTA KILL` + force-hedge | **REMOVED** — hedge engine owns the delta control loop |
+| Vega | disabled (vega_kill=0) | unchanged (improving-only is hard to define for vega; if re-enabled it stays as block_all) |
+| daily_pnl_halt | broker | unchanged (P&L tracking lives in broker) |
+| Operational kills (gateway, calibration, recon) | broker | unchanged |
+
+The §22 latent puts-direction bug is fixed as part of this work
+— `improving_passes` reads the signed `gx.delta` (positive for
+calls, negative for puts) so all four (right, side) combinations
+are gated correctly.
+
+### How "improving-only" works (the load-bearing part)
+
+For a single-contract fill of qty=1:
+
+| Action | Δ portfolio_delta | Δ portfolio_theta |
+|---|---|---|
+| BUY call  | +call_delta (+0.x) | +call_theta (negative) |
+| SELL call | −call_delta (−0.x) | −call_theta (positive) |
+| BUY put   | +put_delta (−0.x)  | +put_theta (negative) |
+| SELL put  | −put_delta (+0.x)  | −put_theta (positive) |
+
+Read off:
+- **Theta breach** (theta < theta_kill) → improve = increase
+  theta → allow SELLs (collect decay), block BUYs. Right-agnostic.
+- **Delta breach high** (eff > +ceiling) → improve = decrease
+  delta → allow SELL call + BUY put. Block BUY call + SELL put.
+- **Delta breach low** (eff < −ceiling) → mirror image.
+
+Implementation: `corsair_trader/src/decision.rs::improving_passes`.
+Truth table enumerated exhaustively in
+`improving_passes_truth_table` test. ~1-2 ns per gate per side
+(below the §21 noise floor).
+
+### Greek cache extension
+
+`theo_cache` was previously `(theo, delta)` per-strike per-fit.
+Now stores full `TheoGreeks { theo, delta, theta, vega }` (still
+at multiplier=1.0). Caching all four together costs ~5 extra
+fp64s of memory per strike (44 strikes × 32 bytes = 1.4 KB) and
+no extra compute on the hot path — `compute_theo` already calls
+Black76 via SVI/SABR; the same call now returns all greeks via
+`black76_greeks`. Theta + vega drive `improving_passes`; delta
+still drives Taylor reprice.
+
+### Trader watchdog (broker-side)
+
+With strategy kills gone, a trader crash leaves the broker with
+no per-strike protection. Mitigated by a 1Hz heartbeat from
+trader → broker plus a watchdog task on the broker:
+
+- Trader publishes `heartbeat` msgpack frame every 1s on the
+  commands ring.
+- Broker's `dispatch_commands` updates `Runtime::last_trader_msg_ns`
+  on EVERY received frame (place / cancel / modify / telemetry /
+  heartbeat / welcome). Active markets keep the watchdog warm
+  via order traffic; calm markets rely on the heartbeat.
+- `trader_watchdog` task runs 1Hz, fires `trader_silent` kill if
+  the gap exceeds `CORSAIR_TRADER_WATCHDOG_TIMEOUT_S` (default 5s).
+- `trader_silent` is a sticky `KillSource` — operator must
+  `docker compose restart corsair-broker-rs` after investigating
+  the underlying trader fault. Auto-resume on heartbeat is
+  deliberately NOT supported — a trader stuck in crash-restart
+  would silently mask itself.
+
+### Hello rehydration
+
+`HelloMsg` now carries `active_kills: Vec<String>`. When the
+trader reconnects (after crash/restart), the broker emits its
+current active kill set in `hello`; the trader populates its
+local `kills` map from the list and stays out of the market
+until the operator clears via broker restart. Closes a window
+where a restarted trader could resume quoting against a broker
+still holding `trader_silent` from the prior trader.
+
+### Why margin stays at broker
+
+P&L tracking, position state, margin computation all live in
+the broker (broker owns IBKR fills + portfolio state). Moving
+margin/daily_pnl to the trader would be a multi-week refactor
+(trader needs its own portfolio state). For now: margin and
+daily_pnl_halt stay broker-side; everything else moves to
+trader. Operational kills (gateway disconnect, calibration
+RMSE, fill rate per spec §7) also stay broker-side because
+they're infrastructure responses, not strategy policy.
+
+### Verification
+
+- `improving_passes_truth_table` test: enumerates all 4 (right ×
+  side) × 4 (breach states) = 16 cases. Sign tables documented
+  inline.
+- `delta_ceiling_high_blocks_sell_put_allows_buy_put` integration
+  test: drives the full `decide_on_tick` flow with a put tick at
+  delta breach, confirms BUY allowed + SELL blocked. Pins the §22
+  puts-direction fix.
+- Live verification (2026-05-07 deploy): trader hit theta breach
+  (theta=-523 vs theta_kill=-500), `risk_block_buy` counter
+  climbed to 11k+ over a few minutes (BUYs blocked); `place`
+  counter still incremented for SELLs. Behavior matches design.
+
+### Don't
+
+- **Don't add delta_kill back to the broker.** Hedge engine
+  controls delta; a separate hard halt is redundant and fires
+  spuriously when hedge is mid-rebalance.
+- **Don't auto-resume on trader heartbeat.** Sticky kill is
+  load-bearing — auto-resume would mask crash loops.
+- **Don't shorten the watchdog timeout below 3s.** GTD-5s on
+  every order is the safety floor; 5s timeout means at most
+  one expiry window of unmanaged orders. Tighter than that
+  risks false-positive on 1-2s GC pauses.
+- **Don't sprinkle `improving_passes` calls anywhere else.** The
+  per-side gate runs ONCE in `decide_on_tick` per side per tick,
+  exactly where the place/modify decision is being made. Adding
+  it elsewhere (e.g. staleness loop) would either re-block
+  already-resting orders (operator-confusing) or no-op.
+
+## 26. Audit passes 2026-05-07
+
+Two back-to-back audit waves shipped 2026-05-07 (commits
+`9e5acb9`, `8d7a0a9`). Full record: `git show 9e5acb9 8d7a0a9`.
+The items below have permanent operator value or anchor
+cross-references elsewhere — don't revert without thinking.
+
+### Correctness
+
+- **`handle_place` rejects malformed `right`/`side`** — drops +
+  WARNs on empty `right` or non-`"BUY"`/`"SELL"` `side` instead
+  of silently bucketing as 'C' / Sell. The prior catch-all
+  clauses flipped direction on any schema drift (lowercase,
+  typo, empty). Don't loosen.
+- **`PlaceOrder.gtd_seconds` plumbed end-to-end.** Broker no
+  longer falls through to a hardcoded 30s. Config knob
+  `quoting.gtd_lifetime_s` now actually drives placed-order
+  lifetime (it previously controlled modify timing only).
+- **`DepthBook::apply` evicts on full-book insert at any
+  position.** Was: only handled the tail; IBKR L2 inserts at
+  pos<5 on a full book silently dropped new best-bid/ask
+  arrivals during fast moves. 7 unit tests in
+  `corsair_market_data/src/option_state.rs::tests` pin the fix.
+- **Trader `pricing.rs` NaN guards** — same SABR radicand
+  `.max(0.0)` clamp + finite-result fallback that
+  `corsair_pricing` got in §18. The trader-side defense belongs
+  at the source even though `compute_theo`'s `iv.is_nan()`
+  check catches it one layer up.
+- **`improving_passes` / `compute_theo` fail-closed on
+  non-finite greeks.** NaN comparisons silently returned false
+  in the `<= 0.0` / `> 0.0` checks, allowing orders through
+  under degenerate inputs.
+
+### Hardening
+
+- **`OutboundLimiter::try_consume` uses `compare_exchange`** —
+  closes a TOCTOU window where hot+staleness could both pass
+  the 2-cap. Bound is now strict; don't revert to read-then-set.
+- **`pump_errors` routes connection failures to sticky
+  `KillSource::Disconnect`** for `BrokerError::ConnectionLost`
+  and `Protocol{ code: 1100|1102|1300|504, .. }`. Quoting halts
+  even when the connection-event stream is delayed. Cleared by
+  the existing `pump_connection` listener on reconnect.
+- **`Runtime::contract_by_key` quantized via `strike_key_i64`**
+  (`(strike * 10_000).round() as i64`). Mirrors §18's trader
+  fix — both producer and consumer must agree, do not change
+  one side without the other.
+- **§14 stale-hedge WARN re-emits at power-of-two occurrences**
+  (was: self-suppress for entire process lifetime). Operator
+  sees re-staling weeks later instead of silently degraded gates.
+- **JSONL writers re-sync `current_size` from disk metadata on
+  write error** — size-based rotation recovers after transient
+  failures (disk-full no longer freezes rotation).
+- **`corsair_broker::config::validate` requires ≥1 product
+  enabled.** A YAML with all `enabled: false` previously booted
+  a broker with zero quoting instruments, visible only via the
+  absence of subscriptions.
+
+### `recently_terminated` cache (operator-relevant)
+
+`Runtime::recently_terminated` is a 60s TTL cache of OrderIds
+that hit a terminal status (Filled/Cancelled/Rejected/Inactive).
+`handle_modify` / `handle_cancel` short-circuit on hit instead
+of round-tripping IBKR for the inevitable "code 104 cannot
+modify a filled order" + 2s ack timeout — that path was
+producing multi-ms tail events under fill churn (see
+`docs/HANDOFF_LATENCY_LEDGER.md` §3.2). Hits bump
+`stale_modify_dropped` / `stale_cancel_dropped` atomics;
+`periodic_terminated_evict` runs at 10s.
+
+IBKR doesn't reuse OrderIds within a session, so no
+false-positive risk on a fresh order landing on a previously-
+terminal id. After 60s any such id has long since left the
+trader's queue.
+
+### Operator runbook
+
+- **`code 104` in IBKR errors** — `recently_terminated` should
+  suppress most. If it happens anyway, check the cache size in
+  the periodic log line.
+- **`Discord disabled` at boot** — rustls/cert store is broken;
+  `notify::HTTP_CLIENT` is `Option<Client>` so Discord
+  notifications drop cleanly instead of hanging fire-and-forget
+  tasks. Restart with a fixed env to re-enable.
+- **`at least one product must be enabled` from broker** — your
+  YAML has all products `enabled: false`.
+- **`proposed=N.NNN outside [0.50, 1.25]` from
+  `ibkr_scale recalibrated`** — §3 behavior, untouched; fallback
+  to scale=1.0 is intended.

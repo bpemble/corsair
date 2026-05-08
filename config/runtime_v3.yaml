@@ -70,8 +70,9 @@ quoting:
   min_send_interval_ms: 250
   # Spec §3.4: skip both sides if half_spread > N × min_edge.
   # 4.0 = skip when half_spread > 4 × (min_edge_ticks × tick_size) = $0.004.
+  # 6.0 = skip when half_spread > $0.006 (12-tick BBO).
   # 0 disables the gate.
-  skip_if_spread_over_edge_mul: 4.0   # spec §3.4. Restored 2026-05-05 after empirical review: 8 ATM fills accounted for ~$144K of $152K total negative edge today; all would have been skipped at 4.0. See docs/research/improvement_spec_2026-05-05.md Rec 4.
+  skip_if_spread_over_edge_mul: 6.0   # spec §3.4 deviation. Bumped 4.0→6.0 on 2026-05-06 to quote more strikes (skip_wide_spread was the 4th-biggest skip reason in live telemetry, ~8k/session). Original 4.0 setting restored 2026-05-05 after disable-incident: 8 ATM fills accounted for ~$144K of $152K total negative edge that day. 6.0 still catches the worst-case wide regime that drove that incident; tolerates 50% more spread width than spec. Re-evaluate if skip_would_cross_* counters or pickoff fills spike. See docs/research/improvement_spec_2026-05-05.md Rec 4.
 
 hedging:
   enabled: true
@@ -81,13 +82,11 @@ hedging:
   rebalance_cadence_sec: 30
   include_in_daily_pnl: true
   flatten_on_halt: true
-  # Bumped 2 → 4 on 2026-05-04. Thin HG futures and ~140ms IBKR
-  # round trip mean a ±2-tick IOC arrives stale ~half the time and
-  # dies unfilled — exactly what was leaving us at -4.3 delta with
-  # hedge_qty=0 despite the periodic firing every 30s. Trade-off:
-  # ~$25/contract slippage at HG's 0.0005 tick × 25k multiplier.
-  ioc_tick_offset: 4
-  hedge_tick_size: 0.0005
+  # ioc_tick_offset and hedge_tick_size were dropped 2026-05-07
+  # (tracked finding #6 in the audit). Hedge orders are MARKET-IOC
+  # since 2026-05-04 (CLAUDE.md §10) — the limit-IOC offset knobs
+  # have been dead since the switch and the HedgeConfig struct no
+  # longer carries them.
   hedge_lockout_days: 30
 
 snapshot:

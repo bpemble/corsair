@@ -1,12 +1,13 @@
 # Corsair — Local Latency Optimization Ledger
 
-**Date:** 2026-05-06 (last updated)
+**Date:** 2026-05-07 (last updated)
 **Predecessor:** `docs/HANDOFF_LATENCY_OPTIMIZATION.md` (2026-05-04)
 **Status:** local hot-path optimization is approaching its structural floor. Two big architectural levers remain (trader+broker merge, infrastructure spend); see §10 + §11.
 
 This ledger captures every local-latency change attempted on the i9-13900K
-("Elephas") through 2026-05-05. Every result here was measured against a
-deterministic replay harness so the data is reproducible.
+("Elephas") through 2026-05-05, **plus the 2026-05-07 live-load revisit
+that overturned the harness-only "isolcpus inconclusive" verdict**
+(see §3.2 + §3.5).
 
 ---
 
@@ -160,7 +161,7 @@ Reverting any of the three: `git revert <sha>` + image rebuild +
 | **Item 1**: mimalloc env tuning (`MIMALLOC_PURGE_DELAY=10000`, `MIMALLOC_RESERVE_HUGE_OS_PAGES=1`) | Reduce tail decommit jitter | Inconclusive at harness scale; KS p=0.80; p50 unchanged | reverted, not in compose |
 | **Item 4**: `DashMap::with_shard_amount(8)` | Reduce cache-line traversal in 10 Hz staleness sweep | Inconclusive on KS but slight p50 regression (+1 µs); not worth the change | reverted |
 | **Items 5+6**: drop Mutex on events ring + zero-copy `read_available_into` | Save lock acquire + alloc per ring read | Neutral at harness scale (KS p=0.83); ~50-100 ns/op below noise floor | reverted; backups at `/tmp/{ring_rs,main_rs}_5_6.rs.bak` (now wiped — reimplement from this doc if revisited) |
-| **`isolcpus=8-15 nohz_full=8-15 rcu_nocbs=8-15`** | Eliminate kernel preemption from trader/broker cores | Tested; the IRQ + softirq invariants verified clean (cores 8-11 had 0 SCHED softirqs after isolation). However the post-reboot warmup confounded the measurement and the rollback didn't immediately restore the morning baseline either. Effect was indistinguishable from boot-state effect at p50; can't claim a win or loss. | rolled back; backup at `/etc/default/grub.pre-isolcpus.1778001938` |
+| **`isolcpus=8-15 nohz_full=8-15 rcu_nocbs=8-15`** | Eliminate kernel preemption from trader/broker cores | **2026-05-04 (harness, ROLLED BACK)**: IRQ + softirq invariants verified clean (cores 8-11 had 0 SCHED softirqs). Post-reboot warmup confounded the measurement, rollback didn't immediately restore baseline; effect indistinguishable from boot-state effect at p50. Could not claim win or loss. **2026-05-07 (LIVE, RE-SHIPPED)**: live wire_timing analysis showed steady-state preemption rate of ~8/sec on `corsair-hot` (19,598 involuntary ctx-switches in 40 min), dominated by `kworker/8:0`, producing multi-ms tail events that the harness's deterministic replay cannot reproduce. After applying the same flags: rate dropped to 0.14/sec; cpu 8 LOC interrupts went from ~1000/sec to 0/sec; live TTT p99 went from 16.5 ms (internal histogram) / 3.8 ms (wire_timing) → 47-55 µs steady-state — a ~440× tail reduction. The 2026-05-04 verdict was correct *for the harness* but the harness under-tested. | LIVE; pre-2026-05-07 backup at `/etc/default/grub.backup-20260507`; older pre-isolcpus backup at `/etc/default/grub.pre-isolcpus.1778001938`; setup runbook at `docs/host_cpu_isolation.md`; preempt-capture script at `scripts/capture_preempt_burst.sh` |
 | **PREEMPT_RT kernel** (`6.12.85+deb13-rt-amd64`) | Lower scheduler-preemption tail | **Confirmed regression**, statistically significant (KS p=2.8e-11). Without `SCHED_FIFO` on hot threads, the kernel-side preemption-check overhead inflates the hot path. | RT data: `~/corsair_latency/rt_kernel.json`; non-RT companion: `~/corsair_latency/non_rt_kernel.json` |
 
 ```
@@ -243,6 +244,50 @@ of each other. The fix paths:
 
 Neither is local-latency work in the hot-path sense, but both are the
 realistic levers for moving the operationally-relevant p99.
+
+### 3.5 Harness vs live: a test-scope lesson (added 2026-05-07)
+
+The 2026-05-04 isolcpus rollback (§3.2) was correct *for the harness*
+but wrong for live operation. The harness is deterministic — the
+synthetic broker emits ticks at the recorded inter-arrival times with
+no real-time bursts, no IBKR network jitter, no kworker-vs-burst
+coincidence patterns. Under those conditions, the kworker preemption
+on cpu 8 (~8/sec, ~µs each) folds into noise and isolcpus shows no
+measurable win.
+
+Under live load, two things change:
+
+1. **Tick bursts**: the broker emits 50-100 ticks within < 1 ms when
+   IBKR pushes a price update across many strikes (one such burst at
+   2026-05-07 13:02:57 had 88 ticks share the same `broker_recv_ns`).
+   If kworker preempts mid-burst, the queued ticks all wait for the
+   preemption to end — producing the multi-ms tail events.
+2. **Variable inter-arrival**: real markets have quiet periods then
+   sudden activity. A preemption during a quiet period is invisible;
+   the same preemption coinciding with a burst inflates p99 by orders
+   of magnitude.
+
+The harness flattens (1) and (2) by construction. So changes that
+target burst-tail interactions look inconclusive on the harness even
+when they're load-bearing live.
+
+**Rule for future evaluation of any kernel-scheduler / preemption /
+IRQ-pinning change**: don't ship the verdict from harness alone.
+Confirm with at least one of:
+
+- `wire_timing-*.jsonl` decomposition over a live session, looking for
+  multi-ms tail events with corresponding broker-side burst patterns
+- `/proc/$PID/task/<corsair-hot>/status` involuntary_ctxt_switches
+  rate, sampled over 10+ minutes of live trading
+- `perf record -C 8 -e sched:sched_switch` capture — see
+  `scripts/capture_preempt_burst.sh` (the script that confirmed
+  `kworker/8:0` was the dominant preempter on 2026-05-07)
+
+The harness is still the right tool for **code-path** changes (a
+ScalarSnapshot reorganization, a new `improving_passes` formula, an
+IPC encoder rewrite) where the metric is per-event arithmetic cost.
+It is the wrong tool for **scheduling-environment** changes where
+the metric is interaction with bursty, real-time arrivals.
 
 ---
 
@@ -393,13 +438,40 @@ Verify the NIC's TxRx queue IRQs land on cores OUTSIDE the trader and
 broker cpusets (currently cpuset 8-15 — IRQs should be on 0-7 or 16-31).
 On the 13900K box, default placement was already on E-cores 26-29.
 
-### CPU isolation: DON'T
+### CPU isolation: DO (revised 2026-05-07)
 
-Per today's findings: do NOT set `isolcpus=` / `nohz_full=` / `rcu_nocbs=`.
-The trader is busy-poll, so it doesn't benefit from the kernel staying off
-these cores; the only effect we measured was confounded reboot-warmup. If
-you want to revisit on a different topology, run the harness A/B before
-committing to it.
+`isolcpus=8-15 nohz_full=8-15 rcu_nocbs=8-15` SHOULD be set. The 2026-05-04
+"don't set this" verdict in earlier revisions of this doc was **based on
+harness-only A/B and was wrong for live conditions** — see §3.2 + §3.5.
+Live verdict: 19,598 involuntary ctx-switches per 40 min on `corsair-hot`
+(dominated by `kworker/8:0`) → 0.14/sec post-isolation; live TTT p99
+~440× lower.
+
+```bash
+cat /proc/cmdline
+# Expect:  ... isolcpus=8-15 nohz_full=8-15 rcu_nocbs=8-15 ...
+
+cat /sys/devices/system/cpu/isolated         # expect: 8-15
+cat /sys/devices/system/cpu/nohz_full        # expect: 8-15
+```
+
+If absent, follow the runbook at `docs/host_cpu_isolation.md` (apply +
+verify + rollback). After 10 min of live load:
+
+```bash
+PID=$(pgrep -f corsair_trader_rust | head -1)
+HOT_TID=$(grep -l "^corsair-hot$" /proc/$PID/task/*/comm | sed 's|.*/task/\([0-9]*\)/.*|\1|')
+grep ctxt_switches /proc/$PID/task/$HOT_TID/status
+# Expect involuntary < 1/min
+```
+
+The `processor.max_cstate=1 intel_idle.max_cstate=1` flags from the prior
+section MUST stay alongside isolcpus — they prevent c-state-exit jitter.
+
+**PREEMPT_RT remains rejected** (§3.2 line 164: KS p=2.8e-11 regression
+without `SCHED_FIFO`). Don't switch to the RT kernel without first
+implementing `SCHED_FIFO` on hot threads, and even then the upside is
+< 10 µs while the operational complexity is real.
 
 ### CPU pinning verification
 
@@ -489,11 +561,16 @@ done
 | location | content |
 |---|---|
 | commit `9a0cd42` | bundle 7+8+9 + replay harness + env-gated histogram dump |
-| `~/corsair_latency/non_rt_kernel.json` | non-RT harness baseline (today, n=143) |
-| `~/corsair_latency/rt_kernel.json` | PREEMPT_RT harness run (today, n=143) — proof RT regresses |
-| `/etc/default/grub.pre-isolcpus.1778001938` | pre-isolcpus grub config backup |
+| `~/corsair_latency/non_rt_kernel.json` | non-RT harness baseline (2026-05-06, n=143) |
+| `~/corsair_latency/rt_kernel.json` | PREEMPT_RT harness run (2026-05-06, n=143) — proof RT regresses |
+| `/etc/default/grub.pre-isolcpus.1778001938` | grub config backup from the 2026-05-04 isolcpus attempt |
+| `/etc/default/grub.backup-20260507` | grub config backup just before the 2026-05-07 re-ship of isolcpus (active config now includes `isolcpus=8-15 nohz_full=8-15 rcu_nocbs=8-15`) |
+| `docs/host_cpu_isolation.md` | runbook for the 2026-05-07 isolcpus apply / verify / rollback |
+| `scripts/capture_preempt_burst.sh` | perf-based scheduler-event capture; confirmed `kworker/8:0` as the dominant preempter |
+| `rust/corsair_trader/benches/decision_gates.rs` | criterion microbench for §25 gates (compute_risk_gates + improving_passes); confirms 3-5 ns/tick — well under §21 noise floor |
 | `logs-paper/wire_timing-2026-05-05.jsonl` | broker-side wire timing data; 45k+ orders for RTT analysis |
 | `logs-paper/trader_events-2026-05-05.jsonl` | trader event recording (used as harness input) |
+| `logs-paper/wire_timing-2026-05-07.jsonl` | live wire timing that exposed the multi-ms tail events the harness couldn't see; basis for the 2026-05-07 isolcpus re-ship |
 | `docs/HANDOFF_LATENCY_OPTIMIZATION.md` | predecessor handoff; lock-shard etc. context |
 
 ---

@@ -101,7 +101,9 @@ fn write_i64_kv(buf: &mut Vec<u8>, key: &str, value: i64) {
 /// `PlaceOrderCmd` deserialize path. `triggering_tick_broker_recv_ns`
 /// is omitted from the map when None (matches `skip_serializing_if`).
 pub fn encode_place_into(buf: &mut Vec<u8>, p: &PlaceOrder<'_>) {
-    let mut n_fields: u8 = 9; // type + ts_ns + strike + expiry + right + side + qty + price + orderRef
+    // 10 always-present fields: type, ts_ns, strike, expiry, right,
+    // side, qty, price, orderRef, gtd_seconds.
+    let mut n_fields: u8 = 10;
     if p.triggering_tick_broker_recv_ns.is_some() {
         n_fields += 1;
     }
@@ -117,6 +119,7 @@ pub fn encode_place_into(buf: &mut Vec<u8>, p: &PlaceOrder<'_>) {
     write_i32_kv(buf, "qty", p.qty);
     write_f64_kv(buf, "price", p.price);
     write_str_kv(buf, "orderRef", p.order_ref);
+    write_u32_kv(buf, "gtd_seconds", p.gtd_seconds);
     if let Some(v) = p.triggering_tick_broker_recv_ns {
         write_u64_kv(buf, "triggering_tick_broker_recv_ns", v);
     }
@@ -179,6 +182,7 @@ mod tests {
         price: f64,
         #[serde(rename = "orderRef")]
         order_ref: String,
+        gtd_seconds: u32,
         #[serde(default)]
         triggering_tick_broker_recv_ns: Option<u64>,
     }
@@ -216,6 +220,7 @@ mod tests {
             qty: 1,
             price: 0.0345,
             order_ref: "corsair_trader_rust",
+            gtd_seconds: 30,
             triggering_tick_broker_recv_ns: Some(1_777_993_654_000_000_000),
         };
         let mut hand = Vec::new();
@@ -241,6 +246,7 @@ mod tests {
             qty: 1,
             price: 0.10,
             order_ref: "corsair_trader_rust",
+            gtd_seconds: 60,
             triggering_tick_broker_recv_ns: None,
         };
         let mut hand = Vec::new();
@@ -250,6 +256,7 @@ mod tests {
         assert_eq!(h.right, "P");
         assert_eq!(h.side, "SELL");
         assert_eq!(h.qty, 1);
+        assert_eq!(h.gtd_seconds, 60);
     }
 
     #[test]

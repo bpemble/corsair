@@ -34,24 +34,11 @@ pub static INDUCED_SENTINELS: &[InducedSentinel] = &[
         kill_type: KillType::Halt,
         inner_source: KillSource::Risk,
     },
-    InducedSentinel {
-        key: "delta",
-        filename: "corsair_induce_delta",
-        kill_type: KillType::HedgeFlat,
-        inner_source: KillSource::Risk,
-    },
-    InducedSentinel {
-        key: "theta",
-        filename: "corsair_induce_theta",
-        kill_type: KillType::Halt,
-        inner_source: KillSource::Risk,
-    },
-    InducedSentinel {
-        key: "vega",
-        filename: "corsair_induce_vega",
-        kill_type: KillType::Halt,
-        inner_source: KillSource::Risk,
-    },
+    // §25: delta/theta/vega sentinels removed. Strategy-level greek
+    // gating moved to the trader (improving-only). To exercise the
+    // trader's gate paths, set `risk_state.theta`/`risk_effective_delta`
+    // out-of-bounds via the broker (e.g., test fill that pushes theta
+    // past threshold). Margin and daily_pnl remain broker-side.
 ];
 
 /// Resolve the sentinel directory. Mirrors the Python convention:
@@ -81,8 +68,21 @@ mod tests {
     }
 
     #[test]
-    fn delta_sentinel_uses_hedge_flat() {
-        let s = INDUCED_SENTINELS.iter().find(|s| s.key == "delta").unwrap();
-        assert_eq!(s.kill_type, KillType::HedgeFlat);
+    fn margin_sentinel_uses_halt() {
+        let s = INDUCED_SENTINELS.iter().find(|s| s.key == "margin").unwrap();
+        assert_eq!(s.kill_type, KillType::Halt);
+    }
+
+    #[test]
+    fn no_strategy_kill_sentinels() {
+        // §25: delta/theta/vega sentinels intentionally removed —
+        // these now exercise via trader gates, not broker sentinels.
+        for s in INDUCED_SENTINELS {
+            assert!(
+                s.key != "delta" && s.key != "theta" && s.key != "vega",
+                "strategy kill sentinel '{}' should be removed (§25)",
+                s.key
+            );
+        }
     }
 }

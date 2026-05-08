@@ -451,16 +451,17 @@ struct HelloConfigPayload {
     gtd_refresh_lead_s: f64,
     dead_band_ticks: i32,
     skip_if_spread_over_edge_mul: f64,
-    /// Theta-breach threshold (negative; 0 disables). Trader self-gates
-    /// at this value so a theta breach is honored locally even if the
-    /// kill IPC event is dropped (defense in depth — see also the
-    /// kill_event publish path below). 2026-05-05 incident: 384 of 422
-    /// adverse fills happened AFTER broker fired THETA HALT because
-    /// kills weren't propagated AND trader had no theta gate.
+    /// Theta-breach threshold (negative; 0 disables). §25: trader is
+    /// the authoritative theta gate (improving-only — SELLs allowed,
+    /// BUYs blocked). Broker no longer fires from theta; this value
+    /// just configures the trader's local check.
     theta_kill: f64,
     /// Vega-breach threshold (positive; 0 disables; currently 0 per
     /// CLAUDE.md §13 — Alabaster characterization).
     vega_kill: f64,
+    /// Contract multiplier (HG=25_000, ETH=50). §25 trader uses this
+    /// to scale per-strike Black-76 greeks for improving-only gates.
+    contract_multiplier: f64,
 }
 
 /// Broker → trader kill event. Mirrors the trader's `KillMsg`. Fires
@@ -519,6 +520,13 @@ struct HelloEvent<'a> {
     ty: &'a str,
     timestamp_ns: u64,
     config: HelloConfigPayload,
+    /// §25: active kill sources at hello time. Trader populates its
+    /// local `killed` map from this list so a reconnecting trader
+    /// (post-crash, post-restart) inherits any active kills the
+    /// broker is still holding (trader_silent, daily_halt,
+    /// operational, etc.) and stays out of the market until the
+    /// operator clears via broker restart.
+    active_kills: Vec<String>,
 }
 
 fn publish_hello(runtime: &Arc<Runtime>) {
@@ -529,6 +537,25 @@ fn publish_hello(runtime: &Arc<Runtime>) {
     let q = &runtime.config.quoting;
     let c = &runtime.config.constraints;
     let r = &runtime.config.risk;
+    // §25: snapshot active kill sources for hello rehydration.
+    let active_kills: Vec<String> = {
+        let risk = runtime.risk.lock().unwrap();
+        risk.kill_event()
+            .map(|e| vec![e.source.label()])
+            .unwrap_or_default()
+    };
+    // Pull contract multiplier from the first product in the registry
+    // (current config has only HG so this is unambiguous; if/when ETH
+    // returns the trader will key by product anyway).
+    let contract_multiplier = {
+        let p = runtime.portfolio.lock().unwrap();
+        let registry = p.registry();
+        registry
+            .products()
+            .first()
+            .and_then(|name| registry.multiplier_for(name))
+            .unwrap_or(25_000.0)
+    };
     let ev = HelloEvent {
         ty: "hello",
         timestamp_ns: now_ns(),
@@ -544,7 +571,9 @@ fn publish_hello(runtime: &Arc<Runtime>) {
             skip_if_spread_over_edge_mul: q.skip_if_spread_over_edge_mul,
             theta_kill: r.theta_kill,
             vega_kill: r.vega_kill,
+            contract_multiplier,
         },
+        active_kills,
     };
     if let Ok(body) = rmp_serde::to_vec_named(&ev) {
         if !server.publish(&body) {
@@ -567,6 +596,14 @@ async fn dispatch_commands(
     mut rx: tokio::sync::mpsc::Receiver<ServerCommand>,
 ) {
     while let Some(cmd) = rx.recv().await {
+        // §25 watchdog: refresh the last-trader-msg timestamp on every
+        // received frame regardless of kind. Place / modify / cancel
+        // / telemetry / heartbeat / welcome all reset the watchdog
+        // timer. Heartbeat is the explicit liveness signal that runs
+        // at 1Hz so calm markets still drive this clock.
+        runtime
+            .last_trader_msg_ns
+            .store(crate::time::now_ns(), std::sync::atomic::Ordering::Release);
         match cmd.kind.as_str() {
             // Spawn each order command so it doesn't serialize behind
             // the previous one's IBKR ack. handle_place awaits a 2s
@@ -594,6 +631,10 @@ async fn dispatch_commands(
             // so we don't need to surface them here. Logging at
             // trace so it's silent under default filter.
             "telemetry" => log::trace!("ipc: trader telemetry frame"),
+            // §25 1Hz heartbeat from trader. The ack is just the
+            // dispatch entry above (which bumps last_trader_msg_ns);
+            // body is unused. Logged at trace so it doesn't spam.
+            "heartbeat" => log::trace!("ipc: trader heartbeat"),
             // Trader sends "welcome" once on connect. Respond with a
             // hello event carrying the broker's runtime config so the
             // trader replaces its compile-time defaults (GTD,
@@ -635,10 +676,29 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
     // iteration — ~10–15 µs of pure dispatch latency per place call.
     // `contract_by_key` is populated in subscribe_strike alongside
     // qualified_contracts so the hot path is one HashMap::get.
-    let r_norm = cmd.right.chars().next()
-        .map(|c| c.to_ascii_uppercase())
-        .unwrap_or('C');
-    let lookup_key = (cmd.strike.to_bits(), cmd.expiry.clone(), r_norm);
+    //
+    // Reject on empty/invalid right rather than silently bucketing as
+    // 'C' — a schema-drift PlaceOrderCmd with a missing right would
+    // otherwise route puts as call lookups (silent directional fault).
+    // Mirrors the trader's strict tick/place_ack handling.
+    let r_norm = match cmd.right.chars().next() {
+        Some(c) => {
+            let up = c.to_ascii_uppercase();
+            if up != 'C' && up != 'P' {
+                log::warn!(
+                    "ipc place_order: dropping — invalid right {:?} (must be C or P)",
+                    cmd.right
+                );
+                return;
+            }
+            up
+        }
+        None => {
+            log::warn!("ipc place_order: dropping — empty `right`");
+            return;
+        }
+    };
+    let lookup_key = (crate::strike_key_i64(cmd.strike), cmd.expiry.clone(), r_norm);
     let cached = runtime.contract_by_key.lock().unwrap().get(&lookup_key).cloned();
     let contract = match cached {
         Some(c) => c,
@@ -669,9 +729,21 @@ async fn handle_place(runtime: &Arc<Runtime>, body: &[u8]) {
             return;
         }
     };
+    // Reject on anything other than exact "BUY"/"SELL". A catch-all
+    // → Sell (the prior behavior) silently flips direction on any
+    // schema drift (lowercase, typo, empty); the trader's place_ack
+    // handler at corsair_trader/src/main.rs:868-872 is similarly
+    // strict on side parsing.
     let side = match cmd.side.as_str() {
         "BUY" => Side::Buy,
-        _ => Side::Sell,
+        "SELL" => Side::Sell,
+        other => {
+            log::warn!(
+                "ipc place_order: dropping — invalid side {:?} (must be BUY or SELL)",
+                other
+            );
+            return;
+        }
     };
     let order_type = match cmd.order_type.as_str() {
         "market" => OrderType::Market,
@@ -851,6 +923,28 @@ async fn handle_cancel(runtime: &Arc<Runtime>, body: &[u8]) {
         log::info!("ipc cancel_order (SHADOW; not cancelling): order_id={}", cmd.order_id);
         return;
     }
+    // Stale-cancel short-circuit (2026-05-07). If pump_status has already
+    // observed a terminal status for this orderId, dispatching to IBKR
+    // would just hit code 104/106 and burn the 500ms ack timeout. Drop
+    // locally and bump the counter — the trader's our_orders entry will
+    // be cleared by its own order_status handler on the same status
+    // event we recorded. See runtime.rs::recently_terminated and
+    // CLAUDE.md §22-style stale-amend behavior.
+    if runtime
+        .recently_terminated
+        .lock()
+        .unwrap()
+        .contains_key(&OrderId(cmd.order_id))
+    {
+        runtime
+            .stale_cancel_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::debug!(
+            "ipc cancel_order: dropping stale (orderId={}) — already terminal",
+            cmd.order_id
+        );
+        return;
+    }
     let result = {
         let b = runtime.broker.clone();
         b.cancel_order(OrderId(cmd.order_id)).await
@@ -871,6 +965,46 @@ async fn handle_modify(runtime: &Arc<Runtime>, body: &[u8]) {
     };
     if matches!(runtime.mode, crate::runtime::RuntimeMode::Shadow) {
         log::info!("ipc modify_order (SHADOW; not modifying): order_id={}", cmd.order_id);
+        return;
+    }
+    // Stale-modify short-circuit (2026-05-07). See `handle_cancel` for
+    // the same pattern. Writes a synthetic wire_timing row with
+    // outcome="rejected_stale" so the dashboard / log analysis sees the
+    // dropped command, but skips the IBKR round-trip + 500ms ack timeout
+    // that was producing multi-ms tail events in tick→trader_decide
+    // when fills raced trader amends.
+    if runtime
+        .recently_terminated
+        .lock()
+        .unwrap()
+        .contains_key(&OrderId(cmd.order_id))
+    {
+        runtime
+            .stale_modify_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = now_ns();
+        let row = serde_json::json!({
+            "schema": "wire_timing/v2",
+            "kind": "modify",
+            "ts_ns": now,
+            "outcome": "rejected_stale",
+            "order_id": cmd.order_id,
+            "price": cmd.price,
+            "triggering_tick_broker_recv_ns": cmd.triggering_tick_broker_recv_ns,
+            "trader_decide_ts_ns": cmd.ts_ns,
+            "broker_order_recv_ns": broker_order_recv_ns,
+            "broker_order_send_ns": now,
+            "broker_order_ack_ns": now,
+            "broker_order_send_marker_ns": now,
+            "broker_order_ack_marker_ns": now,
+            "send_ns_precise": false,
+            "ack_ns_precise": false,
+        });
+        runtime.wire_timing.write(row);
+        log::debug!(
+            "ipc modify_order: dropping stale (orderId={}) — already terminal",
+            cmd.order_id
+        );
         return;
     }
     let req = ModifyOrderReq {

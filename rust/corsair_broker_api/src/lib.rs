@@ -2,8 +2,8 @@
 //!
 //! This crate defines the [`Broker`] trait and supporting value types that
 //! every exchange-gateway implementation must satisfy. The runtime
-//! (`corsair_broker` daemon, `corsair_oms`, `corsair_position`,
-//! `corsair_risk`, `corsair_hedge`) talks to `dyn Broker` — never to a
+//! (`corsair_broker` daemon, `corsair_position`, `corsair_risk`,
+//! `corsair_hedge`) talks to `dyn Broker` — never to a
 //! specific gateway's types — so the IBKR → FCM/iLink swap is a contained
 //! adapter rewrite.
 //!

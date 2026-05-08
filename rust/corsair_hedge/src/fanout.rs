@@ -108,8 +108,6 @@ mod tests {
             rebalance_cadence_sec: 30.0,
             include_in_daily_pnl: true,
             flatten_on_halt_enabled: true,
-            ioc_tick_offset: 2,
-            hedge_tick_size: 0.0005,
             lockout_days: 30,
         }
     }

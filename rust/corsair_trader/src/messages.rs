@@ -46,10 +46,21 @@ pub struct HelloConfig {
     pub tick_size: Option<f64>,
     #[serde(default)]
     pub delta_ceiling: Option<f64>,
+    /// Removed in §25 (hedge owns delta control loop). Field kept on
+    /// the wire for back-compat with brokers that still emit it; trader
+    /// silently ignores. Will be removed entirely once all brokers
+    /// stop publishing it.
     #[serde(default)]
+    #[allow(dead_code)]
     pub delta_kill: Option<f64>,
     #[serde(default)]
     pub margin_ceiling_pct: Option<f64>,
+    /// Contract multiplier (HG=25_000, ETH=50). Used by improving-only
+    /// gates to scale per-strike Black-76 greeks (cached at multiplier=1.0)
+    /// to dollar terms for comparison against `risk_state` portfolio
+    /// greeks. Defaults to 25_000 (HG) if absent for back-compat.
+    #[serde(default)]
+    pub contract_multiplier: Option<f64>,
     /// Quote lifetime in seconds (broker GTD). Trader uses
     /// `gtd_lifetime_s - gtd_refresh_lead_s` as the refresh threshold.
     #[serde(default)]
@@ -80,6 +91,15 @@ pub struct HelloConfig {
 pub struct HelloMsg {
     #[serde(default)]
     pub config: Option<HelloConfig>,
+    /// Active kill sources at broker startup (§25). When the trader
+    /// reconnects after a crash/restart, the broker may still hold
+    /// active kills (trader_silent, daily_halt, operational, etc.).
+    /// The trader populates its local `killed` map from this list so
+    /// it stays out of the market until operator clears the kill via
+    /// broker restart. Sticky semantics — auto-resume is deliberately
+    /// not supported (CLAUDE.md §25).
+    #[serde(default)]
+    pub active_kills: Vec<String>,
 }
 
 // Serialize derive added 2026-05-05 so the msgpack_decode round-trip
@@ -249,6 +269,12 @@ pub struct PlaceOrder<'a> {
     pub price: f64,
     #[serde(rename = "orderRef")]
     pub order_ref: &'static str,
+    /// GTD lifetime in seconds; broker converts to absolute UTC.
+    /// Send on every place so `quoting.gtd_lifetime_s` from runtime
+    /// config actually drives the order's expiry. Without this field,
+    /// the broker fell through to `cmd.gtd_seconds.unwrap_or(30)`,
+    /// silently disagreeing with any non-30s YAML setting.
+    pub gtd_seconds: u32,
     /// v2 wire-timing: TickMsg.broker_recv_ns of the tick that drove
     /// this decision (latest tick the trader had cached for this key
     /// at decide_quote time). Skipped on the wire when None.
@@ -301,11 +327,11 @@ pub struct Telemetry {
     pub ts_ns: u64,
     pub events: serde_json::Value,
     pub decisions: serde_json::Value,
-    pub ipc_p50_us: Option<u64>,
-    pub ipc_p99_us: Option<u64>,
+    pub ipc_p50_ns: Option<u64>,
+    pub ipc_p99_ns: Option<u64>,
     pub ipc_n: usize,
-    pub ttt_p50_us: Option<u64>,
-    pub ttt_p99_us: Option<u64>,
+    pub ttt_p50_ns: Option<u64>,
+    pub ttt_p99_ns: Option<u64>,
     pub ttt_n: usize,
     pub n_options: usize,
     pub n_active_orders: usize,
@@ -325,4 +351,21 @@ pub struct Telemetry {
     /// from `commands_ring.frames_dropped` at telemetry build time —
     /// monotonic across the trader process lifetime.
     pub commands_frames_dropped: u64,
+}
+
+/// 1 Hz heartbeat from trader to broker (CLAUDE.md §25). Broker's
+/// watchdog task tracks the most recent commands-ring frame and fires
+/// a `trader_silent` kill if no frame arrives within
+/// `CORSAIR_TRADER_WATCHDOG_TIMEOUT_S` (default 5s).
+///
+/// Heartbeat is a defense against trader crash/hang in quiet markets:
+/// place/modify/cancel/telemetry frames also reset the watchdog timer,
+/// but in calm markets the trader could go many seconds without
+/// emitting any of those. The 1 Hz heartbeat ensures explicit
+/// liveness detection at the watchdog cadence.
+#[derive(Debug, Clone, Serialize)]
+pub struct Heartbeat {
+    #[serde(rename = "type")]
+    pub msg_type: &'static str,
+    pub ts_ns: u64,
 }

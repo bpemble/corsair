@@ -7,7 +7,7 @@
 #   scripts/run_ab_test.sh <name> <baseline.json> [--env KEY=VAL ...] [--duration N]
 #
 # Saves candidate dump alongside the baseline as <baseline_dir>/<name>.json
-# and prints the verdict for both ttt_us and ipc_us metrics.
+# and prints the verdict for both ttt_ns and ipc_ns metrics.
 #
 # Example (item 1: mimalloc tail tuning):
 #   scripts/run_ab_test.sh mimalloc /tmp/corsair_baseline/baseline_1.json \
@@ -60,15 +60,15 @@ echo "ab: candidate '$NAME' for ${DURATION}s"
     "${HARNESS_ARGS[@]}"
 
 echo
-echo "=== TTT (ttt_us) ==="
+echo "=== TTT (ttt_ns) ==="
 python3 "$(dirname "$0")/compare_latency.py" "$BASELINE" "$OUT" \
-    --metric ttt_us \
+    --metric ttt_ns \
     --label-before baseline \
     --label-after "$NAME" || true
 
 echo
-echo "=== IPC (ipc_us) ==="
+echo "=== IPC (ipc_ns) ==="
 python3 "$(dirname "$0")/compare_latency.py" "$BASELINE" "$OUT" \
-    --metric ipc_us \
+    --metric ipc_ns \
     --label-before baseline \
     --label-after "$NAME" || true

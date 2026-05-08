@@ -5,9 +5,12 @@
 //!     internally shards by key hash so the 10Hz staleness sweep and
 //!     the 10s telemetry snapshot can iterate one shard while the hot
 //!     loop inserts into another shard without contention.
-//!   - Histograms (`ipc_us`, `ttt_us`) live behind their own
+//!   - Histograms (`ipc_ns`, `ttt_ns`) live behind their own
 //!     `parking_lot::Mutex`. The telemetry sort is ~ms; isolating the
 //!     histograms keeps that work off the hot path's lock budget.
+//!     Samples stored in nanoseconds (switched 2026-05-06 from µs to
+//!     resolve sub-µs A/B comparisons; integer-truncated µs lost
+//!     5–20% of the dynamic range we needed to measure).
 //!   - Scalars (config, risk_state, underlying_price, weekend_paused)
 //!     live behind a small `parking_lot::Mutex`. Hot path snapshots
 //!     them once per tick into a stack-local view; broker-event
@@ -96,6 +99,25 @@ pub type VolSurfaceKey = (Arc<str>, char);
 pub type TheoCacheKey = (i64, Arc<str>, char, u64);
 pub type OurOrderKey = (i64, Arc<str>, char, char);
 
+/// Per-strike greeks at fit-time forward, multiplier=1.0. Cached in
+/// `theo_cache` keyed by (strike, expiry, right, fit_ts_ns).
+///
+/// Sign convention mirrors Black-76 long-position greeks:
+///   - delta:  +ve calls, -ve puts
+///   - theta:  -ve both rights (long position decays)
+///   - vega:   +ve both rights (per 1% vol move)
+///
+/// To convert to portfolio-greek change for a single-contract fill:
+///   - BUY  → +1 × greek × multiplier  (adds long position)
+///   - SELL → -1 × greek × multiplier  (adds short position)
+#[derive(Debug, Clone, Copy)]
+pub struct TheoGreeks {
+    pub theo: f64,
+    pub delta: f64,
+    pub theta: f64,
+    pub vega: f64,
+}
+
 /// Histograms behind their own mutex. Hot path pushes one sample;
 /// telemetry sorts a snapshot every 10s.
 ///
@@ -106,8 +128,8 @@ pub type OurOrderKey = (i64, Arc<str>, char, char);
 /// run captures every sample for KS/bootstrap comparison; production
 /// stays at the smaller caps so the telemetry snapshot stays cheap.
 pub struct Histograms {
-    pub ipc_us: VecDeque<u64>,
-    pub ttt_us: VecDeque<u64>,
+    pub ipc_ns: VecDeque<u64>,
+    pub ttt_ns: VecDeque<u64>,
     pub ipc_cap: usize,
     pub ttt_cap: usize,
 }
@@ -115,8 +137,8 @@ pub struct Histograms {
 impl Default for Histograms {
     fn default() -> Self {
         Self {
-            ipc_us: VecDeque::new(),
-            ttt_us: VecDeque::new(),
+            ipc_ns: VecDeque::new(),
+            ttt_ns: VecDeque::new(),
             ipc_cap: env_usize("CORSAIR_TRADER_HIST_IPC_CAP", 2000),
             ttt_cap: env_usize("CORSAIR_TRADER_HIST_TTT_CAP", 500),
         }
@@ -157,12 +179,18 @@ pub struct ScalarState {
     pub min_edge_ticks: i32,
     pub tick_size: f64,
     pub delta_ceiling: f64,
-    pub delta_kill: f64,
     /// Theta breach threshold (negative; 0 disables). From broker hello.
+    /// As of CLAUDE.md §25 (improving-only gating), the trader is the
+    /// authoritative theta gate — broker no longer fires a theta kill.
     pub theta_kill: f64,
-    /// Vega breach threshold (positive; 0 disables). From broker hello.
+    /// Vega breach threshold (positive; 0 disables). Currently 0 per
+    /// CLAUDE.md §13. Trader-side improving-only gating as of §25.
     pub vega_kill: f64,
     pub margin_ceiling_pct: f64,
+    /// Contract multiplier (HG=25_000, ETH=50). Scales per-strike
+    /// Black-76 greeks (cached at multiplier=1.0) to dollar terms for
+    /// improving-only gate post-fill greek change. From broker hello.
+    pub contract_multiplier: f64,
     pub weekend_paused: bool,
     /// Quote-lifetime config from broker hello. Defaults match
     /// CLAUDE.md §16 Layer 6 throttling chain — replaced by broker
@@ -187,10 +215,10 @@ impl ScalarState {
             min_edge_ticks: 2,
             tick_size: 0.0005,
             delta_ceiling: 3.0,
-            delta_kill: 5.0,
             theta_kill: -500.0,
             vega_kill: 0.0,
             margin_ceiling_pct: 0.50,
+            contract_multiplier: 25_000.0,  // HG default; broker hello overrides
             weekend_paused: false,
             // Defaults match the broker's QuotingSection defaults
             // (corsair_broker/src/config.rs::default_*). When the
@@ -220,7 +248,6 @@ impl ScalarState {
             min_edge_ticks: self.min_edge_ticks,
             tick_size: self.tick_size,
             delta_ceiling: self.delta_ceiling,
-            delta_kill: self.delta_kill,
             theta_kill: self.theta_kill,
             vega_kill: self.vega_kill,
             margin_ceiling_pct: self.margin_ceiling_pct,
@@ -246,7 +273,6 @@ pub struct ScalarSnapshot {
     pub min_edge_ticks: i32,
     pub tick_size: f64,
     pub delta_ceiling: f64,
-    pub delta_kill: f64,
     pub theta_kill: f64,
     pub vega_kill: f64,
     pub margin_ceiling_pct: f64,
@@ -281,17 +307,20 @@ pub struct SharedState {
     pub vol_surfaces: DashMap<VolSurfaceKey, Arc<VolSurfaceEntry>>,
 
     /// Optimization #3 — SVI/SABR theo cache, keyed by
-    /// (strike_bits, expiry, right_char, fit_ts_ns). Stores the pair
-    /// (theo_at_fit, delta_at_fit), both pure functions of
-    /// (fit_forward, strike, tte, params, right); within a single fit
-    /// cycle the only changing input is tte, which moves less than 1
-    /// tick over a 60s fit window. We invalidate the entry when
+    /// (strike_bits, expiry, right_char, fit_ts_ns). Stores
+    /// `TheoGreeks` (theo, delta, theta, vega) at fit-time forward,
+    /// all pure functions of (fit_forward, strike, tte, params, right).
+    /// Within a single fit cycle the only changing input is tte, which
+    /// moves less than 1 tick over a 60s fit window. Invalidated when
     /// fit_ts_ns changes (new SABR fit landed). Saves ~80µs per tick
     /// (SVI/SABR + Black76 + greeks) in the steady-state amend loop.
-    /// Delta is cached alongside theo so the Taylor reprice path
-    /// (theo + delta × (spot − fit_forward)) doesn't recompute greeks
-    /// on the hot path.
-    pub theo_cache: DashMap<TheoCacheKey, (f64, f64)>,
+    ///
+    /// Delta drives the Taylor reprice (theo + delta × (spot − fit_forward));
+    /// theta and vega drive the improving-only risk gates (CLAUDE.md
+    /// §25). Greeks are stored at multiplier=1.0; gates scale by
+    /// `scalars.contract_multiplier` to compare against dollar-denominated
+    /// portfolio greeks from `risk_state`.
+    pub theo_cache: DashMap<TheoCacheKey, TheoGreeks>,
 
     /// Resting orders we've placed, keyed by
     /// (strike-bits, expiry, right-char, side-char).
@@ -365,25 +394,37 @@ impl OutboundLimiter {
     /// Try to consume a burst slot at `now_ns`. Returns true if the
     /// caller may send (not at cap), false if it should skip.
     /// `max_age_ns` is the sliding-window length.
+    ///
+    /// Uses `compare_exchange` to claim the older slot atomically:
+    /// the prior load+store implementation had a TOCTOU window where
+    /// the hot loop and staleness loop could both pass the cap-check
+    /// and both store, silently exceeding the 2-cap. CAS retries on
+    /// contention; under realistic load (≤2 threads racing) bounded
+    /// retries.
     #[inline]
     pub fn try_consume(&self, now_ns: u64, max_age_ns: u64) -> bool {
-        let a = self.slot_a.load(Ordering::Relaxed);
-        let b = self.slot_b.load(Ordering::Relaxed);
-        let a_recent = now_ns.saturating_sub(a) < max_age_ns;
-        let b_recent = now_ns.saturating_sub(b) < max_age_ns;
-        if a_recent && b_recent {
-            return false;
+        loop {
+            let a = self.slot_a.load(Ordering::Relaxed);
+            let b = self.slot_b.load(Ordering::Relaxed);
+            let a_recent = now_ns.saturating_sub(a) < max_age_ns;
+            let b_recent = now_ns.saturating_sub(b) < max_age_ns;
+            if a_recent && b_recent {
+                return false;
+            }
+            // Prefer the older slot — it's either stale or empty (0).
+            let (slot, expected) = if a <= b {
+                (&self.slot_a, a)
+            } else {
+                (&self.slot_b, b)
+            };
+            if slot
+                .compare_exchange(expected, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+            // Another caller raced us; retry with fresh reads.
         }
-        // Overwrite the oldest slot. Under hot-path single-thread
-        // access this is race-free; under cross-thread (staleness
-        // loop calling concurrently) the worst case is one extra
-        // send slipping through — acceptable.
-        if a <= b {
-            self.slot_a.store(now_ns, Ordering::Relaxed);
-        } else {
-            self.slot_b.store(now_ns, Ordering::Relaxed);
-        }
-        true
     }
 }
 
@@ -537,6 +578,12 @@ pub struct DecisionCounters {
     /// piling onto the IBKR OMS queue. Caller will re-evaluate on
     /// the next tick (typically <20ms later).
     pub skip_burst_cap: AtomicU64,
+    /// Risk-state event arrived without a field that an enabled gate
+    /// expects (theta_kill < 0 → risk_theta required; vega_kill > 0
+    /// → risk_vega required). Bumped per gate-side per occurrence so
+    /// schema drift between broker and trader surfaces in telemetry
+    /// instead of silently disabling the gate.
+    pub risk_state_partial: AtomicU64,
 }
 
 impl Default for DecisionCounters {
@@ -575,6 +622,7 @@ impl DecisionCounters {
             modify: AtomicU64::new(0),
             place_dropped: AtomicU64::new(0),
             skip_burst_cap: AtomicU64::new(0),
+            risk_state_partial: AtomicU64::new(0),
         }
     }
 
@@ -611,6 +659,7 @@ impl DecisionCounters {
             ("modify", &self.modify),
             ("place_dropped", &self.place_dropped),
             ("skip_burst_cap", &self.skip_burst_cap),
+            ("risk_state_partial", &self.risk_state_partial),
         ];
         for (k, v) in pairs {
             let n = v.load(Ordering::Relaxed);

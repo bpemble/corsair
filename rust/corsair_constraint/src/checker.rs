@@ -93,10 +93,13 @@ pub struct ConstraintChecker {
     ibkr_scale: f64,
     /// Last-observed raw / IBKR / scale tuple. Useful for telemetry.
     last_calibration: Option<MarginCalibration>,
-    /// Audit T1-1 / CLAUDE.md §14: log a stale-hedge WARN at most
-    /// once per process; stale-hedge events are noisy and the warn
-    /// should be loud-but-not-spammy.
-    stale_hedge_warned: std::sync::atomic::AtomicBool,
+    /// Audit T1-1 / CLAUDE.md §14: count stale-hedge events for
+    /// throttled WARN. Logs at every power-of-two count (1, 2, 4, …)
+    /// so the operator sees one signal at first occurrence then
+    /// progressively rarer if the condition persists. Self-suppressing
+    /// at the first event was insufficient: a hedge that re-stales
+    /// hours later silently slipped past observability.
+    stale_hedge_count: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -113,7 +116,7 @@ impl ConstraintChecker {
             cfg,
             ibkr_scale: 1.0,
             last_calibration: None,
-            stale_hedge_warned: std::sync::atomic::AtomicBool::new(false),
+            stale_hedge_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -201,11 +204,12 @@ impl ConstraintChecker {
                 Some(true) => true,
                 Some(false) => {
                     use std::sync::atomic::Ordering;
-                    if !self.stale_hedge_warned.swap(true, Ordering::Relaxed) {
+                    let n = self.stale_hedge_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
                         log::warn!(
                             "ConstraintChecker: hedge state STALE — gating falls back \
-                             to options-only delta (fail-closed). Subsequent stale \
-                             events suppressed."
+                             to options-only delta (fail-closed) [hits={}]",
+                            n
                         );
                     }
                     false

@@ -53,15 +53,38 @@ fn main() {
     let mut data_dir = PathBuf::from("/app/data");
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
-            "--strike" => { strike = args[i+1].parse().unwrap(); i += 2; }
-            "--expiry" => { expiry = args[i+1].clone(); i += 2; }
-            "--right"  => { right = args[i+1].clone(); i += 2; }
-            "--side"   => { side = args[i+1].clone(); i += 2; }
-            "--qty"    => { qty = args[i+1].parse().unwrap(); i += 2; }
-            "--price"  => { price = args[i+1].parse().unwrap(); i += 2; }
-            "--data-dir" => { data_dir = PathBuf::from(&args[i+1]); i += 2; }
-            other => panic!("unknown arg: {other}"),
+        let key = args[i].as_str();
+        // Helper: take the next arg as the value; bail with a clear
+        // usage error instead of panicking on index out of bounds when
+        // a flag is passed without its value.
+        let take_value = |key: &str, i: usize| -> &str {
+            if i + 1 >= args.len() {
+                eprintln!("inject_place_order: missing value for {key}");
+                std::process::exit(2);
+            }
+            args[i + 1].as_str()
+        };
+        match key {
+            "--strike" => {
+                strike = take_value(key, i).parse().expect("--strike: parse f64");
+                i += 2;
+            }
+            "--expiry" => { expiry = take_value(key, i).to_string(); i += 2; }
+            "--right" => { right = take_value(key, i).to_string(); i += 2; }
+            "--side" => { side = take_value(key, i).to_string(); i += 2; }
+            "--qty" => {
+                qty = take_value(key, i).parse().expect("--qty: parse i32");
+                i += 2;
+            }
+            "--price" => {
+                price = take_value(key, i).parse().expect("--price: parse f64");
+                i += 2;
+            }
+            "--data-dir" => { data_dir = PathBuf::from(take_value(key, i)); i += 2; }
+            other => {
+                eprintln!("inject_place_order: unknown arg: {other}");
+                std::process::exit(2);
+            }
         }
     }
 

@@ -32,18 +32,33 @@ static DISCORD_WEBHOOK_URL: std::sync::OnceLock<Option<String>> = std::sync::Onc
 /// scratch — that lazily initializes a tokio runtime resource pool +
 /// rustls cert store on every call (~hundreds of µs of unnecessary
 /// work for a fire-and-forget webhook).
-static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+///
+/// `Option<Client>` so a failed builder (e.g. broken rustls cert
+/// store) cleanly disables notifications instead of falling back to
+/// a no-timeout `Client::new()`. A timeout-less webhook can hang the
+/// fire-and-forget task indefinitely on a stalled Discord. Audit
+/// round 2.
+static HTTP_CLIENT: std::sync::OnceLock<Option<reqwest::Client>> =
+    std::sync::OnceLock::new();
 
-fn http_client() -> &'static reqwest::Client {
-    HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|e| {
-                log::warn!("notify: reqwest build failed, using default client: {e}");
-                reqwest::Client::new()
-            })
-    })
+fn http_client() -> Option<&'static reqwest::Client> {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            match reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+            {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log::error!(
+                        "notify: reqwest builder failed: {e}; Discord notifications \
+                         disabled for this process. Investigate rustls / cert store."
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 pub fn init_from_env() {
@@ -89,7 +104,10 @@ pub fn notify_kill(ev: KillEvent) {
     };
     let payload = format_kill_payload(&ev);
     tokio::spawn(async move {
-        let client = http_client();
+        let client = match http_client() {
+            Some(c) => c,
+            None => return, // builder failed at startup; logged once
+        };
         match client.post(&url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 log::info!("notify: kill posted to Discord ({})", resp.status());
@@ -244,7 +262,10 @@ pub fn notify_fill(fill: corsair_broker_api::events::Fill, ctx: FillNotifyContex
     };
     let payload = format_fill_payload(&fill, &ctx);
     tokio::spawn(async move {
-        let client = http_client();
+        let client = match http_client() {
+            Some(c) => c,
+            None => return, // builder failed at startup; logged once
+        };
         match client.post(&url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 log::debug!("notify: fill posted to Discord ({})", resp.status());

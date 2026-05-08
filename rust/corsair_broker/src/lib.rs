@@ -21,7 +21,7 @@
 //! │  ┌─────────────────────────────────────────────────┐    │
 //! │  │ stream pumps (one tokio task each)              │    │
 //! │  │   fills    → portfolio + hedge + risk.daily_pnl │    │
-//! │  │   status   → oms                                │    │
+//! │  │   status   → seen-orders set + log              │    │
 //! │  │   ticks    → market_data                        │    │
 //! │  │   depth    → market_data L2 book                │    │
 //! │  │   errors   → log + risk                         │    │
@@ -61,6 +61,17 @@ pub mod subscriptions;
 pub mod tasks;
 pub mod time;
 pub mod vol_surface;
+
+/// Quantize a strike to an integer key. Mirrors
+/// `corsair_trader::state::SharedState::strike_key` (§18 trader fix
+/// from to_bits-keyed cache misses). Both producer (subscribe_strike)
+/// and consumer (handle_place) of `Runtime::contract_by_key` route
+/// through this function so a small bit-precision drift between f64
+/// sources can't silently miss the cache.
+#[inline(always)]
+pub fn strike_key_i64(strike: f64) -> i64 {
+    (strike * 10_000.0).round() as i64
+}
 
 pub use config::{BrokerDaemonConfig, ProductConfig};
 pub use ipc::{spawn_ipc, IpcConfig};

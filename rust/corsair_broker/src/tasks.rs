@@ -41,8 +41,131 @@ pub fn spawn_all(runtime: Arc<Runtime>) -> Vec<tokio::task::JoinHandle<()>> {
     handles.push(tokio::spawn(periodic_account_poll(runtime.clone())));
     handles.push(tokio::spawn(daily_halt_rollover(runtime.clone())));
     handles.push(tokio::spawn(periodic_tick_type_hist(runtime.clone())));
+    handles.push(tokio::spawn(trader_watchdog(runtime.clone())));
+    handles.push(tokio::spawn(periodic_terminated_evict(runtime.clone())));
 
     handles
+}
+
+/// TTL for entries in `Runtime::recently_terminated`. 60s is far longer
+/// than any plausible window between a terminal status arriving and the
+/// trader queueing a doomed amend (the trader removes the orderId from
+/// its own state on terminal-status receipt, so by 60s out it cannot
+/// retry against a stale id under any realistic IPC delay). Sized to
+/// bound memory at <500 entries even under heavy fill churn.
+const RECENTLY_TERMINATED_TTL_NS: u64 = 60_000_000_000;
+
+/// Periodically evict aged-out entries from `recently_terminated` so
+/// the cache doesn't grow unbounded across a long session. Cadence is
+/// 10s — well below the TTL, so worst-case memory overshoot is one
+/// session's worth of fills/cancels in a 10s window. Each entry is
+/// 8 bytes (OrderId u64) + 8 bytes (ts_ns) + map overhead = ~32 bytes,
+/// so even 10k orderIds is ~320 KB — bounded.
+async fn periodic_terminated_evict(runtime: Arc<Runtime>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut prev_modify: u64 = 0;
+    let mut prev_cancel: u64 = 0;
+    loop {
+        interval.tick().await;
+        let now = crate::time::now_ns();
+        let (size, evicted) = {
+            let mut map = runtime.recently_terminated.lock().unwrap();
+            let before = map.len();
+            map.retain(|_, ts| now.saturating_sub(*ts) < RECENTLY_TERMINATED_TTL_NS);
+            (map.len(), before.saturating_sub(map.len()))
+        };
+        let mod_total = runtime
+            .stale_modify_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let cncl_total = runtime
+            .stale_cancel_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mod_delta = mod_total.saturating_sub(prev_modify);
+        let cncl_delta = cncl_total.saturating_sub(prev_cancel);
+        prev_modify = mod_total;
+        prev_cancel = cncl_total;
+        // Only emit when interesting (cache non-empty, dropped this
+        // window, or evictions happened) — keeps quiet sessions quiet.
+        if size > 0 || evicted > 0 || mod_delta > 0 || cncl_delta > 0 {
+            log::info!(
+                "recently_terminated: size={} evicted_10s={} stale_modify_10s={} \
+                 stale_cancel_10s={} (totals: mod={} cncl={})",
+                size,
+                evicted,
+                mod_delta,
+                cncl_delta,
+                mod_total,
+                cncl_total
+            );
+        }
+    }
+}
+
+/// §25 trader watchdog. 1Hz check that the trader is still emitting
+/// frames on the commands ring. Fires `trader_silent` kill if the gap
+/// exceeds `CORSAIR_TRADER_WATCHDOG_TIMEOUT_S` (default 5s).
+///
+/// Recovery semantics: the kill is sticky. A reconnecting trader will
+/// resume sending heartbeats but will inherit the active kill via the
+/// `hello`'s `active_kills` field and stay quoting-blocked. Operator
+/// must `docker compose restart corsair-broker-rs` after investigating
+/// the underlying fault. This is deliberate — auto-resume on heartbeat
+/// would silently mask a trader stuck in a crash-restart loop.
+async fn trader_watchdog(runtime: Arc<Runtime>) {
+    let timeout_s = std::env::var("CORSAIR_TRADER_WATCHDOG_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5);
+    let timeout_ns: u64 = timeout_s.saturating_mul(1_000_000_000);
+    log::info!("trader_watchdog: cadence 1s, timeout {}s", timeout_s);
+
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let last = runtime
+            .last_trader_msg_ns
+            .load(std::sync::atomic::Ordering::Acquire);
+        if last == 0 {
+            // Pre-startup: no frame yet. The first frame from the
+            // trader (welcome on connect) will set this.
+            continue;
+        }
+        let now_ns = crate::time::now_ns();
+        let gap = now_ns.saturating_sub(last);
+        if gap <= timeout_ns {
+            continue;
+        }
+        // Already killed for trader_silent? Don't double-fire — the
+        // kill is sticky and a re-fire would just spam the log.
+        let already_silent = {
+            let r = runtime.risk.lock().unwrap();
+            r.kill_event()
+                .map(|e| matches!(e.source, corsair_risk::KillSource::TraderSilent))
+                .unwrap_or(false)
+        };
+        if already_silent {
+            continue;
+        }
+        log::error!(
+            "trader_watchdog: trader silent for {}ms — firing trader_silent kill",
+            gap / 1_000_000
+        );
+        let ev = corsair_risk::KillEvent {
+            reason: format!("TRADER SILENT: no commands-ring frame for {}ms", gap / 1_000_000),
+            source: corsair_risk::KillSource::TraderSilent,
+            kill_type: corsair_risk::KillType::Halt,
+            timestamp_ns: now_ns,
+        };
+        {
+            let mut r = runtime.risk.lock().unwrap();
+            let _ = r.fire(ev.clone());
+        }
+        crate::notify::notify_kill(ev.clone());
+        crate::ipc::publish_kill(&runtime, &ev);
+        cancel_all_resting(&runtime, "trader_silent").await;
+    }
 }
 
 /// Diagnostic: every 30s, log the histogram of incoming TickSize
@@ -212,40 +335,15 @@ async fn handle_fill(runtime: &Arc<Runtime>, fill: corsair_broker_api::events::F
         cancel_all_resting(runtime, "daily_halt_per_fill").await;
     }
 
-    // Per-fill DELTA enforcement. The 300s periodic risk_check is too
-    // slow to catch a fast cascade — on 2026-05-04 we accumulated ~38
-    // contracts in ~4 minutes (options_delta 0 → -14.6) before the
-    // periodic check fired. This gate runs on EVERY option fill and
-    // forces the kill the moment effective_delta crosses delta_kill.
-    let (effective_delta_post_fill, hedge_qty_total, hedge_fresh): (f64, f64, bool) = {
-        let p = runtime.portfolio.lock().unwrap();
-        let h = runtime.hedge.lock().unwrap();
-        let agg = p.aggregate();
-        let hedge_qty: i32 = h.managers().iter().map(|m| m.hedge_qty()).sum();
-        // CLAUDE.md §14: hedge state must be fresh for the gate to
-        // trust hedge_qty as a delta offset. all_fresh ⇒ no strip;
-        // any stale ⇒ RiskMonitor::check_per_fill_delta strips
-        // hedge_qty back out and gates options-only (fail-closed).
-        let now_ns = crate::time::now_ns();
-        let all_fresh = h
-            .managers()
-            .iter()
-            .all(|m| m.state().is_fresh(now_ns, HEDGE_FRESHNESS_MAX_AGE_NS));
-        (
-            agg.total.net_delta + hedge_qty as f64,
-            hedge_qty as f64,
-            all_fresh,
-        )
-    };
-    let delta_outcome = {
-        let mut r = runtime.risk.lock().unwrap();
-        r.check_per_fill_delta(effective_delta_post_fill, hedge_qty_total, hedge_fresh)
-    };
-    if let corsair_risk::RiskCheckOutcome::Killed(ref ev) = delta_outcome {
-        crate::notify::notify_kill(ev.clone());
-        crate::ipc::publish_kill(runtime, ev);
-        cancel_all_resting(runtime, "delta_kill_per_fill").await;
-    }
+    // §25: per-fill delta enforcement removed from broker. Trader's
+    // `improving_passes` (`compute_risk_gates`) consumes the broker's
+    // 1Hz risk_state events and gates per-fill via the cached
+    // per-strike greeks. The 2026-05-04 fast-cascade scenario this
+    // path was added for is now caught by the trader's per-tick gate
+    // (which sees effective_delta the same way the broker did) plus
+    // the trader_silent watchdog (5s timeout if trader can't process
+    // the signal). Hedge engine still runs continuously and is the
+    // primary delta control loop.
 
     // CLAUDE.md §10: rebalance hedge on every option fill (in
     // addition to the 30s periodic). Without this, every option fill
@@ -276,9 +374,35 @@ async fn pump_status(runtime: Arc<Runtime>) {
     loop {
         match rx.recv().await {
             Ok(update) => {
-                let mut oms = runtime.oms.lock().unwrap();
-                let resolved = oms.apply_status(update.order_id, update.status);
-                if !resolved {
+                let terminal = matches!(
+                    update.status,
+                    OrderStatus::Filled
+                        | OrderStatus::Cancelled
+                        | OrderStatus::Rejected
+                        | OrderStatus::Inactive
+                );
+                let already_seen = {
+                    let mut seen = runtime.seen_orders.lock().unwrap();
+                    if terminal {
+                        seen.remove(&update.order_id)
+                    } else {
+                        !seen.insert(update.order_id)
+                    }
+                };
+                // Record terminal orderIds so handle_modify / handle_cancel
+                // can short-circuit on stale targets — eliminates the IBKR
+                // round-trip + 2s ack timeout that previously stalled the
+                // broker pipeline when fills/cancels raced trader-side
+                // amends. Fix shipped 2026-05-07; see
+                // `docs/HANDOFF_LATENCY_LEDGER.md` §3.2.
+                if terminal {
+                    runtime
+                        .recently_terminated
+                        .lock()
+                        .unwrap()
+                        .insert(update.order_id, crate::time::now_ns());
+                }
+                if !already_seen {
                     log::debug!(
                         "status update for unknown orderId {}: {:?}",
                         update.order_id,
@@ -421,11 +545,70 @@ async fn pump_errors(runtime: Arc<Runtime>) {
     loop {
         match rx.recv().await {
             Ok(err) => {
-                log::warn!("broker error: {err}");
-                // TODO: route certain protocol errors (e.g. 1100
-                // disconnect) to risk.fire as KillSource::Disconnect.
-                // Today the connection stream handles disconnects.
-                let _ = runtime;
+                // Code 202 = "Order Canceled - reason:..." — IBKR's
+                // generic per-cancel notification. We already see each
+                // cancellation via the order_status terminal-state log
+                // ("order ord#NNNN terminal: Cancelled"); duplicating
+                // it as a WARN here floods the log on broker reconnect
+                // (IBKR cancels every prior resting order) without
+                // adding any actionable information. Trace-level so
+                // it's still grep-able when an operator wants the
+                // raw error stream.
+                if let corsair_broker_api::BrokerError::Protocol {
+                    code: Some(202), ..
+                } = &err
+                {
+                    log::trace!("broker error (lifecycle): {err}");
+                } else {
+                    log::warn!("broker error: {err}");
+                }
+                // Route disconnect-class errors to a Disconnect kill
+                // so quoting halts even when the connection-stream
+                // event is delayed or never fires (rare on partial
+                // socket faults). The connection-event listener
+                // (`pump_connection`) clears the kill on reconnect,
+                // matching CLAUDE.md §15's clear-on-reconnect rule.
+                //
+                // IBKR codes 1100 / 1102 / 1300 / 504 are gateway
+                // disconnect / TWS reset / port reset; they are the
+                // canonical disconnect-class protocol codes.
+                let disconnect_kill = match &err {
+                    corsair_broker_api::BrokerError::ConnectionLost(msg) => Some(format!(
+                        "broker error → ConnectionLost: {msg}"
+                    )),
+                    corsair_broker_api::BrokerError::Protocol {
+                        code: Some(c @ (1100 | 1102 | 1300 | 504)),
+                        message,
+                    } => Some(format!(
+                        "broker error → Protocol {c}: {message}"
+                    )),
+                    _ => None,
+                };
+                if let Some(reason) = disconnect_kill {
+                    let already_disconnect = {
+                        let r = runtime.risk.lock().unwrap();
+                        r.kill_event()
+                            .map(|e| e.source.is_disconnect())
+                            .unwrap_or(false)
+                    };
+                    if already_disconnect {
+                        // Already disconnect-killed; don't re-fire.
+                        continue;
+                    }
+                    let ev = corsair_risk::KillEvent {
+                        reason,
+                        source: corsair_risk::KillSource::Disconnect,
+                        kill_type: corsair_risk::KillType::Halt,
+                        timestamp_ns: crate::time::now_ns(),
+                    };
+                    {
+                        let mut r = runtime.risk.lock().unwrap();
+                        r.fire(ev.clone());
+                    }
+                    crate::notify::notify_kill(ev.clone());
+                    crate::ipc::publish_kill(&runtime, &ev);
+                    cancel_all_resting(&runtime, "disconnect").await;
+                }
             }
             Err(RecvError::Lagged(_)) => {}
             Err(RecvError::Closed) => break,
@@ -851,17 +1034,16 @@ async fn place_hedge_order(
         return;
     }
     // Hedge order type: MARKET-IOC. The original design was limit-IOC
-    // anchored at F ± `ioc_tick_offset` ticks — small bounded slippage
-    // if filled, but the IOC dies when the market moves >N ticks
-    // during the ~140 ms IBKR RTT. In a fast move (exactly when we
-    // MOST need to be hedged) the IOC reliably missed. HG futures
-    // depth is deep enough that a 4-contract market order slips 1-2
-    // ticks at worst — "fill at any reasonable price" beats "fill at
-    // +N ticks or never". 2026-05-04: switched after observing 4
-    // consecutive 30 s periodic IOC misses while options_delta sat
-    // at −4.3. The `ioc_tick_offset` and `hedge_tick_size` fields are
-    // dead since the switch — see runtime.rs build_hedge_fanout for
-    // the ignored placeholder values.
+    // anchored at F ± N ticks — small bounded slippage if filled, but
+    // the IOC dies when the market moves >N ticks during the ~140 ms
+    // IBKR RTT. In a fast move (exactly when we MOST need to be
+    // hedged) the IOC reliably missed. HG futures depth is deep
+    // enough that a 4-contract market order slips 1-2 ticks at worst
+    // — "fill at any reasonable price" beats "fill at +N ticks or
+    // never". 2026-05-04: switched after observing 4 consecutive 30 s
+    // periodic IOC misses while options_delta sat at −4.3. The legacy
+    // `ioc_tick_offset` and `hedge_tick_size` HedgeConfig fields were
+    // removed entirely with that switch.
     let req = corsair_broker_api::PlaceOrderReq {
         contract,
         side: if is_buy {
@@ -1014,16 +1196,36 @@ async fn periodic_snapshot(runtime: Arc<Runtime>) {
                 None
             }
         };
-        let result = {
+        // Audit round 3 (2026-05-07): split build (under locks) from
+        // disk write (lock-free). Previously this scope held all four
+        // state locks across `s.publish(...)` which performed JSON
+        // serialize + `fsync` + rename SYNCHRONOUSLY. The fsync
+        // routinely took 5-15 ms on the host volume; while it ran, the
+        // tick_publisher closure (corsair_broker::ipc:148) was blocked
+        // on `market_data.lock()` for every inbound IBKR tick, driving
+        // trader-side TTT p99 to ~11 ms with ~5 outliers per 150 s
+        // window (one per snapshot whose fsync collided with a tick).
+        // Now: build the in-memory `Snapshot` under locks (CPU-only,
+        // ~50–200 µs), drop the locks, then serialize+write outside
+        // (no other task contends for `snapshot` so its lock is brief).
+        let snap = {
             let p = runtime.portfolio.lock().unwrap();
             let r = runtime.risk.lock().unwrap();
             let h = runtime.hedge.lock().unwrap();
             let md = runtime.market_data.lock().unwrap();
             let chain_build = build_chain_payload(&runtime, &md, &p, &open_orders_snapshot);
-            let mut s = runtime.snapshot.lock().unwrap();
-            s.publish(&p, &r, &h, &*md, acct_payload, chain_build, latency_snapshot)
+            let s = runtime.snapshot.lock().unwrap();
+            s.build(&p, &r, &h, &*md, acct_payload, chain_build, latency_snapshot)
         };
-        if let Err(e) = result {
+        // Locks dropped — disk write happens here without blocking
+        // the tick fast path. fsync was also removed from atomic_write
+        // (atomicity preserved by rename); see corsair_snapshot
+        // publisher.rs.
+        let write_res = {
+            let mut s = runtime.snapshot.lock().unwrap();
+            s.write_built(&snap)
+        };
+        if let Err(e) = write_res {
             log::warn!("snapshot publish failed: {e}");
         }
     }
@@ -1121,6 +1323,13 @@ async fn periodic_account_poll(runtime: Arc<Runtime>) {
                 if let Ok(mut a) = runtime.account.lock() {
                     *a = snap;
                 }
+                // Resync `realized_pnl_persisted` to IBKR's session-
+                // cumulative number every poll. Closes the prev_avg-VWAP
+                // drift in `Portfolio::add_fill` (IBKR is authoritative
+                // for closed-trade P&L) and keeps the daily_pnl tile +
+                // −5% halt threshold tracking the IBKR session window
+                // even between mid-session restarts.
+                resync_realized_pnl_from_ibkr(&runtime, "periodic");
                 // CLAUDE.md §3: ibkr_scale calibration. Compute the
                 // current raw synthetic SPAN against current positions
                 // and forward, then divide IBKR's MaintMarginReq by it.
@@ -1226,6 +1435,8 @@ fn build_chain_payload(
             use corsair_broker_api::OrderStatus;
             let mut our_bid: Option<f64> = None;
             let mut our_ask: Option<f64> = None;
+            let mut our_bid_qty: u64 = 0;
+            let mut our_ask_qty: u64 = 0;
             let mut bid_live = false;
             let mut ask_live = false;
             for o in open_orders.iter().filter(|o| {
@@ -1242,13 +1453,20 @@ fn build_chain_payload(
                     // = gateway-accepted but exchange not yet confirmed
                     // (yellow on the dashboard).
                     let live = matches!(o.status, OrderStatus::Submitted);
+                    // remaining_qty after partial fills, not original qty.
+                    // Production places qty=1 (CLAUDE.md §17) so the two
+                    // are equal in practice, but threading remaining_qty
+                    // keeps the L2-strip correct for any future multi-lot.
+                    let qty = o.remaining_qty as u64;
                     match o.side {
                         Side::Buy => {
                             our_bid = Some(p);
+                            our_bid_qty = qty;
                             bid_live = live;
                         }
                         Side::Sell => {
                             our_ask = Some(p);
+                            our_ask_qty = qty;
                             ask_live = live;
                         }
                     }
@@ -1261,8 +1479,12 @@ fn build_chain_payload(
             // we're inside the spread or matching it. Falls back to
             // raw L1 (= 0.0) on strikes outside the L2-rotator window;
             // dashboard's `_fmt_side` then displays raw_bid/raw_ask.
-            let ext_bid = opt.depth.external_best_bid(our_bid, 1);
-            let ext_ask = opt.depth.external_best_ask(our_ask, 1);
+            // Pass our actual resting qty so the depth filter doesn't
+            // assume 1-lot. Production currently quotes 1-lot
+            // (CLAUDE.md §17), but threading the real qty here keeps
+            // the L2-strip math correct if multi-lot ships later.
+            let ext_bid = opt.depth.external_best_bid(our_bid, our_bid_qty);
+            let ext_ask = opt.depth.external_best_ask(our_ask, our_ask_qty);
             let side = SideBlockSnapshot {
                 market_bid: if ext_bid > 0.0 { ext_bid } else { opt.bid },
                 market_ask: if ext_ask > 0.0 { ext_ask } else { opt.ask },
@@ -1316,6 +1538,49 @@ fn build_chain_payload(
         atm_strike,
         expiries,
         front_month_expiry,
+    }
+}
+
+/// Resync `Portfolio::realized_pnl_persisted` against IBKR's
+/// session-cumulative `RealizedPnL` so `daily_pnl`
+/// (= realized_pnl_persisted + hedge_realized_total + mtm_pnl) is
+/// anchored on IBKR's session window rather than broker-boot time.
+///
+/// Without this, `Portfolio::new` initializes the accumulator to 0.0
+/// and the only reset is the CME 17:00 CT rollover in
+/// `daily_halt_rollover` — every mid-session broker restart silently
+/// re-anchors the dashboard's "Today's P&L" tile and the −5% daily
+/// halt threshold to boot time, dropping all pre-boot realized P&L.
+/// Periodic invocation also closes the `prev_avg`-VWAP drift in
+/// `Portfolio::add_fill` (see comment at portfolio.rs:163-176).
+///
+/// IBKR's `RealizedPnL` covers the whole account (options + futures
+/// hedges); subtract `hedge_realized_total` so the daily_pnl formula,
+/// which adds hedge realized separately, doesn't double-count.
+pub(crate) fn resync_realized_pnl_from_ibkr(runtime: &Arc<Runtime>, source: &str) {
+    let ibkr_realized = match runtime.account.lock() {
+        Ok(a) => a.realized_pnl_today,
+        Err(_) => return,
+    };
+    let hedge_realized: f64 = {
+        let h = runtime.hedge.lock().unwrap();
+        h.managers().iter().map(|m| m.state().realized_pnl_usd).sum()
+    };
+    let target = ibkr_realized - hedge_realized;
+    let mut p = runtime.portfolio.lock().unwrap();
+    let prev = p.realized_pnl_persisted;
+    p.realized_pnl_persisted = target;
+    let drift = (target - prev).abs();
+    if drift > 10.0 {
+        log::warn!(
+            "resync_realized_pnl ({source}): ibkr=${:.2} \
+             hedge_realized=${:.2} target=${:.2} prev=${:.2} drift=${:.2}",
+            ibkr_realized,
+            hedge_realized,
+            target,
+            prev,
+            drift
+        );
     }
 }
 

@@ -367,15 +367,15 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                 _ = sigint.recv() => log::warn!("graceful_shutdown: SIGINT"),
             }
             // Latency-harness hook: if `CORSAIR_TRADER_HIST_DUMP_PATH`
-            // is set, dump the in-memory ipc_us / ttt_us samples to a
+            // is set, dump the in-memory ipc_ns / ttt_ns samples to a
             // JSON file before doing any cancel work. The
             // corsair_tick_replay orchestrator reads this file as the
             // raw sample input for KS/bootstrap A/B comparison.
             if let Ok(path) = std::env::var("CORSAIR_TRADER_HIST_DUMP_PATH") {
                 let h = state_sd.histograms.lock();
                 let dump = serde_json::json!({
-                    "ipc_us": h.ipc_us.iter().copied().collect::<Vec<_>>(),
-                    "ttt_us": h.ttt_us.iter().copied().collect::<Vec<_>>(),
+                    "ipc_ns": h.ipc_ns.iter().copied().collect::<Vec<_>>(),
+                    "ttt_ns": h.ttt_ns.iter().copied().collect::<Vec<_>>(),
                 });
                 drop(h);
                 match std::fs::write(&path, dump.to_string()) {
@@ -455,6 +455,36 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
         });
     }
 
+    // §25: Spawn 1Hz heartbeat task. Broker's watchdog fires
+    // `trader_silent` if no commands-ring frame arrives within
+    // `CORSAIR_TRADER_WATCHDOG_TIMEOUT_S` (default 5s). In active
+    // markets, place/modify/cancel keep the watchdog warm; in calm
+    // markets, this 1Hz pulse is the explicit liveness signal.
+    {
+        let commands_ring = Arc::clone(&commands_ring);
+        bg_handle.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let hb = Heartbeat {
+                    msg_type: "heartbeat",
+                    ts_ns: now_ns_wall(),
+                };
+                let body = match rmp_serde::to_vec_named(&hb) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log::warn!("heartbeat encode failed: {}", e);
+                        continue;
+                    }
+                };
+                let frame = ipc::protocol::pack_frame(&body);
+                let mut ring = commands_ring.lock();
+                ring.write_frame(&frame);
+            }
+        });
+    }
+
     // Spawn telemetry loop (10s cadence). Also on bg runtime.
     {
         let state = Arc::clone(&state);
@@ -477,13 +507,13 @@ async fn async_main(bg_handle: tokio::runtime::Handle) -> std::io::Result<()> {
                 ring.write_frame(&frame);
                 drop(ring);
                 log::info!(
-                    "telemetry: events={} ipc_p50={:?} ipc_p99={:?} ttt_p50={:?} ttt_p99={:?} \
+                    "telemetry: events={} ipc_p50_ns={:?} ipc_p99_ns={:?} ttt_p50_ns={:?} ttt_p99_ns={:?} \
                      opts={} orders={} hedge={:?} cmd_drops={} decisions={}",
                     n_events,
-                    tel.ipc_p50_us,
-                    tel.ipc_p99_us,
-                    tel.ttt_p50_us,
-                    tel.ttt_p99_us,
+                    tel.ipc_p50_ns,
+                    tel.ipc_p99_ns,
+                    tel.ttt_p50_ns,
+                    tel.ttt_p99_ns,
                     tel.n_options,
                     tel.n_active_orders,
                     tel.risk_hedge_delta,
@@ -698,13 +728,14 @@ fn process_event(
     });
 
     if let Some(emit_ns) = header_ts_ns {
-        let lat = recv_wall_ns.saturating_sub(emit_ns) / 1000;
-        if lat < 5_000_000 {
+        let lat = recv_wall_ns.saturating_sub(emit_ns);
+        // Outlier guard: same threshold as before but in ns now (5s).
+        if lat < 5_000_000_000 {
             let mut h = state.histograms.lock();
             let cap = h.ipc_cap;
-            h.ipc_us.push_back(lat);
-            if h.ipc_us.len() > cap {
-                h.ipc_us.pop_front();
+            h.ipc_ns.push_back(lat);
+            if h.ipc_ns.len() > cap {
+                h.ipc_ns.pop_front();
             }
         }
     }
@@ -964,9 +995,9 @@ fn process_event(
                 if let Some(v) = cfg.delta_ceiling {
                     sc.delta_ceiling = v;
                 }
-                if let Some(v) = cfg.delta_kill {
-                    sc.delta_kill = v;
-                }
+                // delta_kill removed in §25 — hedge engine owns the
+                // delta control loop. Field still arrives in hello for
+                // back-compat but is silently ignored.
                 if let Some(v) = cfg.margin_ceiling_pct {
                     sc.margin_ceiling_pct = v;
                 }
@@ -987,6 +1018,22 @@ fn process_event(
                 }
                 if let Some(v) = cfg.vega_kill {
                     sc.vega_kill = v;
+                }
+                if let Some(v) = cfg.contract_multiplier {
+                    sc.contract_multiplier = v;
+                }
+            }
+            // §25: re-hydrate kill state from broker. If trader
+            // reconnected after a crash and broker still holds active
+            // kills (trader_silent, daily_halt, operational), trader
+            // stays out of the market until operator clears via broker
+            // restart. Sticky semantics — auto-resume is deliberately
+            // not supported. The `kills_count` atomic is the hot-path
+            // gate ("any kills?") in the staleness loop.
+            for src in h.active_kills {
+                if state.kills.insert(src.clone(), "rehydrated_from_hello".to_string()).is_none() {
+                    state.kills_count.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("hello rehydrated active kill: {}", src);
                 }
             }
         }
@@ -1223,6 +1270,7 @@ fn on_tick(
                     qty: 1,
                     price,
                     order_ref: "corsair_trader_rust",
+                    gtd_seconds: gtd_lifetime_s as u32,
                     triggering_tick_broker_recv_ns: tick.broker_recv_ns,
                 };
                 let place_frame_idx = frame_ranges.len();
@@ -1329,13 +1377,14 @@ fn on_tick(
     // TTT histogram push — separate parking_lot mutex so the bg
     // telemetry sort doesn't block this tiny (~50ns) push.
     if let Some(emit_ns) = tick.ts_ns {
-        let lat = send_ns_wall_after_write.saturating_sub(emit_ns) / 1000;
-        if lat < 5_000_000 {
+        let lat = send_ns_wall_after_write.saturating_sub(emit_ns);
+        // Outlier guard: same threshold as before but in ns now (5s).
+        if lat < 5_000_000_000 {
             let mut h = state.histograms.lock();
             let cap = h.ttt_cap;
-            h.ttt_us.push_back(lat);
-            if h.ttt_us.len() > cap {
-                h.ttt_us.pop_front();
+            h.ttt_ns.push_back(lat);
+            if h.ttt_ns.len() > cap {
+                h.ttt_ns.pop_front();
             }
         }
     }
@@ -1464,12 +1513,12 @@ fn staleness_check(
         // Without this in the staleness loop, the loop's drift check
         // compares order.price vs fit-frozen theo, can't see when our
         // quote is stale relative to current market mid.
-        let (_iv, theo_at_fit, delta_at_fit) =
+        let (_iv, gx) =
             match compute_theo(vp.forward, strike, tte, r_char, &vp.params) {
                 Some(v) => v,
                 None => continue,
             };
-        let theo = (theo_at_fit + delta_at_fit * (snap.underlying_price - vp.spot_at_fit.raw())).max(0.01);
+        let theo = (gx.theo + gx.delta * (snap.underlying_price - vp.spot_at_fit.raw())).max(0.01);
 
         // Stale if our price is too unfavorable vs current theo.
         // Drift > threshold → modify to fresh edge (amend bias).
@@ -1599,8 +1648,8 @@ fn build_telemetry(
     // sort so the hot path can keep pushing while we sort the copy.
     let (mut ipc_sorted, mut ttt_sorted) = {
         let h = state.histograms.lock();
-        let ipc: Vec<u64> = h.ipc_us.iter().copied().collect();
-        let ttt: Vec<u64> = h.ttt_us.iter().copied().collect();
+        let ipc: Vec<u64> = h.ipc_ns.iter().copied().collect();
+        let ttt: Vec<u64> = h.ttt_ns.iter().copied().collect();
         (ipc, ttt)
     };
     ipc_sorted.sort_unstable();
@@ -1627,11 +1676,11 @@ fn build_telemetry(
             ts_ns: now_ns_wall(),
             events: serde_json::json!({}),
             decisions: counters.to_json(),
-            ipc_p50_us: pct(&ipc_sorted, 0.50),
-            ipc_p99_us: pct(&ipc_sorted, 0.99),
+            ipc_p50_ns: pct(&ipc_sorted, 0.50),
+            ipc_p99_ns: pct(&ipc_sorted, 0.99),
             ipc_n: ipc_sorted.len(),
-            ttt_p50_us: pct(&ttt_sorted, 0.50),
-            ttt_p99_us: pct(&ttt_sorted, 0.99),
+            ttt_p50_ns: pct(&ttt_sorted, 0.50),
+            ttt_p99_ns: pct(&ttt_sorted, 0.99),
             ttt_n: ttt_sorted.len(),
             n_options: state.options.len(),
             n_active_orders: state.our_orders.len(),

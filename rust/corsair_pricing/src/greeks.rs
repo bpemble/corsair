@@ -8,11 +8,18 @@
 // overhead; Rust is sub-microsecond.
 
 use statrs::distribution::{ContinuousCDF, Normal};
+use std::sync::OnceLock;
+
+/// Cached standard normal. `Normal::new(0.0, 1.0)` allocates + validates
+/// on every call; this OnceLock cache mirrors `lib.rs::STD_NORMAL` and
+/// keeps the hot path allocation-free. Audit round 2.
+static STD_NORMAL: OnceLock<Normal> = OnceLock::new();
 
 #[inline]
 fn norm_cdf(x: f64) -> f64 {
-    // Matches lib.rs's norm_cdf via the same statrs path.
-    Normal::new(0.0, 1.0).unwrap().cdf(x)
+    STD_NORMAL
+        .get_or_init(|| Normal::new(0.0, 1.0).unwrap())
+        .cdf(x)
 }
 
 #[inline]
